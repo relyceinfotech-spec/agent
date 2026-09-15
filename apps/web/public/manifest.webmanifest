@@ -1,0 +1,17 @@
+{
+  "name": "Research Agent MAX",
+  "short_name": "Research MAX",
+  "description": "Evidence-first research across the web.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7faf8",
+  "theme_color": "#166b4c",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

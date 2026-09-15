@@ -1,0 +1,38 @@
+import { z } from "zod";
+
+const schema = z.object({
+  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  PORT: z.coerce.number().int().positive().default(4000),
+  APP_URL: z.string().url().default("http://localhost:4000"),
+  WEB_URL: z.string().url().default("http://localhost:3000"),
+  SEARXNG_URL: z.string().url().default("http://localhost:8080"),
+  OPENROUTER_API_KEY: z.string().optional(),
+  OPENROUTER_MODEL: z.string().default("qwen/qwen3.7-flash"),
+  OPENROUTER_BASE_URL: z.string().url().default("https://openrouter.ai/api/v1"),
+  OPENROUTER_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  MAX_RESEARCH_STEPS: z.coerce.number().int().positive().default(8),
+  MAX_SEARCH_QUERIES: z.coerce.number().int().positive().default(20),
+  MAX_SOURCES: z.coerce.number().int().positive().default(12),
+  MAX_PAGES: z.coerce.number().int().positive().default(8),
+  MAX_RESEARCH_TIME_MS: z.coerce.number().int().positive().default(180000),
+  MAX_MODEL_DECISIONS: z.coerce.number().int().positive().default(4),
+  EVAL_MAX_RESEARCH_STEPS: z.coerce.number().int().positive().default(8),
+  EVAL_MAX_SEARCH_QUERIES: z.coerce.number().int().positive().default(8),
+  EVAL_MAX_SOURCES: z.coerce.number().int().positive().default(4),
+  EVAL_MAX_PAGES: z.coerce.number().int().positive().default(2),
+  EVAL_MAX_RESEARCH_TIME_MS: z.coerce.number().int().positive().default(90000),
+  EVAL_MAX_CASES: z.coerce.number().int().positive().default(7),
+  EVAL_OPENROUTER_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
+  EVAL_CASE_NAMES: z.string().default(""),
+  EVAL_SMOKE_MAX_RESEARCH_STEPS: z.coerce.number().int().positive().default(6),
+  EVAL_SMOKE_MAX_SEARCH_QUERIES: z.coerce.number().int().positive().default(3),
+  EVAL_SMOKE_MAX_SOURCES: z.coerce.number().int().positive().default(2),
+  EVAL_SMOKE_MAX_PAGES: z.coerce.number().int().positive().default(1),
+  EVAL_SMOKE_MAX_RESEARCH_TIME_MS: z.coerce.number().int().positive().default(120000),
+  EVAL_SMOKE_MAX_CASES: z.coerce.number().int().positive().default(3),
+  EVAL_SMOKE_OPENROUTER_TIMEOUT_MS: z.coerce.number().int().positive().default(45000),
+  FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(12000),
+  MAX_CONTENT_BYTES: z.coerce.number().int().positive().default(2_000_000),
+});
+
+export const config = schema.parse(process.env);

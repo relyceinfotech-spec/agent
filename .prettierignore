@@ -1,0 +1,7 @@
+node_modules
+.next
+dist
+.pnpm-store
+coverage
+pnpm-lock.yaml
+evaluation-results

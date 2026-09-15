@@ -1,0 +1,17 @@
+{
+  "name": "research-agent-max",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @research-max/api --filter @research-max/web dev",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "format": "prettier --write \"apps/**/*.{ts,tsx,js,jsx,json,css}\" \"*.{json,yml,yaml}\"",
+    "format:check": "prettier --check \"apps/**/*.{ts,tsx,js,jsx,json,css}\" \"*.{json,yml,yaml}\""
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2"
+  }
+}
