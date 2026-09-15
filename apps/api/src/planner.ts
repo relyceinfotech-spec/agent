@@ -5,6 +5,8 @@ import type {
   ResearchPlan,
   SearchResult,
   QueryInterpretation,
+  LanguageProfile,
+  ResponseFormatPreference,
 } from "./domain.js";
 import { OpenRouterProvider } from "./llm.js";
 
@@ -18,18 +20,39 @@ const corrections: Record<string, string> = {
 };
 const knownEntities = [
   "React Native",
+  "React",
   "Flutter",
   "JavaScript",
+  "TypeScript",
   "Python",
   "Node.js",
+  "Next.js",
+  "Vue",
+  "Angular",
+  "Svelte",
+  "Bun",
+  "Deno",
+  "Docker",
+  "Kubernetes",
+  "PostgreSQL",
+  "MySQL",
+  "MongoDB",
+  "Redis",
+  "Tailwind CSS",
+  "GraphQL",
+  "FastAPI",
+  "Django",
+  "Express",
+  "Supabase",
+  "Firebase",
   "NocoDB",
-  "TypeScript",
   "Rust",
   "Go",
   "Java",
   "Kotlin",
   "Swift",
 ];
+
 const categories: QueryCategory[] = ["DIRECT", "OFFICIAL", "RECENT", "EXPERT", "CONTRARY"];
 
 function clamp(value: number) {
@@ -42,7 +65,108 @@ function unique(values: string[]) {
   return [...new Set(values.map((value) => value.replace(/\s+/g, " ").trim()).filter(Boolean))];
 }
 
-function heuristicUnderstanding(question: string): QueryInterpretation {
+export function detectLanguage(input: string): LanguageProfile {
+  // 1. Script checks (Unicode ranges)
+  if (/[\u0B80-\u0BFF]/.test(input)) {
+    return {
+      detected: "ta",
+      name: "Tamil",
+      respondIn: "Tamil script (தமிழ்). Provide a natural, technically accurate response in Tamil.",
+    };
+  }
+  if (/[\u0900-\u097F]/.test(input)) {
+    return {
+      detected: "hi",
+      name: "Hindi",
+      respondIn:
+        "Hindi script (हिन्दी). Provide a natural, technically accurate response in Hindi.",
+    };
+  }
+  if (/[\u0C00-\u0C7F]/.test(input)) {
+    return {
+      detected: "te",
+      name: "Telugu",
+      respondIn: "Telugu script (తెలుగు).",
+    };
+  }
+  if (/[\u0C80-\u0CFF]/.test(input)) {
+    return {
+      detected: "kn",
+      name: "Kannada",
+      respondIn: "Kannada script (ಕನ್ನಡ).",
+    };
+  }
+  if (/[\u0D00-\u0D7F]/.test(input)) {
+    return {
+      detected: "ml",
+      name: "Malayalam",
+      respondIn: "Malayalam script (മലയാളം).",
+    };
+  }
+
+  // 2. Tanglish markers (Tamil in Latin script)
+  const tanglishRegex =
+    /\b(oda|enna|epdi|epadi|eppadi|sollinga|sollu|sollunga|pannunga|panna|nalla|irukku|irukka|illai|illa|vanthuchu|bro|macha|machan|nanba|thala|theriyuma|paathu|vango|vaanga|podhum|edhuku|engaluku|ungaluku|solren|parunga)\b/i;
+  if (tanglishRegex.test(input)) {
+    return {
+      detected: "ta-Latn",
+      name: "Tanglish",
+      respondIn:
+        "natural conversational Tanglish (Tamil in Latin script), matching user's casual, friendly conversational tone. Keep code and technical terms in English.",
+    };
+  }
+
+  // 3. Hinglish markers (Hindi in Latin script)
+  const hinglishRegex =
+    /\b(kya|hai|hain|kaise|batao|bataiye|accha|acha|karo|karna|hoga|chahiye|wala|wali|bhai|yaar|samjhao|dekho|kisme|konsa|kaunsa)\b/i;
+  if (hinglishRegex.test(input)) {
+    return {
+      detected: "hi-Latn",
+      name: "Hinglish",
+      respondIn:
+        "natural conversational Hinglish (Hindi in Latin script), matching user's conversational tone. Keep code and technical terms in English.",
+    };
+  }
+
+  return {
+    detected: "en",
+    name: "English",
+    respondIn: "clear, concise English",
+  };
+}
+
+export function detectFormatPreference(
+  question: string,
+  mode: ResearchMode = "quick",
+): ResponseFormatPreference {
+  const lower = question.toLowerCase();
+  if (
+    mode === "deep" ||
+    /\b(deep research|in-depth|investigate deeply|comprehensive analysis)\b/i.test(lower)
+  ) {
+    return "research";
+  }
+  if (/\b(compare|vs|versus|better|difference between|differences)\b/i.test(lower)) {
+    return "comparison";
+  }
+  if (/\b(code|example|snippet|implement|syntax|how to write|function)\b/i.test(lower)) {
+    return "code";
+  }
+  if (
+    /\b(latest version|current version|release date|when was|what version|status of)\b/i.test(
+      lower,
+    ) ||
+    /latest.*version/i.test(lower)
+  ) {
+    return "lookup";
+  }
+  return "direct";
+}
+
+function heuristicUnderstanding(
+  question: string,
+  mode: ResearchMode = "quick",
+): QueryInterpretation {
   let normalizedQuestion = question.trim();
   const applied: QueryInterpretation["corrections"] = [];
   for (const [from, to] of Object.entries(corrections)) {
@@ -54,13 +178,27 @@ function heuristicUnderstanding(question: string): QueryInterpretation {
   }
   normalizedQuestion = normalizedQuestion.replace(/\s+/g, " ").trim();
   const lower = normalizedQuestion.toLowerCase();
-  const entities = unique(knownEntities.filter((entity) => lower.includes(entity.toLowerCase())));
+  const entities = unique(
+    knownEntities.filter((entity) => {
+      const pattern = new RegExp(
+        `(^|[^a-zA-Z0-9])${entity.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-zA-Z0-9]|$)`,
+        "i",
+      );
+      return pattern.test(normalizedQuestion);
+    }),
+  );
+  if (entities.includes("React Native") && entities.includes("React")) {
+    const rnIndex = entities.indexOf("React");
+    if (rnIndex !== -1 && !new RegExp(`\\bReact\\b(?!\\s+Native)`, "i").test(normalizedQuestion)) {
+      entities.splice(rnIndex, 1);
+    }
+  }
   const compare = /\b(vs|versus|compare|comparison|difference|better|faster|best)\b/i.test(lower);
   const intent = compare
     ? lower.includes("best")
       ? "Evaluate options against decision criteria"
       : "Compare the identified entities"
-    : /\b(latest|current|recent|news)\b/i.test(lower)
+    : /\b(latest|current|recent|news|version|enna|kya)\b/i.test(lower)
       ? "Find and explain current developments"
       : "Explain and investigate the topic";
   const topic = /\b(performance|speed|latency|benchmark)\b/i.test(lower)
@@ -113,6 +251,8 @@ function heuristicUnderstanding(question: string): QueryInterpretation {
   if (applied.length > 0) ambiguity += 0.04;
   ambiguity = clamp(ambiguity);
   const needsClarification = ambiguity >= 0.6;
+  const language = detectLanguage(question);
+  const formatPreference = detectFormatPreference(question, mode);
   return {
     normalizedQuestion,
     intent,
@@ -127,14 +267,29 @@ function heuristicUnderstanding(question: string): QueryInterpretation {
     clarificationQuestion: needsClarification
       ? "What should MAX focus on or compare here (for example performance, cost, ecosystem, or a specific use case)?"
       : undefined,
+    language,
+    formatPreference,
   };
 }
 
 export async function understandQuery(
   question: string,
   llm: OpenRouterProvider,
+  mode: ResearchMode = "quick",
 ): Promise<QueryInterpretation> {
-  const fallback = heuristicUnderstanding(question);
+  const fallback = heuristicUnderstanding(question, mode);
+  // Fast path: if the heuristic already identified the query with high confidence
+  // (low ambiguity score, recognized entities or clear format preference like lookup/code,
+  // and does not need user clarification), skip the sequential LLM call to save 15-20s.
+  if (
+    fallback.ambiguityScore < 0.4 &&
+    (fallback.entities.length > 0 ||
+      fallback.formatPreference === "lookup" ||
+      fallback.formatPreference === "code") &&
+    !fallback.needsClarification
+  ) {
+    return fallback;
+  }
   if (!llm.enabled) return fallback;
   try {
     const raw = await llm.complete(
@@ -165,6 +320,8 @@ export async function understandQuery(
           score >= 0.6
             ? (parsed.clarificationQuestion ?? fallback.clarificationQuestion)
             : undefined,
+        language: parsed.language ?? fallback.language,
+        formatPreference: parsed.formatPreference ?? fallback.formatPreference,
       };
     }
   } catch {
@@ -235,7 +392,7 @@ export async function buildPlan(
   mode: ResearchMode,
   llm: OpenRouterProvider,
 ): Promise<ResearchPlan> {
-  const interpretation = await understandQuery(question, llm);
+  const interpretation = await understandQuery(question, llm, mode);
   let queryGroups = buildHeuristicGroups(interpretation);
   if (llm.enabled && !interpretation.needsClarification) {
     try {

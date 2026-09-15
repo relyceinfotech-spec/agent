@@ -800,7 +800,9 @@ function evaluationLimits(profile: EvaluationProfile): EvaluationLimits {
       maxPages: config.EVAL_SMOKE_MAX_PAGES,
       maxTimeMs: config.EVAL_SMOKE_MAX_RESEARCH_TIME_MS,
       openRouterTimeoutMs: config.EVAL_SMOKE_OPENROUTER_TIMEOUT_MS,
-      caseNames: "direct_javascript_closures,current_react_version,compare_react_native_flutter",
+      caseNames:
+        config.EVAL_CASE_NAMES ||
+        "direct_javascript_closures,current_react_version,compare_react_native_flutter",
       profile,
     };
   }
@@ -892,8 +894,9 @@ async function main() {
   );
   console.log("");
 
+  const cliCase = process.argv.find((arg) => arg.startsWith("--case="))?.split("=")[1];
   const requestedCases = new Set(
-    limits.caseNames
+    (cliCase || limits.caseNames)
       .split(",")
       .map((name) => name.trim())
       .filter(Boolean),

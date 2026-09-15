@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Claim, ResearchPlan, Source } from "../domain.js";
+import type { Claim, QueryInterpretation, ResearchPlan, Source } from "../domain.js";
 import { extractHtml } from "../extract.js";
 import { OpenRouterProvider } from "../llm.js";
 import { understandQuery } from "../planner.js";
@@ -100,7 +100,10 @@ export function createToolRegistry(search: SearchProvider, llm: OpenRouterProvid
       try {
         const response = await fetch(url, {
           signal: controller.signal,
-          headers: { "user-agent": "ResearchAgentMAX/0.1 (+research; respectful crawler)" },
+          headers: {
+            "user-agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          },
           redirect: "follow",
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -254,12 +257,22 @@ export function createToolRegistry(search: SearchProvider, llm: OpenRouterProvid
         plan?: ResearchPlan;
         sources?: Source[];
         claims?: Claim[];
+        interpretation?: QueryInterpretation;
       };
       if (payload.kind === "direct") {
         if (!llm.enabled)
           return "OPENROUTER_API_KEY is not configured, so MAX cannot generate a direct answer yet.";
+        const lang = payload.interpretation?.language?.respondIn;
+        const format = payload.interpretation?.formatPreference;
+        const langRule = lang
+          ? `CRITICAL LANGUAGE RULE: You MUST answer in ${lang}. Match the user's conversational style, tone, and dialect. If the user asked in Tanglish, write in natural Tanglish. If in Tamil, write in Tamil script. If in English, write in English.`
+          : "";
+        const formatRule =
+          format === "code"
+            ? "Provide clean, properly tagged code blocks with concise explanation."
+            : "Answer clearly, naturally, and concisely.";
         return llm.complete(
-          "Answer the user's question clearly and concisely. Do not claim to have browsed the web. If the question requires current information, say so instead of guessing.",
+          `Answer the user's question clearly and concisely. ${langRule} ${formatRule} Do not claim to have browsed the web. If the question requires current information, say so instead of guessing.`,
           payload.question ?? "",
         );
       }

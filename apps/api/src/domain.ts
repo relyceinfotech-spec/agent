@@ -61,6 +61,14 @@ export interface Conflict {
   description: string;
   status: "open" | "resolved" | "uncertain";
 }
+export interface LanguageProfile {
+  detected: string;
+  name: string;
+  respondIn: string;
+}
+
+export type ResponseFormatPreference = "direct" | "lookup" | "comparison" | "research" | "code";
+
 export interface QueryInterpretation {
   normalizedQuestion: string;
   intent: string;
@@ -73,6 +81,8 @@ export interface QueryInterpretation {
   ambiguityReasons: string[];
   needsClarification: boolean;
   clarificationQuestion?: string;
+  language?: LanguageProfile;
+  formatPreference?: ResponseFormatPreference;
 }
 export interface QueryGroup {
   category: QueryCategory;

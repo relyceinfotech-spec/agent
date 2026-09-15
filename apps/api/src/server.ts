@@ -13,12 +13,20 @@ import { createToolRegistry } from "./agent/tools.js";
 const app = Fastify({ logger: { level: config.NODE_ENV === "production" ? "info" : "debug" } });
 await app.register(cors, { origin: [config.WEB_URL], credentials: true });
 await app.register(sensible);
+
+app.addHook("onSend", async (_request, reply) => {
+  void reply.header("X-Content-Type-Options", "nosniff");
+  void reply.header("X-Frame-Options", "DENY");
+  void reply.header("X-XSS-Protection", "1; mode=block");
+  void reply.header("Referrer-Policy", "strict-origin-when-cross-origin");
+});
+
 const store = new MemorySessionStore();
 const search = new SearXNGProvider(config.SEARXNG_URL);
 const llm = new OpenRouterProvider();
 const registry = createToolRegistry(search, llm);
 const runner = new ResearchRunner(store, search, llm, registry);
-const agent = new AutonomousAgent(registry, runner, llm);
+const agent = new AutonomousAgent(registry, runner, llm, store);
 const requestSchema = z.object({
   question: z.string().trim().min(8).max(2000),
   mode: z.enum(["quick", "deep"]).default("quick"),
@@ -46,7 +54,7 @@ app.post("/api/chat", async (request, reply) => {
   const parsed = chatSchema.safeParse(request.body);
   if (!parsed.success) return reply.badRequest(JSON.stringify(parsed.error.flatten()));
   const response = await agent.handle(parsed.data.message, parsed.data.deepResearch);
-  return reply.code(response.route === "direct" ? 200 : 202).send(response);
+  return reply.code(response.route === "direct" || response.answer ? 200 : 202).send(response);
 });
 app.post("/api/research", async (request, reply) => {
   const parsed = requestSchema.safeParse(request.body);
@@ -66,6 +74,12 @@ app.post<{ Params: { id: string } }>("/api/research/:id/clarify", async (request
   return session
     ? reply.code(202).send({ id: session.id, status: session.status })
     : reply.notFound("Clarification is not available for this research session");
+});
+app.post<{ Params: { id: string } }>("/api/research/:id/cancel", async (request, reply) => {
+  const session = await runner.cancel(request.params.id);
+  return session
+    ? reply.code(200).send({ id: session.id, status: session.status })
+    : reply.notFound("Research session not found");
 });
 app.delete<{ Params: { id: string } }>("/api/research/:id", async (request, reply) => {
   await store.delete(request.params.id);

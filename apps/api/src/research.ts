@@ -175,6 +175,23 @@ export class ResearchRunner {
     if (next) void this.run(id);
     return next;
   }
+  async cancel(id: string): Promise<ResearchSession | undefined> {
+    const current = await this.store.get(id);
+    if (!current || ["COMPLETED", "FAILED", "CANCELLED"].includes(current.status)) return current;
+    const next = await this.update(id, {
+      status: "CANCELLED",
+      error: "Research session cancelled by user",
+    });
+    if (next) {
+      await this.step(id, "⏹️ cancel_session", "complete", "Research session cancelled by user");
+      this.emit(id, {
+        type: "research.failed",
+        message: "Research session cancelled by user",
+        session: next,
+      });
+    }
+    return next;
+  }
   private async update(id: string, patch: Partial<ResearchSession>) {
     const current = await this.store.get(id);
     if (!current) return;
@@ -244,7 +261,8 @@ export class ResearchRunner {
     return this.registry.execute("web_search", { queries }) as Promise<SearchResult[]>;
   }
   private pendingSource(state: LoopState, budget: ResearchBudget) {
-    if (state.fetchedSources.length >= budget.maxPages) return undefined;
+    if (state.fetchedSources.filter((source) => source.content).length >= budget.maxPages)
+      return undefined;
     return state.rankedSources.find(
       (source) => !state.fetchedUrls.has(source.url) && !source.fetchError,
     );
@@ -637,6 +655,8 @@ export class ResearchRunner {
       let answer = "";
       let iterations = 0;
       while (iterations < budget.maxSteps && Date.now() - startedAt < budget.maxTimeMs) {
+        const currentSession = await this.store.get(id);
+        if (currentSession?.status === "CANCELLED") return;
         const action = await this.chooseAction(id, state, budget);
         await this.update(id, {
           status: statusFor(action),
