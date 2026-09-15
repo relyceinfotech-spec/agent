@@ -33,6 +33,10 @@ const schema = z.object({
   EVAL_SMOKE_OPENROUTER_TIMEOUT_MS: z.coerce.number().int().positive().default(45000),
   FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(12000),
   MAX_CONTENT_BYTES: z.coerce.number().int().positive().default(2_000_000),
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RATE_LIMIT_MAX_REQUESTS: z.coerce.number().int().positive().default(60),
+  MAX_BODY_BYTES: z.coerce.number().int().positive().default(65536),
+  MAX_CONCURRENT_FETCHES: z.coerce.number().int().positive().default(4),
 });
 
 export const config = schema.parse(process.env);

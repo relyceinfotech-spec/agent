@@ -11,6 +11,8 @@ import { rankResults } from "../rank.js";
 import { ResearchRunner } from "../research.js";
 import type { SessionStore } from "../store.js";
 import { ToolRegistry } from "./tools.js";
+import { pMap } from "../concurrency.js";
+import { config } from "../config.js";
 
 export type AgentRoute = "direct" | "web" | "deep";
 type InternalEffort = "low" | "medium" | "high";
@@ -164,30 +166,29 @@ export class AutonomousAgent {
     const ranked = rankResults(interpretation.normalizedQuestion, rawResults);
     const topCandidates = ranked.slice(0, 2);
 
-    // 3. Fetch content in parallel for top candidates
-    const fetchedSources: Source[] = [];
-    if (topCandidates.length > 0) {
-      await Promise.all(
-        topCandidates.map(async (candidate) => {
-          try {
-            const fetched = await this.use<{ url: string; html: string }>(toolEvents, "fetch_url", {
-              url: candidate.url,
-            });
-            const extracted = await this.use<{ content: string }>(toolEvents, "extract_content", {
-              html: fetched.html,
-              url: fetched.url,
-            });
-            fetchedSources.push({
-              ...candidate,
-              content: extracted.content.slice(0, 4000),
-              fetchedAt: new Date().toISOString(),
-            });
-          } catch {
-            fetchedSources.push(candidate);
-          }
-        }),
-      );
-    }
+    // 3. Fetch content with bounded concurrency for top candidates
+    const fetchedSources: Source[] = await pMap(
+      topCandidates,
+      async (candidate) => {
+        try {
+          const fetched = await this.use<{ url: string; html: string }>(toolEvents, "fetch_url", {
+            url: candidate.url,
+          });
+          const extracted = await this.use<{ content: string }>(toolEvents, "extract_content", {
+            html: fetched.html,
+            url: fetched.url,
+          });
+          return {
+            ...candidate,
+            content: extracted.content.slice(0, 4000),
+            fetchedAt: new Date().toISOString(),
+          };
+        } catch {
+          return candidate;
+        }
+      },
+      config.MAX_CONCURRENT_FETCHES,
+    );
 
     // 4. Synthesize directly with citations
     const plan: ResearchPlan = {
