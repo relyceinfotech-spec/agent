@@ -9,6 +9,7 @@ export type SourceItem = {
   domain: string;
   snippet: string;
   content?: string;
+  sourceType?: string;
   quality: { overall: number; relevance: number; authority: number; freshness: number };
 };
 
@@ -72,6 +73,11 @@ export function SourcesDrawer({
                   <div className="source-card-header">
                     <span className="source-index-badge">[{index + 1}]</span>
                     <span className="source-domain-pill">{cleanDomain}</span>
+                    {src.sourceType && (
+                      <span className={`source-type-pill type-${src.sourceType}`}>
+                        {src.sourceType}
+                      </span>
+                    )}
                     <span className="source-quality-metric">{qualityPct}% quality</span>
                   </div>
 

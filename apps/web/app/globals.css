@@ -915,6 +915,18 @@ textarea {
   letter-spacing: 0.04em;
 }
 
+.artifact-coverage-pill {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  background: var(--emerald-subtle);
+  border: 1px solid var(--border-emerald);
+  color: var(--emerald-brand);
+  padding: 2px 8px;
+  border-radius: 6px;
+  letter-spacing: 0.02em;
+}
+
 .artifact-lang-tag {
   font-family: var(--font-mono);
   font-size: 10.5px;
@@ -1315,6 +1327,258 @@ textarea {
 }
 
 /* ==========================================================================
+   RESEARCH OBJECTIVES SECTION COMPONENT
+   ========================================================================== */
+
+.objectives-section {
+  margin-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 16px;
+}
+
+.objectives-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: transparent;
+  border: 0;
+  padding: 6px 0;
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+
+.objectives-count {
+  color: var(--emerald-brand);
+}
+
+.coverage-badge-small {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  background: var(--emerald-subtle);
+  border: 1px solid var(--border-emerald);
+  color: var(--emerald-brand);
+  padding: 1px 7px;
+  border-radius: 6px;
+  margin-left: 6px;
+}
+
+.objectives-list-wrapper {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.objectives-progress-bar-container {
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.objectives-progress-bar-track {
+  width: 100%;
+  height: 6px;
+  background: var(--bg-surface-sunken);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.objectives-progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--emerald-brand), var(--lime-brand));
+  border-radius: 999px;
+  transition: width 0.4s ease-out;
+}
+
+.objectives-progress-metrics {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.progress-pct-val {
+  color: var(--emerald-brand);
+  font-weight: 700;
+}
+
+.objectives-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.objective-card {
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 0.2s ease;
+}
+
+.objective-card.status-fulfilled {
+  border-left: 3px solid var(--emerald-brand);
+}
+
+.objective-card.status-partial {
+  border-left: 3px solid var(--status-warning);
+}
+
+.objective-card.status-investigating {
+  border-left: 3px solid var(--emerald-glow);
+}
+
+.objective-card.status-pending {
+  border-left: 3px solid var(--border-default);
+}
+
+.objective-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.objective-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.status-pill {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.pill-fulfilled {
+  background: var(--emerald-subtle);
+  color: var(--emerald-brand);
+}
+
+.pill-partial {
+  background: #fef3c720;
+  color: var(--status-warning);
+}
+
+.pill-investigating {
+  background: #38bdf820;
+  color: #38bdf8;
+}
+
+.pill-pending {
+  background: var(--bg-surface-sunken);
+  color: var(--text-muted);
+}
+
+.pill-blocked {
+  background: var(--status-error-bg);
+  color: var(--status-error);
+}
+
+.importance-tag {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  letter-spacing: 0.03em;
+}
+
+.importance-critical {
+  background: #ef444420;
+  color: #ef4444;
+  border: 1px solid #ef444440;
+}
+
+.importance-high {
+  background: #f59e0b20;
+  color: #f59e0b;
+}
+
+.importance-medium {
+  background: var(--bg-surface-sunken);
+  color: var(--text-muted);
+}
+
+.importance-low {
+  background: var(--bg-surface-sunken);
+  color: var(--text-muted);
+  opacity: 0.75;
+}
+
+.category-pill {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-surface-sunken);
+  padding: 1px 6px;
+  border-radius: 4px;
+  text-transform: capitalize;
+}
+
+.objective-coverage-val {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.objective-label {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text-primary);
+}
+
+.objective-finding-box {
+  background: var(--bg-surface-sunken);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.finding-label {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--emerald-brand);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.finding-text {
+  margin: 0;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.objective-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+/* ==========================================================================
    SOURCES DRAWER COMPONENT
    ========================================================================== */
 
@@ -1426,6 +1690,43 @@ textarea {
 .source-domain-pill {
   font-family: var(--font-mono);
   font-size: 11px;
+  color: var(--text-muted);
+}
+
+.source-type-pill {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  background: var(--bg-surface-sunken);
+  color: var(--text-muted);
+}
+
+.source-type-pill.type-official,
+.source-type-pill.type-documentation {
+  background: var(--emerald-subtle);
+  color: var(--emerald-brand);
+  border: 1px solid var(--border-emerald);
+}
+
+.source-type-pill.type-academic,
+.source-type-pill.type-government {
+  background: #3b82f620;
+  color: #60a5fa;
+  border: 1px solid #3b82f640;
+}
+
+.source-type-pill.type-news {
+  background: #8b5cf620;
+  color: #a78bfa;
+}
+
+.source-type-pill.type-forum,
+.source-type-pill.type-blog {
+  background: var(--bg-surface-sunken);
   color: var(--text-muted);
 }
 
@@ -1541,6 +1842,43 @@ textarea {
 .verdict-tag.uncertain {
   background: #fef3c720;
   color: var(--status-warning);
+}
+
+.claim-badges-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.claim-importance-tag {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  letter-spacing: 0.03em;
+}
+
+.claim-importance-tag.importance-critical {
+  background: #ef444420;
+  color: #ef4444;
+  border: 1px solid #ef444440;
+}
+
+.claim-importance-tag.importance-high {
+  background: #f59e0b20;
+  color: #f59e0b;
+}
+
+.claim-importance-tag.importance-medium {
+  background: var(--bg-surface-sunken);
+  color: var(--text-muted);
+}
+
+.claim-importance-tag.importance-low {
+  background: var(--bg-surface-sunken);
+  color: var(--text-muted);
+  opacity: 0.75;
 }
 
 .confidence-metric {

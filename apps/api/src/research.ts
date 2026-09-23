@@ -10,6 +10,9 @@ import type {
   ResearchMode,
   Source,
   SearchResult,
+  ResearchObjective,
+  ResearchState,
+  ClaimImportance,
 } from "./domain.js";
 import { OpenRouterProvider } from "./llm.js";
 import { buildPlan, rewriteQueries } from "./planner.js";
@@ -42,6 +45,7 @@ export interface ResearchBudget {
 interface LoopState {
   mode: ResearchMode;
   plan: Awaited<ReturnType<typeof buildPlan>>;
+  objectives: ResearchObjective[];
   rawResults: SearchResult[];
   rankedSources: Source[];
   fetchedSources: Source[];
@@ -267,12 +271,109 @@ export class ResearchRunner {
       (source) => !state.fetchedUrls.has(source.url) && !source.fetchError,
     );
   }
+
+  private computeResearchState(state: LoopState): ResearchState {
+    const objectives: ResearchObjective[] = (state.objectives || []).map((obj) => ({
+      ...obj,
+      evidenceIds: [...obj.evidenceIds],
+      sourceIds: [...obj.sourceIds],
+    }));
+
+    // Map claims to objectives and assign claim importance
+    for (const claim of state.claims) {
+      const claimText = `${claim.text} ${claim.evidence || ""}`.toLowerCase();
+      let matched = objectives.find(
+        (obj) =>
+          claimText.includes(obj.category.toLowerCase()) ||
+          obj.label
+            .toLowerCase()
+            .split(/\W+/)
+            .filter((w) => w.length > 4)
+            .some((w) => claimText.includes(w)),
+      );
+
+      if (!matched && objectives.length > 0) {
+        matched = objectives[0];
+      }
+
+      if (matched) {
+        claim.objectiveId = matched.id;
+        claim.importance = matched.importance;
+        if (!matched.evidenceIds.includes(claim.id)) {
+          matched.evidenceIds.push(claim.id);
+        }
+        for (const sId of claim.sourceIds) {
+          if (!matched.sourceIds.includes(sId)) {
+            matched.sourceIds.push(sId);
+          }
+        }
+      } else {
+        claim.importance = claim.importance || "medium";
+      }
+    }
+
+    // Evaluate each objective's fulfillment status
+    for (const obj of objectives) {
+      const matchingClaims = state.claims.filter((c) => c.objectiveId === obj.id);
+      const supported = matchingClaims.filter((c) => c.verification?.verdict === "supported");
+      const contradicted = matchingClaims.filter((c) => c.verification?.verdict === "contradicted");
+
+      if (supported.length > 0) {
+        obj.status = "fulfilled";
+        obj.coverage = 1.0;
+        obj.keyFinding = supported[0].text;
+      } else if (contradicted.length > 0 && supported.length === 0) {
+        obj.status = "blocked";
+        obj.coverage = 0.2;
+      } else if (matchingClaims.length > 0) {
+        obj.status = "partial";
+        obj.coverage = 0.5;
+      } else {
+        obj.status = "pending";
+        obj.coverage = 0.0;
+      }
+    }
+
+    // Weighted coverage calculation
+    const weights: Record<string, number> = { critical: 3, high: 2, medium: 1, low: 0.5 };
+    let totalWeight = 0;
+    let weightedScore = 0;
+
+    for (const obj of objectives) {
+      const w = weights[obj.importance] || 1;
+      totalWeight += w;
+      weightedScore += obj.coverage * w;
+    }
+
+    const coverage = totalWeight > 0 ? Number((weightedScore / totalWeight).toFixed(3)) : 0;
+    const completedObjectives = objectives.filter((o) => o.status === "fulfilled").map((o) => o.label);
+    const missingObjectives = objectives.filter((o) => o.status !== "fulfilled").map((o) => o.label);
+    const verifiedClaims = state.claims.filter((c) => c.verification?.verdict === "supported");
+
+    return {
+      objectives,
+      completedObjectives,
+      missingObjectives,
+      queries: state.plan.queries,
+      sources: state.fetchedSources.length > 0 ? state.fetchedSources : state.rankedSources,
+      claims: state.claims,
+      conflicts: state.conflicts,
+      verifiedClaims,
+      coverage,
+      nextBestAction:
+        missingObjectives.length > 0
+          ? `Investigate missing objective: ${missingObjectives[0]}`
+          : "Synthesize research evidence",
+    };
+  }
+
   private assessEvidence(state: LoopState): EvidenceAssessment {
     const supported = state.claims.filter(
       (claim) => claim.verification?.verdict === "supported",
     ).length;
     const minimumClaims = state.plan.interpretation.dimensions.length > 4 ? 4 : 2;
     const reasons: string[] = [];
+
     if (state.rankedSources.length === 0) reasons.push("no relevant sources passed triage");
     if (state.claims.length < minimumClaims)
       reasons.push(`only ${state.claims.length}/${minimumClaims} claims were extracted`);
@@ -280,6 +381,7 @@ export class ResearchRunner {
       reasons.push(`only ${supported}/${Math.min(2, minimumClaims)} claims are supported`);
     if (state.conflicts.some((conflict) => conflict.status === "open"))
       reasons.push("credible source conflicts remain open");
+
     return { sufficient: reasons.length === 0, reasons };
   }
   private needsMoreEvidence(state: LoopState, budget: ResearchBudget) {
@@ -340,8 +442,12 @@ export class ResearchRunner {
   }
   private observation(state: LoopState, budget: ResearchBudget): Record<string, unknown> {
     const evidence = this.assessEvidence(state);
+    const researchState = this.computeResearchState(state);
     return {
-      objectives: state.plan.objectives,
+      objectives: researchState.objectives.map((o) => `[${o.status.toUpperCase()}] ${o.label}`),
+      coverage: `${Math.round(researchState.coverage * 100)}%`,
+      completedObjectives: researchState.completedObjectives,
+      missingObjectives: researchState.missingObjectives,
       dimensions: state.plan.interpretation.dimensions,
       relevantSources: `${state.rankedSources.length}/${state.rawResults.length}`,
       fetchedSources: state.fetchedSources.filter((source) => source.content).length,
@@ -500,8 +606,15 @@ export class ResearchRunner {
       return;
     }
     if (action === "verify_claims") {
+      this.computeResearchState(state);
+      const impWeight = { critical: 4, high: 3, medium: 2, low: 1 };
       const pending = state.claims
         .filter((claim) => !claim.verification)
+        .sort((a, b) => {
+          const aW = impWeight[a.importance || "medium"] || 2;
+          const bW = impWeight[b.importance || "medium"] || 2;
+          return bW - aW;
+        })
         .slice(0, budget.maxClaimsToVerify);
       for (const claim of pending) {
         const result = await this.useTool<{
@@ -549,12 +662,15 @@ export class ResearchRunner {
       return;
     }
     if (action === "search_again") {
+      const researchState = this.computeResearchState(state);
+      const missingObjs = researchState.objectives.filter((o) => o.status !== "fulfilled");
       const rewritten = await rewriteQueries(
         state.plan.interpretation.normalizedQuestion,
         state.plan,
         state.rawResults,
         state.mode,
         this.llm,
+        missingObjs,
       );
       if (rewritten.length === 0) {
         state.searchPasses = budget.maxSearchPasses;
@@ -635,6 +751,7 @@ export class ResearchRunner {
       const state: LoopState = {
         mode: session.mode,
         plan,
+        objectives: plan.structuredObjectives || [],
         rawResults: [],
         rankedSources: [],
         fetchedSources: [],
@@ -658,14 +775,18 @@ export class ResearchRunner {
         const currentSession = await this.store.get(id);
         if (currentSession?.status === "CANCELLED") return;
         const action = await this.chooseAction(id, state, budget);
+        const currentResearchState = this.computeResearchState(state);
         await this.update(id, {
           status: statusFor(action),
           sources: state.fetchedSources.length ? state.fetchedSources : state.rankedSources,
           claims: state.claims,
           conflicts: state.conflicts,
+          state: currentResearchState,
+          coverage: currentResearchState.coverage,
         });
         if (action === "synthesize") {
           const evidence = this.assessEvidence(state);
+          const researchState = this.computeResearchState(state);
           if (!evidence.sufficient)
             answer = `Research stopped within its bounded budget before evidence was sufficient: ${evidence.reasons.join(
               "; ",
@@ -680,9 +801,10 @@ export class ResearchRunner {
               plan: state.plan,
               sources: state.fetchedSources,
               claims: state.claims,
+              researchState,
             })) as string;
           else
-            answer = `## Research summary\n\nOpenRouter is not configured, so automated synthesis is unavailable. MAX collected ${state.claims.length} claims from ${state.fetchedSources.filter((source) => source.content).length} pages.`;
+            answer = `## Research summary\n\nOpenRouter is not configured, so automated synthesis is unavailable. MAX collected ${state.claims.length} claims (${researchState.verifiedClaims.length} verified) across ${researchState.objectives.length} research objectives (${Math.round(researchState.coverage * 100)}% coverage) from ${state.fetchedSources.filter((source) => source.content).length} pages.`;
           await this.step(id, "✍️ synthesize", "complete");
           break;
         }
@@ -702,12 +824,15 @@ export class ResearchRunner {
           state.claims.length > 0
             ? `Research reached its bounded ${budget.maxSteps}-step budget with ${state.claims.length} claims. Review the evidence and sources collected.`
             : "Research ended without enough extractable evidence.";
+      const finalResearchState = this.computeResearchState(state);
       const complete = await this.update(id, {
         status: "COMPLETED",
         sources: state.fetchedSources.length ? state.fetchedSources : state.rankedSources,
         claims: state.claims,
         conflicts: state.conflicts,
         plan: state.plan,
+        state: finalResearchState,
+        coverage: finalResearchState.coverage,
         answer,
       });
       if (complete)

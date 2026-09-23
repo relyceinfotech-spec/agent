@@ -43,12 +43,44 @@ export interface Source extends SearchResult {
   };
   fetchError?: string;
 }
+export type ObjectiveStatus = "pending" | "investigating" | "fulfilled" | "partial" | "blocked";
+export type ObjectiveImportance = "critical" | "high" | "medium" | "low";
+export type ClaimImportance = "critical" | "high" | "medium" | "low";
+
+export interface ResearchObjective {
+  id: string;
+  label: string;
+  category: string;
+  importance: ObjectiveImportance;
+  status: ObjectiveStatus;
+  evidenceIds: string[];
+  sourceIds: string[];
+  coverage: number;
+  keyFinding?: string;
+}
+
+export interface ResearchState {
+  objectives: ResearchObjective[];
+  completedObjectives: string[];
+  missingObjectives: string[];
+  queries: string[];
+  sources: Source[];
+  claims: Claim[];
+  conflicts: Conflict[];
+  verifiedClaims: Claim[];
+  currentHypothesis?: string;
+  nextBestAction?: string;
+  coverage: number;
+}
+
 export interface Claim {
   id: string;
   text: string;
   sourceIds: string[];
   evidence: string;
   confidence: number;
+  importance?: ClaimImportance;
+  objectiveId?: string;
   verification?: {
     verdict: "supported" | "contradicted" | "uncertain" | "unavailable";
     rationale?: string;
@@ -90,6 +122,7 @@ export interface QueryGroup {
 }
 export interface ResearchPlan {
   objectives: string[];
+  structuredObjectives?: ResearchObjective[];
   queries: string[];
   queryGroups: QueryGroup[];
   interpretation: QueryInterpretation;
@@ -106,6 +139,8 @@ export interface ResearchSession {
   claims: Claim[];
   conflicts?: Conflict[];
   decisions?: ResearchDecision[];
+  state?: ResearchState;
+  coverage?: number;
   answer?: string;
   error?: string;
   steps: ResearchStep[];

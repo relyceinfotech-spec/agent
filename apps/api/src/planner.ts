@@ -7,6 +7,7 @@ import type {
   QueryInterpretation,
   LanguageProfile,
   ResponseFormatPreference,
+  ResearchObjective,
 } from "./domain.js";
 import { OpenRouterProvider } from "./llm.js";
 
@@ -423,13 +424,16 @@ export async function buildPlan(
         question,
         mode === "deep" ? 16 : 10,
       );
-      if (queries.length > 0)
+      if (queries.length > 0) {
+        const structuredObjectives = generateStructuredObjectives(interpretation, mode);
         return {
-          objectives: objectives.length > 0 ? objectives : defaultObjectives(interpretation),
+          objectives: objectives.length > 0 ? objectives : structuredObjectives.map((o) => o.label),
+          structuredObjectives,
           queries,
           queryGroups,
           interpretation,
         };
+      }
     } catch {
       /* heuristic query diversification remains available */
     }
@@ -439,16 +443,159 @@ export async function buildPlan(
     question,
     mode === "deep" ? 16 : 10,
   );
-  return { objectives: defaultObjectives(interpretation), queries, queryGroups, interpretation };
+  const structuredObjectives = generateStructuredObjectives(interpretation, mode);
+  return {
+    objectives: structuredObjectives.map((o) => o.label),
+    structuredObjectives,
+    queries,
+    queryGroups,
+    interpretation,
+  };
 }
 
-function defaultObjectives(interpretation: QueryInterpretation) {
+export function generateStructuredObjectives(
+  interpretation: QueryInterpretation,
+  mode: ResearchMode = "quick",
+): ResearchObjective[] {
+  const isComparison =
+    interpretation.formatPreference === "comparison" || interpretation.entities.length >= 2;
+  const isLookup = interpretation.formatPreference === "lookup";
+
+  if (isComparison) {
+    const e1 = interpretation.entities[0] || "Entity A";
+    const e2 = interpretation.entities[1] || "Entity B";
+    return [
+      {
+        id: "obj-core",
+        label: `Core architecture & feature parity between ${e1} and ${e2}`,
+        category: "architecture",
+        importance: "critical",
+        status: "pending",
+        evidenceIds: [],
+        sourceIds: [],
+        coverage: 0,
+      },
+      {
+        id: "obj-pricing",
+        label: `Pricing model, free tiers, and operational cost breakdown`,
+        category: "pricing",
+        importance: "critical",
+        status: "pending",
+        evidenceIds: [],
+        sourceIds: [],
+        coverage: 0,
+      },
+      {
+        id: "obj-perf",
+        label: `Performance benchmarks, scalability, and production limits`,
+        category: "performance",
+        importance: "high",
+        status: "pending",
+        evidenceIds: [],
+        sourceIds: [],
+        coverage: 0,
+      },
+      {
+        id: "obj-ecosystem",
+        label: `Developer experience, tooling ecosystem, and migration friction`,
+        category: "ecosystem",
+        importance: "high",
+        status: "pending",
+        evidenceIds: [],
+        sourceIds: [],
+        coverage: 0,
+      },
+      {
+        id: "obj-caveats",
+        label: `Known limitations, failure modes, and trade-offs`,
+        category: "limitations",
+        importance: "medium",
+        status: "pending",
+        evidenceIds: [],
+        sourceIds: [],
+        coverage: 0,
+      },
+    ];
+  }
+
+  if (isLookup) {
+    return [
+      {
+        id: "obj-version",
+        label: `Current official release version and status of ${interpretation.topic}`,
+        category: "status",
+        importance: "critical",
+        status: "pending",
+        evidenceIds: [],
+        sourceIds: [],
+        coverage: 0,
+      },
+      {
+        id: "obj-changes",
+        label: `Key breaking changes, release dates, and core updates`,
+        category: "features",
+        importance: "high",
+        status: "pending",
+        evidenceIds: [],
+        sourceIds: [],
+        coverage: 0,
+      },
+      {
+        id: "obj-official",
+        label: `Official release provenance and documentation citation`,
+        category: "documentation",
+        importance: "medium",
+        status: "pending",
+        evidenceIds: [],
+        sourceIds: [],
+        coverage: 0,
+      },
+    ];
+  }
+
+  // General / Deep research
+  const dims = interpretation.dimensions.slice(0, 3);
   return [
-    `Understand ${interpretation.topic}`,
-    "Find current primary and official sources",
-    "Compare independent perspectives",
-    `Evaluate ${interpretation.dimensions.slice(0, 4).join(", ")}`,
-    "Identify evidence, caveats, and disagreements",
+    {
+      id: "obj-foundation",
+      label: `Foundational concepts and authoritative definition of ${interpretation.topic}`,
+      category: "foundation",
+      importance: "critical",
+      status: "pending",
+      evidenceIds: [],
+      sourceIds: [],
+      coverage: 0,
+    },
+    {
+      id: "obj-evidence",
+      label: `Empirical evidence, benchmarks, and practical applications ${dims.length ? `(${dims.join(", ")})` : ""}`,
+      category: "evidence",
+      importance: "high",
+      status: "pending",
+      evidenceIds: [],
+      sourceIds: [],
+      coverage: 0,
+    },
+    {
+      id: "obj-tradeoffs",
+      label: `Critical analysis, limitations, caveats, and conflicting views`,
+      category: "criticism",
+      importance: "high",
+      status: "pending",
+      evidenceIds: [],
+      sourceIds: [],
+      coverage: 0,
+    },
+    {
+      id: "obj-synthesis",
+      label: `Industry best practices, current recommendations, and future direction`,
+      category: "best_practices",
+      importance: "medium",
+      status: "pending",
+      evidenceIds: [],
+      sourceIds: [],
+      coverage: 0,
+    },
   ];
 }
 
@@ -458,34 +605,57 @@ export async function rewriteQueries(
   results: SearchResult[],
   mode: ResearchMode,
   llm: OpenRouterProvider,
+  missingObjectives?: ResearchObjective[],
 ): Promise<string[]> {
   const existing = new Set(plan.queries.map((query) => query.toLowerCase()));
   const resultContext = results
     .slice(0, 8)
     .map((result) => `${result.title} — ${result.snippet}`)
     .join("\n");
+
+  // If missing objectives were provided, construct targeted search queries for those exact gaps
+  const targetedMissingQueries: string[] = [];
+  if (missingObjectives && missingObjectives.length > 0) {
+    const subject =
+      plan.interpretation.entities.length >= 2
+        ? `${plan.interpretation.entities[0]} vs ${plan.interpretation.entities[1]}`
+        : plan.interpretation.normalizedQuestion;
+    for (const obj of missingObjectives.slice(0, 3)) {
+      targetedMissingQueries.push(`${subject} ${obj.category} ${obj.label}`);
+      targetedMissingQueries.push(`${subject} ${obj.category} comparison analysis`);
+    }
+  }
+
   if (llm.enabled) {
     try {
+      const missingContext =
+        missingObjectives && missingObjectives.length > 0
+          ? `Missing research objectives that need evidence: ${missingObjectives.map((o) => `${o.label} (${o.category})`).join("; ")}`
+          : "";
       const raw = await llm.complete(
-        'Return JSON only as {"queries": string[]}. Rewrite the research queries because the first result set is weak. Use the normalized interpretation and missing dimensions. Never repeat the raw user sentence verbatim and never include instructions for the search engine.',
-        `Question provenance: ${question}\nInterpretation: ${JSON.stringify(plan.interpretation)}\nFirst result set:\n${resultContext}\nMode: ${mode}`,
+        'Return JSON only as {"queries": string[]}. Rewrite research queries targeting specific missing evidence gaps. Use the normalized interpretation and missing objectives. Never repeat the raw user sentence verbatim and never include instructions for the search engine.',
+        `Question provenance: ${question}\nInterpretation: ${JSON.stringify(plan.interpretation)}\n${missingContext}\nFirst result set:\n${resultContext}\nMode: ${mode}`,
       );
       const parsed = JSON.parse(cleanJson(raw)) as { queries?: string[] };
       if (Array.isArray(parsed.queries)) {
-        const rewritten = sanitizeQueries(parsed.queries, question, mode === "deep" ? 8 : 5).filter(
-          (candidate) => !existing.has(candidate.toLowerCase()),
-        );
+        const rewritten = sanitizeQueries(
+          [...targetedMissingQueries, ...parsed.queries],
+          question,
+          mode === "deep" ? 8 : 5,
+        ).filter((candidate) => !existing.has(candidate.toLowerCase()));
         if (rewritten.length > 0) return rewritten;
       }
     } catch {
       /* deterministic rewrite below */
     }
   }
+
   const subject =
     plan.interpretation.entities.length >= 2
       ? `${plan.interpretation.entities[0]} vs ${plan.interpretation.entities[1]}`
       : plan.interpretation.normalizedQuestion;
   const fallback = [
+    ...targetedMissingQueries,
     ...buildHeuristicGroups(plan.interpretation).flatMap((group) => group.queries),
     ...plan.interpretation.dimensions.map(
       (dimension) => `${subject} ${dimension} evidence sources`,

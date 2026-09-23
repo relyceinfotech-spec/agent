@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Claim, QueryInterpretation, ResearchPlan, Source } from "../domain.js";
+import type { Claim, QueryInterpretation, ResearchPlan, Source, ResearchState } from "../domain.js";
 import { extractHtml } from "../extract.js";
 import { OpenRouterProvider } from "../llm.js";
 import { understandQuery } from "../planner.js";
@@ -328,6 +328,7 @@ export function createToolRegistry(search: SearchProvider, llm: OpenRouterProvid
         sources?: Source[];
         claims?: Claim[];
         interpretation?: QueryInterpretation;
+        researchState?: ResearchState;
       };
       if (payload.kind === "direct") {
         if (!llm.enabled)
@@ -353,6 +354,7 @@ export function createToolRegistry(search: SearchProvider, llm: OpenRouterProvid
         payload.plan,
         payload.sources ?? [],
         payload.claims ?? [],
+        payload.researchState,
       );
     },
   });

@@ -7,6 +7,8 @@ export type ClaimItem = {
   text: string;
   evidence: string;
   confidence: number;
+  importance?: "critical" | "high" | "medium" | "low";
+  objectiveId?: string;
   verification?: {
     verdict: "supported" | "contradicted" | "uncertain" | "unavailable";
     rationale?: string;
@@ -51,12 +53,19 @@ export function EvidenceSection({ claims, isOpen, onToggle }: EvidenceSectionPro
               return (
                 <div key={claim.id || idx} className="claim-card-interactive">
                   <div className="claim-top-row">
-                    <span className={`verdict-tag ${verdict}`}>
-                      {verdict === "supported" && "✓ "}
-                      {verdict === "contradicted" && "✗ "}
-                      {verdict === "uncertain" && "? "}
-                      {verdict.toUpperCase()}
-                    </span>
+                    <div className="claim-badges-group">
+                      <span className={`verdict-tag ${verdict}`}>
+                        {verdict === "supported" && "✓ "}
+                        {verdict === "contradicted" && "✗ "}
+                        {verdict === "uncertain" && "? "}
+                        {verdict.toUpperCase()}
+                      </span>
+                      {claim.importance && (
+                        <span className={`claim-importance-tag importance-${claim.importance}`}>
+                          {claim.importance.toUpperCase()}
+                        </span>
+                      )}
+                    </div>
                     <span className="confidence-metric">{confidencePct}% confidence</span>
                   </div>
 

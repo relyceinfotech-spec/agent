@@ -5,6 +5,7 @@ import { MarkdownRenderer } from "../MarkdownRenderer";
 import { AgentActivity, deriveActivitySteps } from "./AgentActivity";
 import { SourcesDrawer, SourceItem } from "./SourcesDrawer";
 import { EvidenceSection, ClaimItem } from "./EvidenceSection";
+import { ObjectivesSection, ObjectiveItem } from "./ObjectivesSection";
 
 export type InterpretationData = {
   normalizedQuestion: string;
@@ -22,6 +23,15 @@ export type InterpretationData = {
   formatPreference?: string;
 };
 
+export type ResearchStateData = {
+  objectives: ObjectiveItem[];
+  completedObjectives: string[];
+  missingObjectives: string[];
+  coverage: number;
+  currentHypothesis?: string;
+  nextBestAction?: string;
+};
+
 export type SessionData = {
   id: string;
   question: string;
@@ -33,9 +43,12 @@ export type SessionData = {
   claims: ClaimItem[];
   conflicts?: Array<{ id: string; description: string; status: string }>;
   steps: Array<{ label: string; status: string; detail?: string }>;
+  state?: ResearchStateData;
+  coverage?: number;
   plan?: {
     queries: string[];
     queryGroups: Array<{ category: string; queries: string[] }>;
+    structuredObjectives?: ObjectiveItem[];
     interpretation: InterpretationData;
   };
 };
@@ -63,11 +76,16 @@ interface ResearchArtifactProps {
 export function ResearchArtifact({ item, onCancel, onClarify, onRetry }: ResearchArtifactProps) {
   const session = item.session;
   const isResearch = Boolean(session);
+  const [objectivesOpen, setObjectivesOpen] = useState(false);
   const [sourcesOpen, setSourcesOpen] = useState(false);
   const [evidenceOpen, setEvidenceOpen] = useState(false);
   const [highlightedSourceId, setHighlightedSourceId] = useState<string | null>(null);
   const [clarificationInput, setClarificationInput] = useState("");
   const [copiedAnswer, setCopiedAnswer] = useState(false);
+
+  const objectives = session?.state?.objectives || session?.plan?.structuredObjectives || [];
+  const coverageVal = session?.coverage ?? session?.state?.coverage;
+  const coveragePct = typeof coverageVal === "number" ? Math.round(coverageVal * 100) : null;
 
   // Derive runtime-truthful progress steps
   const activitySteps = deriveActivitySteps(session, Boolean(item.text), item.busy);
@@ -116,6 +134,15 @@ export function ResearchArtifact({ item, onCancel, onClarify, onRetry }: Researc
             <span className="artifact-agent-name">MAX</span>
             <span className="artifact-route-pill">{routeLabel}</span>
           </div>
+
+          {coveragePct !== null && (
+            <span
+              className="artifact-coverage-pill"
+              title="Weighted evidence coverage across research objectives"
+            >
+              🎯 {coveragePct}% Coverage
+            </span>
+          )}
 
           {item.interpretation?.language && (
             <span className="artifact-lang-tag" title={item.interpretation.language.respondIn}>
@@ -222,6 +249,16 @@ export function ResearchArtifact({ item, onCancel, onClarify, onRetry }: Researc
             </button>
           </div>
         </div>
+      )}
+
+      {/* Research Objectives & Coverage Panel */}
+      {isResearch && objectives.length > 0 && (
+        <ObjectivesSection
+          objectives={objectives}
+          coverage={coverageVal}
+          isOpen={objectivesOpen}
+          onToggle={() => setObjectivesOpen(!objectivesOpen)}
+        />
       )}
 
       {/* Cited Sources Panel */}
