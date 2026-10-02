@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ResearchSession } from "../src/domain.js";
 import { AutonomousAgent } from "../src/agent/autonomous.js";
-import { createToolRegistry } from "../src/agent/tools.js";
+import { createToolRegistry, ToolRegistry } from "../src/agent/tools.js";
 import { OpenRouterProvider } from "../src/llm.js";
 import type { ResearchRunner } from "../src/research.js";
 import { MemorySessionStore } from "../src/store.js";
@@ -48,18 +48,59 @@ describe("Single-Chat Autonomous Agent (Zero User Modes)", () => {
 
   it("current question → autonomous web search", async () => {
     const llm = new OpenRouterProvider();
-    const registry = createToolRegistry(
-      {
-        search: async () => [
-          {
-            title: "React v19.0.0 Release",
-            url: "https://react.dev/blog/2024/12/05/react-19",
-            snippet: "React 19 is now available on npm!",
-          },
-        ],
-      },
-      llm,
-    );
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "understand_query",
+      description: "fixture query interpretation",
+      execute: async () => ({
+        normalizedQuestion: "What's the latest React version?",
+        intent: "Find the current React release",
+        entities: ["React"],
+        topic: "React",
+        timeframe: "latest",
+        dimensions: ["release"],
+        corrections: [],
+        ambiguityScore: 0,
+        ambiguityReasons: [],
+        needsClarification: false,
+        formatPreference: "lookup",
+      }),
+    });
+    registry.register({
+      name: "web_search",
+      description: "fixture source discovery",
+      execute: async () => [
+        {
+          title: "React Versions – official documentation",
+          url: "https://react.dev/versions",
+          snippet: "Official React versions",
+        },
+        {
+          title: "React package metadata – npm registry",
+          url: "https://registry.npmjs.org/react/latest",
+          snippet: "Latest React package metadata",
+        },
+      ],
+    });
+    registry.register({
+      name: "fetch_url",
+      description: "fixture source retrieval",
+      execute: async (input) => ({ url: (input as { url: string }).url, html: "fixture" }),
+    });
+    registry.register({
+      name: "extract_content",
+      description: "fixture source extraction",
+      execute: async (input) => ({
+        content: (input as { url: string }).url.includes("npmjs")
+          ? "Source: react. Published version or release tag: 19.3.0."
+          : "Official React release history.",
+      }),
+    });
+    registry.register({
+      name: "synthesize",
+      description: "unused for structured React version lookup",
+      execute: async () => "Unexpected synthesis call",
+    });
     let runnerCalled = false;
     const runner = {
       start: async (question: string, mode: ResearchSession["mode"]) => {
@@ -79,7 +120,7 @@ describe("Single-Chat Autonomous Agent (Zero User Modes)", () => {
     expect(res.toolEvents.some((e) => e.tool === "web_search")).toBe(true);
     expect(res.session?.status).toBe("COMPLETED");
     expect(res.sources?.length).toBeGreaterThanOrEqual(1);
-    expect(res.answer).toBeDefined();
+    expect(res.answer).toContain("19.3.0");
 
     // Verify session stored for cited sources
     const stored = await store.get(res.researchId!);

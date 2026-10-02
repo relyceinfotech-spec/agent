@@ -2,16 +2,83 @@ import { z } from "zod";
 
 const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-  PORT: z.coerce.number().int().positive().default(4000),
-  APP_URL: z.string().url().default("http://localhost:4000"),
+  PORT: z.coerce.number().int().positive().default(8000),
+  APP_URL: z.string().url().default("http://localhost:8000"),
   WEB_URL: z.string().url().default("http://localhost:3000"),
-  SEARXNG_URL: z.string().url().default("http://localhost:8080"),
+  SERPER_API_KEY: z.string().optional(),
+  SERPER_GL: z.string().length(2).default("in"),
+  SERPER_HL: z.string().min(2).max(8).default("en"),
+  MAX_DATABASE_PATH: z.string().optional(),
+  MAX_PERSISTENCE_PROVIDER: z.enum(["sqlite", "supabase"]).optional(),
+  MAX_JOB_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(1),
+  MAX_JOB_LEASE_SECONDS: z.coerce.number().int().min(5).max(300).default(45),
+  MAX_JOB_POLL_INTERVAL_MS: z.coerce.number().int().min(100).max(10000).default(1000),
+  SUPABASE_URL: z.preprocess(
+    (value) => (value === "" ? undefined : value),
+    z.string().url().optional(),
+  ),
+  SUPABASE_SECRET_KEY: z.string().optional(),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
+  SUPABASE_PUBLISHABLE_KEY: z.preprocess(
+    (value) => (value === "" ? undefined : value),
+    z.string().optional(),
+  ),
+  MAX_USER_RESEARCH_PER_WINDOW: z.coerce.number().int().positive().max(10000).default(20),
+  MAX_USER_DEEP_RESEARCH_PER_WINDOW: z.coerce.number().int().positive().max(10000).default(3),
+  MAX_USER_FOLLOWUPS_PER_WINDOW: z.coerce.number().int().positive().max(10000).default(5),
+  USER_QUOTA_WINDOW_SECONDS: z.coerce.number().int().min(60).max(604800).default(86400),
+  MAX_DEFAULT_QUOTA_PLAN: z.string().min(1).default("default"),
+  MAX_QUOTA_PLANS_JSON: z.string().default(""),
+  MAX_USER_PLAN_OVERRIDES_JSON: z.string().default(""),
+  BROWSER_EXECUTABLE_PATH: z.string().optional(),
+  BROWSER_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
+  MAX_TOPIC_FEEDS: z.string().default("https://github.blog/feed/,https://blog.cloudflare.com/rss/"),
+  MAX_TOPIC_ALLOWED_DOMAINS: z
+    .string()
+    .default("github.blog,blog.cloudflare.com,react.dev,nodejs.org"),
+  MAX_TOPIC_MAX_AGE_DAYS: z.coerce.number().int().positive().default(14),
+  AUTONOMOUS_SCHEDULER_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  AUTONOMOUS_INTERVAL_MINUTES: z.coerce.number().int().positive().default(720),
+  MAX_ADMIN_TOKEN: z.string().optional(),
   OPENROUTER_API_KEY: z.string().optional(),
   OPENROUTER_MODEL: z.string().default("qwen/qwen3.7-flash"),
   OPENROUTER_BASE_URL: z.string().url().default("https://openrouter.ai/api/v1"),
   OPENROUTER_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
-  MAX_RESEARCH_STEPS: z.coerce.number().int().positive().default(8),
-  MAX_SEARCH_QUERIES: z.coerce.number().int().positive().default(20),
+  MEMORY_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+  EMBEDDING_PROVIDER: z.enum(["openrouter"]).default("openrouter"),
+  EMBEDDING_MODEL: z.string().min(1).max(120).default("openai/text-embedding-3-small"),
+  EMBEDDING_BASE_URL: z.string().url().default("https://openrouter.ai/api/v1"),
+  EMBEDDING_DIMENSIONS: z.coerce
+    .number()
+    .int()
+    .refine(
+      (value) => value === 1536,
+      "must match the 1536-dimensional research.max_user_memories vector column",
+    )
+    .default(1536),
+  EMBEDDING_TIMEOUT_MS: z.coerce.number().int().positive().max(30000).default(10000),
+  MEMORY_MAX_RECORDS: z.coerce.number().int().positive().max(500).default(500),
+  MEMORY_MAX_TEXT_CHARS: z.coerce.number().int().min(32).max(2000).default(2000),
+  MEMORY_MAX_EMBEDDING_BATCH: z.coerce.number().int().positive().max(8).default(8),
+  MEMORY_MAX_CANDIDATES: z.coerce.number().int().positive().max(100).default(50),
+  MEMORY_MAX_RESULTS: z.coerce.number().int().positive().max(8).default(5),
+  MEMORY_MAX_CONTEXT_CHARS: z.coerce.number().int().positive().max(12000).default(4000),
+  MEMORY_MIN_SIMILARITY: z.coerce.number().min(0).max(1).default(0.45),
+  POST_AGENT_PLANNER_MODEL: z.string().default(""),
+  POST_AGENT_RESEARCH_MODEL: z.string().default(""),
+  POST_AGENT_VERIFIER_MODEL: z.string().default(""),
+  POST_AGENT_PLANNER_FALLBACK_MODEL: z.string().default(""),
+  POST_AGENT_RESEARCH_FALLBACK_MODEL: z.string().default(""),
+  POST_AGENT_VERIFIER_FALLBACK_MODEL: z.string().default(""),
+  POST_AGENT_MODEL_TIMEOUT_MS: z.coerce.number().int().positive().max(60000).default(20000),
+  MAX_RESEARCH_STEPS: z.coerce.number().int().positive().default(24),
+  MAX_SEARCH_QUERIES: z.coerce.number().int().positive().default(8),
   MAX_SOURCES: z.coerce.number().int().positive().default(12),
   MAX_PAGES: z.coerce.number().int().positive().default(8),
   MAX_RESEARCH_TIME_MS: z.coerce.number().int().positive().default(180000),
@@ -24,14 +91,21 @@ const schema = z.object({
   EVAL_MAX_CASES: z.coerce.number().int().positive().default(7),
   EVAL_OPENROUTER_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   EVAL_CASE_NAMES: z.string().default(""),
-  EVAL_SMOKE_MAX_RESEARCH_STEPS: z.coerce.number().int().positive().default(6),
+  EVAL_SMOKE_MAX_RESEARCH_STEPS: z.coerce.number().int().positive().default(4),
   EVAL_SMOKE_MAX_SEARCH_QUERIES: z.coerce.number().int().positive().default(3),
   EVAL_SMOKE_MAX_SOURCES: z.coerce.number().int().positive().default(2),
   EVAL_SMOKE_MAX_PAGES: z.coerce.number().int().positive().default(1),
-  EVAL_SMOKE_MAX_RESEARCH_TIME_MS: z.coerce.number().int().positive().default(120000),
+  EVAL_SMOKE_MAX_RESEARCH_TIME_MS: z.coerce.number().int().positive().default(30000),
   EVAL_SMOKE_MAX_CASES: z.coerce.number().int().positive().default(3),
-  EVAL_SMOKE_OPENROUTER_TIMEOUT_MS: z.coerce.number().int().positive().default(45000),
-  FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(12000),
+  EVAL_SMOKE_OPENROUTER_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
+  EVAL_QUALITY_MAX_CASES: z.coerce.number().int().positive().default(5),
+  EVAL_QUALITY_MAX_RESEARCH_STEPS: z.coerce.number().int().positive().default(16),
+  EVAL_QUALITY_MAX_SEARCH_QUERIES: z.coerce.number().int().positive().default(6),
+  EVAL_QUALITY_MAX_SOURCES: z.coerce.number().int().positive().default(6),
+  EVAL_QUALITY_MAX_PAGES: z.coerce.number().int().positive().default(4),
+  EVAL_QUALITY_OPENROUTER_TIMEOUT_MS: z.coerce.number().int().positive().default(45000),
+  EVAL_QUALITY_SESSION_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
+  FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(8000),
   MAX_CONTENT_BYTES: z.coerce.number().int().positive().default(2_000_000),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_MAX_REQUESTS: z.coerce.number().int().positive().default(60),
@@ -40,3 +114,6 @@ const schema = z.object({
 });
 
 export const config = schema.parse(process.env);
+
+export const persistenceProvider =
+  config.MAX_PERSISTENCE_PROVIDER ?? (config.NODE_ENV === "production" ? "supabase" : "sqlite");

@@ -9,6 +9,8 @@ export type RecentItem = {
   deepResearch?: boolean;
 };
 
+export type SearchAvailability = "checking" | "ready" | "missing" | "offline";
+
 interface SidebarProps {
   isOpen: boolean;
   onToggle: () => void;
@@ -17,6 +19,7 @@ interface SidebarProps {
   onNewInvestigation: () => void;
   onClearHistory: () => void;
   theme: "light" | "dark";
+  searchAvailability: SearchAvailability;
   onToggleTheme: () => void;
 }
 
@@ -28,8 +31,16 @@ export function Sidebar({
   onNewInvestigation,
   onClearHistory,
   theme,
+  searchAvailability,
   onToggleTheme,
 }: SidebarProps) {
+  const searchStatus = {
+    checking: "Checking API and search…",
+    ready: "Online · Serper search ready",
+    missing: "Online · Serper key missing",
+    offline: "API unavailable · search offline",
+  }[searchAvailability];
+
   return (
     <>
       {/* Mobile Backdrop */}
@@ -114,10 +125,15 @@ export function Sidebar({
         {/* Capabilities & Status Footer */}
         <div className="sidebar-footer">
           <div className="system-status">
-            <span className="status-dot-live" />
+            <span
+              className={`status-dot ${searchAvailability === "ready" ? "status-dot-live" : `status-dot-${searchAvailability}`}`}
+              aria-hidden="true"
+            />
             <div className="status-info">
               <span className="status-title">Autonomous Core</span>
-              <span className="status-sub">Online · Live Search Ready</span>
+              <span className="status-sub" aria-live="polite">
+                {searchStatus}
+              </span>
             </div>
           </div>
 

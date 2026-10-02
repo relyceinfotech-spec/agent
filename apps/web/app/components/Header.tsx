@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import Link from "next/link";
 
 interface HeaderProps {
   onToggleSidebar: () => void;
@@ -8,6 +9,8 @@ interface HeaderProps {
   theme: "light" | "dark";
   onToggleTheme: () => void;
   onNewInvestigation: () => void;
+  userEmail?: string;
+  onSignOut: () => void;
 }
 
 export function Header({
@@ -16,6 +19,8 @@ export function Header({
   theme,
   onToggleTheme,
   onNewInvestigation,
+  userEmail,
+  onSignOut,
 }: HeaderProps) {
   return (
     <header className="workspace-header">
@@ -42,11 +47,14 @@ export function Header({
       </div>
 
       <div className="header-right">
+        <Link className="header-discover-link" href="/discover">
+          Discover
+        </Link>
         <div className="header-capabilities">
           <span className="cap-pill" title="Autonomous Routing">
             ⚡ Direct
           </span>
-          <span className="cap-pill" title="Live Web Search via SearXNG">
+          <span className="cap-pill" title="Live Google Search via Serper">
             🌐 Live Search
           </span>
           <span className="cap-pill" title="Multi-Source Evidence Verification">
@@ -63,6 +71,13 @@ export function Header({
           <span className="action-icon">+</span>
           <span className="action-label">New</span>
         </button>
+
+        <div className="header-account">
+          <span title={userEmail}>{userEmail || "Signed in"}</span>
+          <button type="button" className="header-signout-btn" onClick={onSignOut}>
+            Sign out
+          </button>
+        </div>
 
         <button
           type="button"

@@ -5,9 +5,11 @@
   "packageManager": "pnpm@9.15.4",
   "scripts": {
     "dev": "pnpm --parallel --filter @research-max/api --filter @research-max/web dev",
-    "build": "pnpm -r build",
+    "build": "pnpm --filter @research-max/api build && pnpm --filter @research-max/web build",
     "test": "pnpm -r test",
-    "typecheck": "pnpm -r typecheck",
+    "typecheck": "pnpm --filter @research-max/api typecheck && pnpm --filter @research-max/web typecheck",
+    "check:live-network": "pnpm --filter @research-max/api run check:live-network",
+    "eval:backend-integration": "pnpm --filter @research-max/api run eval:backend-integration",
     "format": "prettier --write \"apps/**/*.{ts,tsx,js,jsx,json,css}\" \"*.{json,yml,yaml}\"",
     "format:check": "prettier --check \"apps/**/*.{ts,tsx,js,jsx,json,css}\" \"*.{json,yml,yaml}\""
   },

@@ -1,6 +1,13 @@
 import dns from "node:dns/promises";
 import net from "node:net";
 import { URL } from "node:url";
+import { Agent, fetch as undiciFetch } from "undici";
+import {
+  getResearchExecutionContext,
+  raceWithResearchAbort,
+  remainingResearchTimeMs,
+  throwIfResearchInactive,
+} from "./execution-context.js";
 
 const BLOCKED_HOSTNAMES = new Set([
   "localhost",
@@ -33,19 +40,15 @@ const BLOCKED_INTERNAL_PORTS = new Set([
   3306, // MySQL
   5432, // PostgreSQL
   6379, // Redis
-  8080, // Often local dev/SearXNG - allow only public if resolved, blocked if private
+  8080, // Alternate HTTP port; private and loopback destinations remain blocked
   9200, // Elasticsearch
   11211, // Memcached
   27017, // MongoDB
 ]);
 
 export function privateIp(ip: string): boolean {
-  // Check for IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1)
-  const v4Mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
-  const targetIp = v4Mapped ? v4Mapped[1] : ip;
-
-  if (net.isIPv4(targetIp)) {
-    const parts = targetIp.split(".").map(Number);
+  if (net.isIPv4(ip)) {
+    const parts = ip.split(".").map(Number);
     if (parts.length !== 4 || parts.some((p) => isNaN(p) || p < 0 || p > 255)) {
       return true; // Invalid format treated as unsafe
     }
@@ -70,22 +73,59 @@ export function privateIp(ip: string): boolean {
     );
   }
 
-  if (net.isIPv6(targetIp)) {
-    const lower = targetIp.toLowerCase();
+  if (net.isIPv6(ip)) {
+    const words = parseIpv6Words(ip);
+    if (!words) return true;
+
+    // IPv4-mapped addresses can be written with dotted or hexadecimal tails.
+    // Classify the embedded IPv4 address so DNS answers cannot bypass SSRF checks.
+    if (words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff) {
+      const [high, low] = words.slice(6);
+      return privateIp([high >> 8, high & 0xff, low >> 8, low & 0xff].join("."));
+    }
+
+    const firstWord = words[0];
+    const allTrailingWordsZero = words.slice(1).every((word) => word === 0);
     return (
-      lower === "::1" ||
-      lower === "::" ||
-      lower.startsWith("fc") || // Unique Local Address (fc00::/7)
-      lower.startsWith("fd") || // Unique Local Address (fd00::/8)
-      lower.startsWith("fe8") || // Link-Local (fe80::/10)
-      lower.startsWith("fe9") ||
-      lower.startsWith("fea") ||
-      lower.startsWith("feb") ||
-      lower.startsWith("ff") // Multicast (ff00::/8)
+      (firstWord === 0 && allTrailingWordsZero) || // Unspecified address
+      (firstWord === 0 && words[7] === 1 && words.slice(1, 7).every((word) => word === 0)) || // Loopback
+      (firstWord & 0xfe00) === 0xfc00 || // Unique local (fc00::/7)
+      (firstWord & 0xffc0) === 0xfe80 || // Link-local (fe80::/10)
+      (firstWord & 0xffc0) === 0xfec0 || // Deprecated site-local (fec0::/10)
+      (firstWord & 0xff00) === 0xff00 // Multicast (ff00::/8)
     );
   }
 
   return true; // Any non-IP address is treated as unsafe for IP check
+}
+
+function parseIpv6Words(ip: string): number[] | undefined {
+  if (!net.isIPv6(ip)) return undefined;
+
+  let normalized = ip.toLowerCase();
+  const dottedTail = normalized.match(/(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (dottedTail) {
+    const octets = dottedTail[1].split(".").map(Number);
+    if (octets.some((octet) => octet < 0 || octet > 255)) return undefined;
+    const first = ((octets[0] << 8) | octets[1]).toString(16);
+    const second = ((octets[2] << 8) | octets[3]).toString(16);
+    const dottedTailIndex = normalized.length - dottedTail[1].length;
+    normalized = `${normalized.slice(0, dottedTailIndex)}${first}:${second}`;
+  }
+
+  const compressionIndex = normalized.indexOf("::");
+  const left = (compressionIndex === -1 ? normalized : normalized.slice(0, compressionIndex))
+    .split(":")
+    .filter(Boolean);
+  const right = (compressionIndex === -1 ? "" : normalized.slice(compressionIndex + 2))
+    .split(":")
+    .filter(Boolean);
+  const missingWords = compressionIndex === -1 ? 0 : 8 - left.length - right.length;
+  const words = [...left, ...Array.from({ length: missingWords }, () => "0"), ...right].map(
+    (word) => Number.parseInt(word, 16),
+  );
+
+  return words.length === 8 && words.every((word) => Number.isInteger(word)) ? words : undefined;
 }
 
 export async function assertSafeHttpUrl(raw: string): Promise<URL> {
@@ -196,22 +236,57 @@ export async function safeFetch(
   init: RequestInit = {},
   maxRedirects = 3,
   timeoutMs = 12000,
-): Promise<{ url: string; response: Response }> {
+): Promise<{ url: string; response: Response; dispose: () => Promise<void> }> {
   let currentUrl = urlInput;
   let redirectsCount = 0;
+  const runContext = getResearchExecutionContext();
+  throwIfResearchInactive();
+  const bounded = <T>(operation: Promise<T>) =>
+    runContext ? raceWithResearchAbort(operation, runContext.signal) : operation;
 
   while (true) {
-    const validatedUrl = await assertSafeHttpUrl(currentUrl);
+    const remainingMs = runContext ? runContext.deadlineAt - Date.now() : undefined;
+    if (remainingMs !== undefined && remainingMs <= 0) {
+      throw new Error("Research session deadline exhausted");
+    }
+    const validatedUrl = await bounded(assertSafeHttpUrl(currentUrl));
+    // Pin the connection to an address that was checked immediately before use.
+    const addresses = await bounded(
+      dns.lookup(validatedUrl.hostname, { all: true, verbatim: true }),
+    );
+    if (addresses.length === 0 || addresses.some((entry) => privateIp(entry.address))) {
+      throw new Error("Blocked private or unresolvable destination at connection time");
+    }
+    const selected = addresses[0];
+    const dispatcher = new Agent({
+      connect: {
+        autoSelectFamily: false,
+        lookup: (hostname, _options, callback) => {
+          if (hostname.toLowerCase() !== validatedUrl.hostname.toLowerCase()) {
+            callback(new Error("Unexpected connection hostname"), "", 4);
+            return;
+          }
+          callback(null, selected.address, selected.family);
+        },
+      },
+    });
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(
+      () => controller.abort(),
+      Math.min(timeoutMs, remainingMs ?? timeoutMs),
+    );
+    const signals = [controller.signal, init.signal, runContext?.signal].filter(
+      (signal): signal is AbortSignal => Boolean(signal),
+    );
 
     try {
-      const response = await fetch(validatedUrl, {
+      const response = (await undiciFetch(validatedUrl, {
         ...init,
-        signal: controller.signal,
+        signal: signals.length === 1 ? signals[0] : AbortSignal.any(signals),
         redirect: "manual", // Prevent automatic following of unsafe redirect destinations
-      });
+        dispatcher,
+      } as Parameters<typeof undiciFetch>[1])) as unknown as Response;
 
       // Handle HTTP redirects securely
       if ([301, 302, 303, 307, 308].includes(response.status)) {
@@ -225,14 +300,230 @@ export async function safeFetch(
         }
         const resolvedRedirect = new URL(location, validatedUrl).toString();
         // Re-validate the redirect destination against SSRF!
-        await assertSafeHttpUrl(resolvedRedirect);
+        await bounded(assertSafeHttpUrl(resolvedRedirect));
+        await response.body?.cancel();
+        await dispatcher.close();
         currentUrl = resolvedRedirect;
         continue;
       }
 
-      return { url: validatedUrl.toString(), response };
+      return {
+        url: validatedUrl.toString(),
+        response,
+        dispose: async () => dispatcher.close(),
+      };
+    } catch (error) {
+      dispatcher.destroy();
+      throw error;
     } finally {
       clearTimeout(timer);
     }
   }
+}
+
+function isTransientFetchError(error: unknown): boolean {
+  const messages: string[] = [];
+  let current: unknown = error;
+  while (current && typeof current === "object") {
+    const candidate = current as { message?: unknown; cause?: unknown };
+    if (typeof candidate.message === "string") messages.push(candidate.message);
+    current = candidate.cause;
+  }
+  return /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|network error|aborted/i.test(
+    messages.join(" "),
+  );
+}
+
+/** Retry transient fetch failures once; validation and permanent HTTP errors fail immediately. */
+export async function retryTransient<T>(
+  operation: () => Promise<T>,
+  maxAttempts = 2,
+  retryable: (error: unknown) => boolean = isTransientFetchError,
+): Promise<T> {
+  const attempts = Math.max(1, Math.min(3, Math.floor(maxAttempts)));
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (attempt >= attempts || !retryable(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
+    }
+  }
+  throw new Error("Fetch retry loop ended unexpectedly");
+}
+
+class RetryableHttpStatus extends Error {}
+
+export function isRetryableFetchStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+export async function safeFetchWithRetry(
+  urlInput: string,
+  init: RequestInit = {},
+  maxRedirects = 3,
+  timeoutMs = 12000,
+  maxAttempts = 2,
+): Promise<{ url: string; response: Response; dispose: () => Promise<void> }> {
+  return retryTransient(
+    async () => {
+      const fetched = await safeFetch(urlInput, init, maxRedirects, timeoutMs);
+      if (isRetryableFetchStatus(fetched.response.status)) {
+        await fetched.response.body?.cancel();
+        await fetched.dispose();
+        const retryAfter = Number(fetched.response.headers.get("retry-after"));
+        if (Number.isFinite(retryAfter) && retryAfter > 0) {
+          await new Promise((resolve) => setTimeout(resolve, Math.min(retryAfter * 1000, 1000)));
+        }
+        throw new RetryableHttpStatus(`Retryable HTTP status ${fetched.response.status}`);
+      }
+      return fetched;
+    },
+    maxAttempts,
+    (error) => {
+      const contextSignal = getResearchExecutionContext()?.signal;
+      return (
+        !init.signal?.aborted &&
+        !contextSignal?.aborted &&
+        (error instanceof RetryableHttpStatus || isTransientFetchError(error))
+      );
+    },
+  );
+}
+
+async function readWithDeadline<T>(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+  timeoutMessage: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const effectiveTimeout = remainingResearchTimeMs(timeoutMs) ?? timeoutMs;
+  if (effectiveTimeout <= 0) throw new Error("Research session deadline exhausted");
+  const signal = getResearchExecutionContext()?.signal;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      void reader.cancel().catch(() => undefined);
+      reject(new Error(timeoutMessage));
+    }, effectiveTimeout);
+  });
+  const aborted = signal
+    ? new Promise<never>((_, reject) => {
+        onAbort = () => {
+          void reader.cancel().catch(() => undefined);
+          reject(
+            signal.reason instanceof Error
+              ? signal.reason
+              : new Error("Research execution was cancelled"),
+          );
+        };
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      })
+    : undefined;
+  try {
+    return await Promise.race([operation(), deadline, ...(aborted ? [aborted] : [])]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/** Read a response body with a byte budget and the smaller of its timeout or session remainder. */
+export async function readBoundedText(
+  response: Response,
+  maxBytes: number,
+  timeoutMs: number,
+): Promise<string> {
+  const length = Number(response.headers.get("content-length") ?? 0);
+  if (length > maxBytes) throw new Error("Response exceeds content-size limit");
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Response body is empty");
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  await readWithDeadline(reader, timeoutMs, "Response body timed out", async () => {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      bytes += next.value.byteLength;
+      if (bytes > maxBytes) {
+        await reader.cancel();
+        throw new Error("Response exceeds content-size limit");
+      }
+      chunks.push(next.value);
+    }
+  });
+  const charset = response.headers.get("content-type")?.match(/charset=([^;\s]+)/i)?.[1];
+  let decoder: TextDecoder;
+  try {
+    decoder = new TextDecoder(charset ?? "utf-8");
+  } catch {
+    decoder = new TextDecoder("utf-8");
+  }
+  return decoder.decode(Buffer.concat(chunks));
+}
+
+/** Read only a bounded response prefix for metadata discovery; never buffer the remaining body. */
+export async function readBoundedPrefixText(
+  response: Response,
+  maxBytes: number,
+  timeoutMs: number,
+): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    await readWithDeadline(reader, timeoutMs, "Response prefix timed out", async () => {
+      while (bytes < maxBytes) {
+        const next = await reader.read();
+        if (next.done) break;
+        const remaining = maxBytes - bytes;
+        const chunk = next.value.subarray(0, remaining);
+        chunks.push(chunk);
+        bytes += chunk.byteLength;
+        if (chunk.byteLength < next.value.byteLength || bytes >= maxBytes) {
+          await reader.cancel();
+          break;
+        }
+      }
+    });
+    const charset = response.headers.get("content-type")?.match(/charset=([^;\s]+)/i)?.[1];
+    let decoder: TextDecoder;
+    try {
+      decoder = new TextDecoder(charset ?? "utf-8");
+    } catch {
+      decoder = new TextDecoder("utf-8");
+    }
+    return decoder.decode(Buffer.concat(chunks));
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+export async function readBoundedBytes(
+  response: Response,
+  maxBytes: number,
+  timeoutMs: number,
+): Promise<Uint8Array> {
+  const length = Number(response.headers.get("content-length") ?? 0);
+  if (length > maxBytes) throw new Error("Response exceeds content-size limit");
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Response body is empty");
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  await readWithDeadline(reader, timeoutMs, "Response body timed out", async () => {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      bytes += next.value.byteLength;
+      if (bytes > maxBytes) {
+        await reader.cancel();
+        throw new Error("Response exceeds content-size limit");
+      }
+      chunks.push(next.value);
+    }
+  });
+  return Buffer.concat(chunks);
 }

@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Sidebar, RecentItem } from "./components/Sidebar";
+import { useRouter } from "next/navigation";
+import { Sidebar, RecentItem, SearchAvailability } from "./components/Sidebar";
 import { Header } from "./components/Header";
 import { HeroLanding } from "./components/HeroLanding";
 import { ChatComposer } from "./components/ChatComposer";
@@ -11,10 +12,15 @@ import {
   SessionData,
   InterpretationData,
 } from "./components/ResearchArtifact";
+import { useAuth } from "./auth-provider";
+import { authenticatedFetch } from "./supabase-browser";
+import { getApiBaseUrl } from "./api-url";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
+const API = getApiBaseUrl(process.env.NEXT_PUBLIC_API_URL, process.env.NODE_ENV);
 
 export default function Home() {
+  const { ready: authReady, session, signOut } = useAuth();
+  const router = useRouter();
   const [messages, setMessages] = useState<ResearchMessageItem[]>([]);
   const [input, setInput] = useState("");
   const [deepResearch, setDeepResearch] = useState(false);
@@ -23,14 +29,52 @@ export default function Home() {
   const [theme, setTheme] = useState<"light" | "dark">("dark");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [recentSearches, setRecentSearches] = useState<RecentItem[]>([]);
+  const [searchAvailability, setSearchAvailability] = useState<SearchAvailability>("checking");
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  useEffect(() => {
+    if (authReady && !session) router.replace("/login");
+  }, [authReady, router, session]);
+
+  useEffect(() => {
+    if (!session) return;
+    try {
+      const savedRecent = localStorage.getItem(`max_recent_inquiries:${session.user.id}`);
+      setRecentSearches(savedRecent ? JSON.parse(savedRecent) : []);
+    } catch {
+      setRecentSearches([]);
+    }
+    setMessages([]);
+    setActiveSessionId(null);
+    setBusy(false);
+  }, [session?.user.id]);
+
   // Initialize service worker, theme, and saved recent searches
   useEffect(() => {
+    const readinessController = new AbortController();
+    void fetch(`${API}/ready`, {
+      cache: "no-store",
+      signal: readinessController.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Readiness request failed (${response.status})`);
+        return (await response.json()) as { search?: string };
+      })
+      .then((readiness) =>
+        setSearchAvailability(readiness.search === "configured" ? "ready" : "missing"),
+      )
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.name === "AbortError") return;
+        setSearchAvailability("offline");
+      });
+
     if ("serviceWorker" in navigator) {
-      void navigator.serviceWorker.register("/sw.js");
+      void navigator.serviceWorker
+        .register("/sw.js", { updateViaCache: "none" })
+        .then((registration) => registration.update())
+        .catch(() => undefined);
     }
 
     // Theme initialization
@@ -47,15 +91,7 @@ export default function Home() {
       setSidebarOpen(false);
     }
 
-    // Load recent investigations
-    try {
-      const savedRecent = localStorage.getItem("max_recent_inquiries");
-      if (savedRecent) {
-        setRecentSearches(JSON.parse(savedRecent));
-      }
-    } catch {
-      // Ignored
-    }
+    return () => readinessController.abort();
   }, []);
 
   function toggleTheme() {
@@ -78,7 +114,9 @@ export default function Home() {
         ...filtered,
       ].slice(0, 20); // Keep last 20
       try {
-        localStorage.setItem("max_recent_inquiries", JSON.stringify(updated));
+        if (session) {
+          localStorage.setItem(`max_recent_inquiries:${session.user.id}`, JSON.stringify(updated));
+        }
       } catch {
         // Ignored
       }
@@ -89,7 +127,7 @@ export default function Home() {
   function handleClearHistory() {
     setRecentSearches([]);
     try {
-      localStorage.removeItem("max_recent_inquiries");
+      if (session) localStorage.removeItem(`max_recent_inquiries:${session.user.id}`);
     } catch {
       // Ignored
     }
@@ -109,45 +147,50 @@ export default function Home() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Server-Sent Events subscription for active research session
+  // Authenticated polling keeps private session state behind the bearer-token guard.
   useEffect(() => {
-    if (!activeSessionId) return;
-    const events = new EventSource(`${API}/api/research/${activeSessionId}/events`);
+    if (!activeSessionId || !session) return;
+    const pollController = new AbortController();
+    let stopped = false;
+    let pollInFlight = false;
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
 
-    events.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data) as { session?: SessionData };
-        if (payload.session) {
-          updateSessionInMessages(payload.session);
-          if (
-            ["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CLARIFICATION"].includes(
-              payload.session.status,
-            )
-          ) {
-            setActiveSessionId(null);
-            setBusy(false);
-          }
-        }
-      } catch {
-        // Fallback polling on parse failure
-        fetch(`${API}/api/research/${activeSessionId}`)
-          .then((r) => r.json())
-          .then((s: SessionData) => {
-            updateSessionInMessages(s);
-            if (["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CLARIFICATION"].includes(s.status)) {
-              setActiveSessionId(null);
-              setBusy(false);
-            }
-          });
+    function applySession(session: SessionData) {
+      updateSessionInMessages(session);
+      if (["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CLARIFICATION"].includes(session.status)) {
+        setActiveSessionId(null);
+        setBusy(false);
+        return true;
       }
-    };
+      return false;
+    }
 
-    events.onerror = () => {
-      events.close();
-    };
+    async function pollSession() {
+      if (stopped || pollInFlight) return;
+      pollInFlight = true;
+      try {
+        const response = await authenticatedFetch(`${API}/api/research/${activeSessionId}`, {
+          signal: pollController.signal,
+        });
+        if (!response.ok) throw new Error(`Research status returned HTTP ${response.status}`);
+        const session = (await response.json()) as SessionData;
+        applySession(session);
+      } catch {
+        // Keep polling after transient failures; the session may still be running.
+      } finally {
+        pollInFlight = false;
+      }
+    }
 
-    return () => events.close();
-  }, [activeSessionId]);
+    void pollSession();
+    pollTimer = setInterval(() => void pollSession(), 2000);
+
+    return () => {
+      stopped = true;
+      pollController.abort();
+      if (pollTimer) clearInterval(pollTimer);
+    };
+  }, [activeSessionId, session?.user.id]);
 
   function updateSessionInMessages(updated: SessionData) {
     setMessages((prev) =>
@@ -200,7 +243,7 @@ export default function Home() {
     abortControllerRef.current = controller;
 
     try {
-      const response = await fetch(`${API}/api/chat`, {
+      const response = await authenticatedFetch(`${API}/api/chat`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ message: textToSend, deepResearch: useDeep }),
@@ -295,7 +338,7 @@ export default function Home() {
     const idToCancel = sessionId || activeSessionId;
     if (idToCancel) {
       try {
-        await fetch(`${API}/api/research/${idToCancel}/cancel`, { method: "POST" });
+        await authenticatedFetch(`${API}/api/research/${idToCancel}/cancel`, { method: "POST" });
       } catch {
         // Ignored
       }
@@ -320,14 +363,13 @@ export default function Home() {
     if (!answerText.trim()) return;
     try {
       setBusy(true);
-      await fetch(`${API}/api/research/${sessionId}/clarify`, {
+      await authenticatedFetch(`${API}/api/research/${sessionId}/clarify`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ answer: answerText }),
       });
       setActiveSessionId(sessionId);
-    } catch (e) {
-      console.error(e);
+    } catch {
       setBusy(false);
     }
   }
@@ -340,6 +382,16 @@ export default function Home() {
       : firstUserMessage
     : undefined;
 
+  if (!authReady || !session) {
+    return (
+      <main className="content-shell">
+        <div className="content-state" role="status">
+          {authReady ? "Opening sign in…" : "Restoring your MAX session…"}
+        </div>
+      </main>
+    );
+  }
+
   return (
     <div className="research-workspace-layout">
       {/* Persistent / Responsive Sidebar */}
@@ -351,6 +403,7 @@ export default function Home() {
         onNewInvestigation={handleNewInvestigation}
         onClearHistory={handleClearHistory}
         theme={theme}
+        searchAvailability={searchAvailability}
         onToggleTheme={toggleTheme}
       />
 
@@ -362,6 +415,11 @@ export default function Home() {
           theme={theme}
           onToggleTheme={toggleTheme}
           onNewInvestigation={handleNewInvestigation}
+          userEmail={session.user.email}
+          onSignOut={async () => {
+            await signOut();
+            router.replace("/login");
+          }}
         />
 
         <main className="workspace-scroll-area">

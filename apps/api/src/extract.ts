@@ -10,6 +10,27 @@ export interface ExtractedDocument {
   language?: string;
   content: string;
   headings: string[];
+  contentType?: "html" | "rss" | "pdf" | "structured";
+}
+
+export function extractRetrievedDocument(
+  raw: string,
+  url: URL,
+  contentType: string,
+  sourceUrl?: string,
+): ExtractedDocument {
+  // The npm registry serves package metadata as text/plain on some paths.
+  // Treat that specific JSON payload as structured evidence rather than HTML.
+  if (
+    /application\/json/i.test(contentType) ||
+    (url.hostname === "registry.npmjs.org" && /^\s*\{/.test(raw))
+  ) {
+    return extractStructuredJson(raw, url);
+  }
+  if (/(?:rss|atom)\+xml|(?:text|application)\/xml/i.test(contentType)) {
+    return extractFeed(raw, url, sourceUrl);
+  }
+  return extractHtml(raw, url);
 }
 
 export function extractHtml(html: string, url: URL): ExtractedDocument {
@@ -28,7 +49,36 @@ export function extractHtml(html: string, url: URL): ExtractedDocument {
     .get()
     .filter(Boolean)
     .slice(0, 50);
-  const content = $("article").text() || $("main").text() || $("body").text();
+  const paragraphSelector = "p,h1,h2,h3,h4,blockquote";
+  const paragraphsIn = (element: typeof $ extends (input: infer T) => unknown ? T : never) =>
+    $(element)
+      .find(paragraphSelector)
+      .toArray()
+      .map((paragraph) => $(paragraph).text().replace(/\s+/g, " ").trim())
+      .filter((paragraph) => paragraph.length >= 30 && paragraph.length <= 3000);
+  const contentScore = (element: typeof $ extends (input: infer T) => unknown ? T : never) =>
+    paragraphsIn(element).reduce((total, paragraph) => total + paragraph.length, 0);
+  const explicitRoots = $(
+    "[itemprop='articleBody'],.post__content,.entry-content,.article-content,[class*='article-body']",
+  )
+    .toArray()
+    .sort((first, second) => contentScore(second) - contentScore(first));
+  const articleRoots = $("article")
+    .toArray()
+    .sort((first, second) => contentScore(second) - contentScore(first));
+  const mainRoot = $("main,[role='main']").first().get(0);
+  const bodyRoot = $("body").first().get(0);
+  const explicitRoot = explicitRoots.find((element) => contentScore(element) >= 120);
+  const articleRoot = articleRoots.find((element) => contentScore(element) >= 120);
+  const root = explicitRoot ?? articleRoot ?? mainRoot ?? bodyRoot;
+  const paragraphs = root ? paragraphsIn(root) : [];
+  const distinctParagraphs = [...new Set(paragraphs)];
+  const content =
+    distinctParagraphs.join("\n\n").length >= 120
+      ? distinctParagraphs.join("\n\n")
+      : root
+        ? $(root).text()
+        : "";
   return {
     title: title.replace(/\s+/g, " ").trim(),
     description: description.trim(),
@@ -37,7 +87,152 @@ export function extractHtml(html: string, url: URL): ExtractedDocument {
     canonicalUrl,
     domain: url.hostname,
     language: $("html").attr("lang"),
-    content: content.replace(/\s+/g, " ").trim(),
+    content: content
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim(),
     headings,
+    contentType: "html",
   };
+}
+
+export function extractFeed(xml: string, url: URL, sourceUrl?: string): ExtractedDocument {
+  const $ = cheerio.load(xml, { xmlMode: true });
+  const entries = $("item,entry").slice(0, 30).toArray();
+  const normalizePublishedDate = (value: string): string => {
+    const timestamp = Date.parse(value);
+    if (!Number.isFinite(timestamp)) return value.replace(/\s+/g, " ").trim();
+    return new Date(timestamp).toISOString().slice(0, 10);
+  };
+  const normalize = (value: string) => {
+    try {
+      const parsed = new URL(value);
+      parsed.hash = "";
+      for (const key of ["utm_source", "utm_medium", "utm_campaign", "fbclid", "gclid"])
+        parsed.searchParams.delete(key);
+      return parsed.toString().replace(/\/$/, "");
+    } catch {
+      return value;
+    }
+  };
+  const matchingEntries = sourceUrl
+    ? entries.filter((entry) => {
+        const item = $(entry);
+        const link = item.find("link").first();
+        const href =
+          link.attr("href") || link.text().trim() || item.find("id").first().text().trim();
+        return href && normalize(new URL(href, url).toString()) === normalize(sourceUrl);
+      })
+    : entries;
+  const selectedEntries = sourceUrl ? matchingEntries : entries;
+  const content = selectedEntries
+    .map((entry) => {
+      const item = $(entry);
+      const title = item.find("title").first().text().trim();
+      const description = $(entry).find("description,summary,content").first().text().trim();
+      const published = item.find("pubDate,published,updated,date").first().text().trim();
+      const categories = item
+        .find("category")
+        .map((_, category) => $(category).attr("term") ?? $(category).text().trim())
+        .get()
+        .filter(Boolean);
+      const status = item.find("prerelease,draft,release-status,status").first().text().trim();
+      return [
+        title,
+        published ? `published: ${normalizePublishedDate(published)}` : "",
+        status ? `status: ${status}` : "",
+        categories.length ? `categories: ${categories.join(", ")}` : "",
+        description,
+      ]
+        .filter(Boolean)
+        .join(" | ");
+    })
+    .join("\n\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return {
+    title:
+      sourceUrl && selectedEntries.length > 0
+        ? $(selectedEntries[0]).find("title").first().text().trim()
+        : $("channel > title,feed > title").first().text().trim(),
+    description: $("channel > description,feed > subtitle").first().text().trim(),
+    author:
+      selectedEntries.length > 0
+        ? $(selectedEntries[0])
+            .find("author name,author,email,dc\\:creator")
+            .first()
+            .text()
+            .trim() || undefined
+        : undefined,
+    publishedAt:
+      selectedEntries.length > 0
+        ? $(selectedEntries[0]).find("pubDate,published,updated,date").first().text().trim() ||
+          undefined
+        : undefined,
+    canonicalUrl:
+      selectedEntries.length > 0
+        ? (() => {
+            const entry = $(selectedEntries[0]);
+            const link = entry.find("link").first();
+            const href = link.attr("href") ?? link.text().trim();
+            return href ? new URL(href, url).toString() : undefined;
+          })()
+        : undefined,
+    domain: url.hostname,
+    content,
+    headings: selectedEntries
+      .map((entry) => $(entry).find("title").first().text().trim())
+      .filter(Boolean),
+    contentType: "rss",
+  };
+}
+
+export function extractStructuredJson(raw: string, url: URL): ExtractedDocument {
+  const data = JSON.parse(raw) as unknown;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("Structured source is not a supported JSON object");
+  }
+  const record = data as Record<string, unknown>;
+  const field = (name: string) =>
+    typeof record[name] === "string"
+      ? (record[name] as string).replace(/\s+/g, " ").trim().slice(0, 1000)
+      : undefined;
+  const name = field("name") ?? field("full_name") ?? url.hostname;
+  const version = field("version") ?? field("tag_name");
+  const description = field("description") ?? field("body") ?? "";
+  const publishedAt = field("published_at") ?? field("created_at");
+  const content = [
+    `Source: ${name}.`,
+    version ? `Published version or release tag: ${version}.` : "",
+    description ? `Description: ${description}.` : "",
+    publishedAt ? `Publication timestamp: ${publishedAt}.` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return {
+    title: `${name}${version ? ` ${version}` : ""}`,
+    description,
+    publishedAt,
+    domain: url.hostname,
+    content,
+    headings: [],
+    contentType: "structured",
+  };
+}
+
+export function validateExtraction(document: ExtractedDocument): void {
+  const content = document.content.trim();
+  if (content.length < (document.contentType === "structured" ? 40 : 120)) {
+    throw new Error("Extracted content is too short to use as evidence");
+  }
+  const rejection = [
+    /verify you are human/i,
+    /attention required.{0,80}cloudflare/i,
+    /enable javascript to continue/i,
+    /sign in to continue/i,
+    /access denied/i,
+    /captcha/i,
+  ].find((pattern) => pattern.test(content.slice(0, 1500)));
+  if (rejection) throw new Error("Retrieved page is a challenge, login, or access-denied page");
 }

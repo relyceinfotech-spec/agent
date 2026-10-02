@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { Claim, ResearchSession, SearchResult } from "../src/domain.js";
-import { ToolRegistry } from "../src/agent/tools.js";
-import { ResearchRunner } from "../src/research.js";
+import { createToolRegistry, ToolRegistry } from "../src/agent/tools.js";
+import { OpenRouterProvider } from "../src/llm.js";
+import { ResearchRunner, selectVerificationClaims } from "../src/research.js";
 import { MemorySessionStore } from "../src/store.js";
 
 const primaryResult: SearchResult = {
@@ -142,7 +143,21 @@ function createRegistry(
   registry.register({
     name: "synthesize",
     description: "test synthesis",
-    execute: async () => "Cited test answer",
+    execute: async (input) => {
+      const payload = input as { claims?: Claim[]; sources?: Array<{ id: string }> };
+      const sourceNumbers = new Map(
+        (payload.sources ?? []).map((source, index) => [source.id, index + 1]),
+      );
+      const claim = (payload.claims ?? []).find((candidate) =>
+        candidate.sourceIds.some((sourceId) => sourceNumbers.has(sourceId)),
+      );
+      const sourceNumber = claim?.sourceIds
+        .map((sourceId) => sourceNumbers.get(sourceId))
+        .find((number): number is number => number !== undefined);
+      return claim && sourceNumber
+        ? `${claim.text} [${sourceNumber}]`
+        : "Insufficient evidence to provide a verified answer.";
+    },
   });
   return registry;
 }
@@ -160,6 +175,85 @@ async function runResearch(
 }
 
 describe("tool decision quality", () => {
+  it("routes conflicting versioned latest-release claims to conflict verification", async () => {
+    class OfflineVerifier extends OpenRouterProvider {
+      override get enabled() {
+        return false;
+      }
+    }
+
+    const registry = createToolRegistry({ search: async () => [] }, new OfflineVerifier());
+    const conflicts = await registry.execute("detect_conflict", {
+      claims: [
+        {
+          id: "website-latest",
+          text: "React 2.9.0 is the latest stable release.",
+          evidence: "React 2.9.0 is the latest stable release.",
+          sourceIds: ["official-site"],
+          confidence: 1,
+          verification: { verdict: "supported" },
+        },
+        {
+          id: "github-latest",
+          text: "React 2.10.0 is the latest stable release.",
+          evidence: "React 2.10.0 is the latest stable release.",
+          sourceIds: ["official-github"],
+          confidence: 1,
+          verification: { verdict: "supported" },
+        },
+      ],
+    });
+
+    expect(conflicts).toEqual([
+      expect.objectContaining({
+        claimIds: ["website-latest", "github-latest"],
+        sourceIds: ["official-site", "official-github"],
+        description: "Sources identify different versions as the latest release",
+        status: "open",
+      }),
+    ]);
+  });
+
+  it("does not treat different products as conflicting latest-release claims", async () => {
+    class OfflineVerifier extends OpenRouterProvider {
+      override get enabled() {
+        return false;
+      }
+    }
+
+    const registry = createToolRegistry({ search: async () => [] }, new OfflineVerifier());
+    const conflicts = await registry.execute("detect_conflict", {
+      claims: [
+        {
+          id: "react-latest",
+          text: "React 2.9.0 is the latest stable release.",
+          evidence: "React 2.9.0 is the latest stable release.",
+          sourceIds: ["react-source"],
+          confidence: 1,
+          verification: { verdict: "supported" },
+        },
+        {
+          id: "react-native-latest",
+          text: "React Native 0.83.0 is the latest stable release.",
+          evidence: "React Native 0.83.0 is the latest stable release.",
+          sourceIds: ["react-native-source"],
+          confidence: 1,
+          verification: { verdict: "supported" },
+        },
+      ],
+    });
+
+    expect(conflicts).toEqual([]);
+  });
+
+  it("allocates verification slots across sources before taking a second claim from one source", () => {
+    const claims = [makeClaim("source-a", 1), makeClaim("source-a", 2), makeClaim("source-b", 3)];
+    expect(selectVerificationClaims(claims, 2).map((claim) => claim.id)).toEqual([
+      "claim-1",
+      "claim-3",
+    ]);
+  });
+
   it("fetches only triaged relevant sources instead of every search result", async () => {
     const observedQueries: string[][] = [];
     const fetchedUrls: string[] = [];
@@ -213,5 +307,70 @@ describe("tool decision quality", () => {
     expect(completed?.status).toBe("COMPLETED");
     expect(observedQueries).toHaveLength(1);
     expect(completed?.steps.some((step) => step.label.includes("search_again"))).toBe(false);
+  });
+
+  it("reserves pages for conflict follow-up instead of exhausting retrieval on the first pass", async () => {
+    const fetchedUrls: string[] = [];
+    const initialResults = [
+      primaryResult,
+      secondaryResult,
+      {
+        title: "Independent React Native and Flutter performance analysis",
+        url: "https://analysis.example.org/mobile-performance",
+        snippet: "Detailed comparison of React Native and Flutter performance.",
+      },
+      {
+        title: "React Native Flutter benchmark methodology",
+        url: "https://benchmarks.example.net/mobile-performance",
+        snippet: "Reproducible performance methods for React Native and Flutter.",
+      },
+    ];
+    const registry = createRegistry(initialResults, initialResults, [], fetchedUrls);
+    let firstPassFetches = -1;
+    registry.register({
+      name: "search_again",
+      description: "observe reserved fetch budget",
+      execute: async () => {
+        firstPassFetches = fetchedUrls.length;
+        return initialResults;
+      },
+    });
+    let conflictChecks = 0;
+    registry.register({
+      name: "detect_conflict",
+      description: "conflict on first pass",
+      execute: async () => {
+        conflictChecks += 1;
+        return conflictChecks === 1
+          ? [
+              {
+                claimIds: ["claim-0", "claim-1"],
+                sourceIds: [],
+                description: "Results disagree",
+                status: "open",
+              },
+            ]
+          : [];
+      },
+    });
+    const store = new MemorySessionStore();
+    const runner = new ResearchRunner(store, { search: async () => [] }, undefined, registry, {
+      maxSteps: 20,
+      maxQueries: 6,
+      maxPages: 4,
+      maxSources: 4,
+      maxSearchPasses: 1,
+      maxTimeMs: 5000,
+    });
+    const started = await runner.start("Compare React Native and Flutter performance", "quick");
+    const completed = await waitForCompletion(store, started.id);
+
+    expect(completed?.status).toBe("COMPLETED");
+    expect(completed?.error).toBeUndefined();
+    expect(completed?.answer).toContain("[1]");
+    expect(firstPassFetches).toBe(2);
+    expect(fetchedUrls).toHaveLength(4);
+    expect(completed?.steps.some((step) => step.label.includes("search_again"))).toBe(true);
+    expect(completed?.steps.some((step) => step.label.includes("synthesize"))).toBe(true);
   });
 });

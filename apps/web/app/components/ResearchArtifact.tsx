@@ -6,6 +6,7 @@ import { AgentActivity, deriveActivitySteps } from "./AgentActivity";
 import { SourcesDrawer, SourceItem } from "./SourcesDrawer";
 import { EvidenceSection, ClaimItem } from "./EvidenceSection";
 import { ObjectivesSection, ObjectiveItem } from "./ObjectivesSection";
+import { ExportControl } from "./ExportControl";
 
 export type InterpretationData = {
   normalizedQuestion: string;
@@ -42,7 +43,7 @@ export type SessionData = {
   sources: SourceItem[];
   claims: ClaimItem[];
   conflicts?: Array<{ id: string; description: string; status: string }>;
-  steps: Array<{ label: string; status: string; detail?: string }>;
+  steps: Array<{ id?: string; label: string; status: string; detail?: string }>;
   state?: ResearchStateData;
   coverage?: number;
   plan?: {
@@ -116,11 +117,17 @@ export function ResearchArtifact({ item, onCancel, onClarify, onRetry }: Researc
   }
 
   // Derive route badge
+  const hasRetrievedSources = Boolean(
+    session?.sources.some((source) => source.content?.trim() && !source.fetchError),
+  );
+  const sessionError = session?.status === "FAILED" ? session.error : undefined;
   const routeLabel = item.deepResearch
     ? "DEEP RESEARCH REPORT"
-    : session?.sources && session.sources.length > 0
+    : hasRetrievedSources
       ? "LIVE WEB SYNTHESIS"
-      : "DIRECT SYNTHESIS";
+      : sessionError
+        ? "RESEARCH INCOMPLETE"
+        : "DIRECT SYNTHESIS";
 
   return (
     <article className="research-artifact-card" aria-label="Research synthesis artifact">
@@ -170,6 +177,9 @@ export function ResearchArtifact({ item, onCancel, onClarify, onRetry }: Researc
               <span>{copiedAnswer ? "Copied" : "Copy Brief"}</span>
             </button>
           )}
+          {session?.status === "COMPLETED" && (
+            <ExportControl resourceType="research_session" resourceId={session.id} nextPath="/" />
+          )}
         </div>
       </div>
 
@@ -177,7 +187,7 @@ export function ResearchArtifact({ item, onCancel, onClarify, onRetry }: Researc
       {activitySteps.length > 0 && <AgentActivity steps={activitySteps} isBusy={item.busy} />}
 
       {/* Error state with Retry action */}
-      {item.error && (
+      {(item.error || sessionError) && (
         <div className="artifact-error-banner" role="alert">
           <div className="error-content">
             <span className="error-icon" aria-hidden="true">
@@ -185,7 +195,7 @@ export function ResearchArtifact({ item, onCancel, onClarify, onRetry }: Researc
             </span>
             <div className="error-message">
               <strong>Investigation interrupted</strong>
-              <p>{item.error}</p>
+              <p>{item.error || sessionError}</p>
             </div>
           </div>
           <button

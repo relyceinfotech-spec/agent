@@ -6,7 +6,7 @@ export type ActivityStep = {
   id: string;
   icon: string;
   label: string;
-  status: "complete" | "running" | "pending";
+  status: "complete" | "running" | "pending" | "failed";
 };
 
 interface AgentActivityProps {
@@ -97,7 +97,11 @@ export function deriveActivitySteps(
   );
   const hasConflict = sessionSteps.some((s) => s.label.includes("detect_conflict"));
   const hasSynthesis = sessionSteps.some((s) => s.label.includes("synthesize"));
-  const isCompleted = ["COMPLETED"].includes(session.status);
+  const isCompleted = session.status === "COMPLETED";
+  const phaseFailed = (phase: string) =>
+    sessionSteps.some(
+      (step) => step.label.toLowerCase().includes(phase) && step.status === "failed",
+    );
 
   // 2. Search phase
   if (hasSearch || session.status === "SEARCHING") {
@@ -107,7 +111,7 @@ export function deriveActivitySteps(
       id: "search",
       icon: "🔎",
       label: sourceCount > 0 ? `Searched web (${sourceCount} sources)` : "Searching live web",
-      status: isDone ? "complete" : "running",
+      status: phaseFailed("web_search") ? "failed" : isDone ? "complete" : "running",
     });
   }
 
@@ -119,7 +123,7 @@ export function deriveActivitySteps(
       id: "read",
       icon: "📄",
       label: fetchedCount > 0 ? `Read ${fetchedCount} sources` : "Reading retrieved pages",
-      status: isDone ? "complete" : "running",
+      status: phaseFailed("fetch_url") ? "failed" : isDone ? "complete" : "running",
     });
   }
 
@@ -135,7 +139,12 @@ export function deriveActivitySteps(
         claimCount > 0
           ? `Verified ${verifiedCount}/${claimCount} claims`
           : "Cross-checking evidence",
-      status: isDone ? "complete" : "running",
+      status:
+        phaseFailed("verify_claim") || phaseFailed("detect_conflict")
+          ? "failed"
+          : isDone
+            ? "complete"
+            : "running",
     });
   }
 
@@ -145,7 +154,12 @@ export function deriveActivitySteps(
       id: "synthesize",
       icon: "✍️",
       label: "Synthesizing research answer",
-      status: session.answer ? "complete" : "running",
+      status:
+        phaseFailed("synthesize") || session.status === "FAILED"
+          ? "failed"
+          : session.answer
+            ? "complete"
+            : "running",
     });
   }
 

@@ -7,7 +7,7 @@ import { createToolRegistry, ToolRegistry } from "../agent/tools.js";
 import { config } from "../config.js";
 import { OpenRouterProvider, type LLMMetrics } from "../llm.js";
 import { ResearchRunner, type ResearchBudget } from "../research.js";
-import { SearXNGProvider } from "../search.js";
+import { ResilientSearchProvider, SerperProvider } from "../search.js";
 import { MemorySessionStore } from "../store.js";
 
 type ControlledScenario = "weak" | "conflict";
@@ -24,6 +24,8 @@ interface SmokeThresholds {
   routingAccuracy: number;
   /** Tool-decision accuracy must be ≥ 80% across the smoke cases. */
   toolDecisionAccuracy: number;
+  /** Every smoke trajectory must complete its explicitly required actions. */
+  toolTrajectoryAccuracy: number;
   /** Zero controller safety violations permitted. */
   maxControllerViolations: number;
 }
@@ -31,6 +33,7 @@ interface SmokeThresholds {
 const SMOKE_THRESHOLDS: SmokeThresholds = {
   routingAccuracy: 1.0,
   toolDecisionAccuracy: 0.8,
+  toolTrajectoryAccuracy: 1.0,
   maxControllerViolations: 0,
 };
 
@@ -98,6 +101,7 @@ interface EvaluationResult {
   trace: string[];
   toolCalls: ToolCallRecord[];
   searchQueries: string[][];
+  searchAttempts: NonNullable<ResearchSession["searchAttempts"]>;
   selectedSources: Array<{
     id: string;
     title: string;
@@ -120,6 +124,7 @@ interface EvaluationResult {
   };
   checks: {
     route: boolean;
+    evidence: boolean;
     clarification: boolean;
     requiredActions: boolean;
     searchAgain: boolean;
@@ -141,7 +146,11 @@ interface EvaluationResult {
 interface SmokeVerdict {
   pass: boolean;
   routingAccuracy: number;
-  toolDecisionAccuracy: number;
+  currentEvidenceRate: number | null;
+  toolDecisionAccuracy: number | null;
+  toolDecisionCount: number;
+  modelCalls: number;
+  toolTrajectoryAccuracy: number;
   controllerViolations: number;
   criticalFailures: CriticalFailure[];
   reasons: string[];
@@ -383,8 +392,10 @@ function failureKind(error: unknown): NonNullable<EvaluationResult["failure"]>["
   // quality problem. Classify it separately so routing accuracy is not
   // incorrectly penalised when the agent made the right decision.
   if (/429|rate.?limit|too many requests/i.test(message)) return "NETWORK_FAILURE";
+  if (/openrouter.*(?:timed?\s*out|timeout|returned 5\d\d)/i.test(message))
+    return "NETWORK_FAILURE";
   if (/openrouter/i.test(message)) return "MODEL_FAILURE";
-  if (/searx|fetch|network|timeout|abort|econn|enotfound/i.test(message)) return "NETWORK_FAILURE";
+  if (/serper|fetch|network|timeout|abort|econn|enotfound/i.test(message)) return "NETWORK_FAILURE";
   return "EVALUATION_FAILURE";
 }
 
@@ -511,7 +522,16 @@ function countControllerViolations(results: EvaluationResult[]): number {
 // excluded because they are not model decisions; overrides are counted as
 // incorrect model choices.
 // ---------------------------------------------------------------------------
-function computeToolDecisionAccuracy(results: EvaluationResult[]): number {
+function countToolDecisions(results: EvaluationResult[]): number {
+  return results.reduce(
+    (total, result) =>
+      total +
+      result.decisions.filter((decision) => decision.controllerDecision !== "fallback").length,
+    0,
+  );
+}
+
+export function computeToolDecisionAccuracy(results: EvaluationResult[]): number | null {
   let totalDecisions = 0;
   let correctDecisions = 0;
   for (const result of results) {
@@ -521,14 +541,14 @@ function computeToolDecisionAccuracy(results: EvaluationResult[]): number {
       if (decision.controllerDecision === "allow") correctDecisions += 1;
     }
   }
-  if (totalDecisions === 0) return 1; // no model decisions → controller ran everything → acceptable
+  if (totalDecisions === 0) return null;
   return correctDecisions / totalDecisions;
 }
 
 // ---------------------------------------------------------------------------
 // Smoke verdict
 // ---------------------------------------------------------------------------
-function buildSmokeVerdict(
+export function buildSmokeVerdict(
   results: EvaluationResult[],
   metrics: ReturnType<typeof buildMetrics>,
 ): SmokeVerdict {
@@ -536,7 +556,15 @@ function buildSmokeVerdict(
   const allCriticalFailures = results.flatMap((result) => result.criticalFailures);
   const controllerViolations = countControllerViolations(results);
   const toolDecisionAccuracy = computeToolDecisionAccuracy(results);
+  const toolDecisionCount = countToolDecisions(results);
   const routingAccuracy = metrics.routingAccuracy;
+  const toolTrajectoryAccuracy = metrics.toolTrajectoryAccuracy;
+  const currentCases = results.filter((result) => result.category === "current");
+  const currentEvidenceRate =
+    currentCases.length === 0
+      ? null
+      : currentCases.filter((result) => result.checks.evidence).length / currentCases.length;
+  const modelCalls = results.reduce((total, result) => total + result.modelMetrics.calls, 0);
 
   // Check routing (must be 100%)
   if (routingAccuracy < SMOKE_THRESHOLDS.routingAccuracy) {
@@ -547,6 +575,16 @@ function buildSmokeVerdict(
     );
   }
 
+  // A correct route and nominal tool sequence do not prove a research result.
+  // Current-information cases need retrieved source content; otherwise this is
+  // an infrastructure/retrieval failure even when the agent correctly refuses.
+  const casesWithoutEvidence = currentCases.filter((result) => !result.checks.evidence);
+  if (casesWithoutEvidence.length > 0) {
+    reasons.push(
+      `Current-information evidence unavailable for: ${casesWithoutEvidence.map((result) => result.name).join(", ")}. Routing success is not a research-quality pass.`,
+    );
+  }
+
   // Check critical failures (must be 0)
   if (allCriticalFailures.length > 0) {
     for (const failure of allCriticalFailures) {
@@ -554,8 +592,20 @@ function buildSmokeVerdict(
     }
   }
 
-  // Check tool-decision accuracy (must be ≥ 80%)
-  if (toolDecisionAccuracy < SMOKE_THRESHOLDS.toolDecisionAccuracy) {
+  // Check required complete action paths; routing alone is not enough.
+  if (toolTrajectoryAccuracy < SMOKE_THRESHOLDS.toolTrajectoryAccuracy) {
+    const incomplete = results.filter((result) => !result.checks.trajectory);
+    reasons.push(
+      `Tool-trajectory accuracy ${(toolTrajectoryAccuracy * 100).toFixed(0)}% < 100% required. ` +
+        `Incomplete: ${incomplete.map((result) => result.name).join(", ")}.`,
+    );
+  }
+
+  // No observed model decisions is not 100% accuracy. Report it as unmeasured.
+  if (
+    toolDecisionAccuracy !== null &&
+    toolDecisionAccuracy < SMOKE_THRESHOLDS.toolDecisionAccuracy
+  ) {
     reasons.push(
       `Tool-decision accuracy ${(toolDecisionAccuracy * 100).toFixed(0)}% < 80% required.`,
     );
@@ -569,7 +619,11 @@ function buildSmokeVerdict(
   return {
     pass: reasons.length === 0,
     routingAccuracy,
+    currentEvidenceRate,
     toolDecisionAccuracy,
+    toolDecisionCount,
+    modelCalls,
+    toolTrajectoryAccuracy,
     controllerViolations,
     criticalFailures: allCriticalFailures,
     reasons,
@@ -588,7 +642,7 @@ async function evaluateCase(
   const searchQueries: string[][] = [];
   const search = testCase.controlled
     ? { search: async () => [] }
-    : new SearXNGProvider(config.SEARXNG_URL);
+    : new ResilientSearchProvider([{ name: "serper", provider: new SerperProvider() }]);
   const registry = testCase.controlled
     ? controlledRegistry(testCase.controlled, llm, calls, searchQueries)
     : createToolRegistry(search, llm);
@@ -602,7 +656,12 @@ async function evaluateCase(
     maxTimeMs: limits.maxTimeMs,
   };
   const runner = new ResearchRunner(store, search, llm, registry, budget);
-  const agent = new AutonomousAgent(registry, runner, llm);
+  const agent = new AutonomousAgent(registry, runner, llm, store, {
+    maxQueries: limits.maxQueries,
+    maxSources: limits.maxSources,
+    maxPages: limits.maxPages,
+    maxTimeMs: limits.maxTimeMs,
+  });
   llm.setDeadline(Date.now() + limits.maxTimeMs);
   let responseRoute: AgentRoute | undefined;
   let finalSession: ResearchSession | undefined;
@@ -661,8 +720,17 @@ async function evaluateCase(
   const clarificationCheck = actualClarification === (testCase.expectedClarification ?? false);
   const searchAgainCheck = actualSearchAgain === (testCase.expectedSearchAgain ?? false);
   const conflictCheck = actualConflict === (testCase.expectedConflict ?? false);
+  const hasRetrievedEvidence = Boolean(
+    finalSession?.sources.some((source) => source.content?.trim() && !source.fetchError),
+  );
+  const evidenceCheck = testCase.category !== "current" || hasRetrievedEvidence;
   const trajectoryCheck =
-    routeCheck && clarificationCheck && requiredActions && searchAgainCheck && conflictCheck;
+    routeCheck &&
+    clarificationCheck &&
+    requiredActions &&
+    searchAgainCheck &&
+    conflictCheck &&
+    evidenceCheck;
 
   const criticalFailures = detectCriticalFailures(testCase, trace, finalSession, limits.profile);
 
@@ -679,6 +747,7 @@ async function evaluateCase(
     trace,
     toolCalls: calls,
     searchQueries,
+    searchAttempts: finalSession?.searchAttempts ?? [],
     selectedSources: sourceSummary(finalSession),
     claims: finalSession?.claims ?? [],
     conflicts: finalSession?.conflicts,
@@ -694,6 +763,7 @@ async function evaluateCase(
     },
     checks: {
       route: routeCheck,
+      evidence: evidenceCheck,
       clarification: clarificationCheck,
       requiredActions,
       searchAgain: searchAgainCheck,
@@ -735,7 +805,14 @@ function buildMetrics(results: EvaluationResult[]) {
         : direct.filter((result) => result.trace.includes("fetch_url")).length / direct.length,
     toolTrajectoryAccuracy:
       results.filter((result) => result.checks.trajectory).length / results.length,
+    currentEvidenceRate: (() => {
+      const current = results.filter((result) => result.category === "current");
+      return current.length === 0
+        ? undefined
+        : current.filter((result) => result.checks.evidence).length / current.length;
+    })(),
     toolDecisionAccuracy: computeToolDecisionAccuracy(results),
+    toolDecisionCount: countToolDecisions(results),
     searchAgainPrecision:
       searchAgainCases.length === 0
         ? undefined
@@ -838,13 +915,29 @@ function applyProfileExpectations(
 // Console output helpers
 // ---------------------------------------------------------------------------
 function printCaseResult(result: EvaluationResult) {
-  const statusIcon = result.criticalFailures.length > 0 ? "❌" : result.checks.route ? "✅" : "⚠️";
+  const statusIcon =
+    result.criticalFailures.length > 0 || !result.checks.trajectory
+      ? "❌"
+      : result.checks.route
+        ? "✅"
+        : "⚠️";
   console.log(
     `${statusIcon} ${result.name}  route=${result.route ?? "unavailable"}  ` +
-      `expected=${result.expectedRoute}  trace=[${result.trace.join(" → ")}]`,
+      `expected=${result.expectedRoute}  evidence=${result.checks.evidence ? "yes" : "no"}  ` +
+      `trace=[${result.trace.join(" → ")}]`,
   );
   if (result.failure) {
     console.log(`   ⚠ failure(${result.failure.kind}): ${result.failure.message.slice(0, 120)}`);
+  }
+  if (result.searchAttempts.length > 0) {
+    const attempts = result.searchAttempts
+      .map((attempt) => `${attempt.provider}=${attempt.status}:${attempt.resultCount}`)
+      .join(", ");
+    console.log(`   search providers: ${attempts}`);
+  }
+  if (result.selectedSources.length > 0) {
+    const usable = result.selectedSources.filter((source) => !source.fetchError).length;
+    console.log(`   fetched sources: ${usable}/${result.selectedSources.length}`);
   }
   for (const cf of result.criticalFailures) {
     console.log(`   ❌ CRITICAL[${cf.kind}]: ${cf.detail}`);
@@ -864,8 +957,19 @@ function printSmokeVerdict(verdict: SmokeVerdict) {
     `  Routing accuracy       : ${(verdict.routingAccuracy * 100).toFixed(0)}%  (required 100%)`,
   );
   console.log(
-    `  Tool-decision accuracy : ${(verdict.toolDecisionAccuracy * 100).toFixed(0)}%  (required ≥80%)`,
+    verdict.currentEvidenceRate === null
+      ? "  Current-info evidence : NOT MEASURED (no current-info cases)"
+      : `  Current-info evidence : ${(verdict.currentEvidenceRate * 100).toFixed(0)}%  (required 100%)`,
   );
+  console.log(
+    verdict.toolDecisionAccuracy === null
+      ? `  Tool-decision accuracy : NOT MEASURED (${verdict.toolDecisionCount} decisions; ${verdict.modelCalls} model calls)`
+      : `  Tool-decision accuracy : ${(verdict.toolDecisionAccuracy * 100).toFixed(0)}%  (required ≥80%)`,
+  );
+  console.log(
+    `  Tool-trajectory accuracy: ${(verdict.toolTrajectoryAccuracy * 100).toFixed(0)}%  (required 100%)`,
+  );
+  console.log(`  OpenRouter calls       : ${verdict.modelCalls}`);
   console.log(`  Controller violations  : ${verdict.controllerViolations}  (required 0)`);
   console.log(`  Critical failures      : ${verdict.criticalFailures.length}  (required 0)`);
   if (!verdict.pass) {
@@ -958,7 +1062,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && /(?:^|[\\/])real\.(?:ts|js)$/.test(process.argv[1])) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}

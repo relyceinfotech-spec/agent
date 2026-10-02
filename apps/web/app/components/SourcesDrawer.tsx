@@ -9,6 +9,7 @@ export type SourceItem = {
   domain: string;
   snippet: string;
   content?: string;
+  fetchError?: string;
   sourceType?: string;
   quality: { overall: number; relevance: number; authority: number; freshness: number };
 };
@@ -27,6 +28,9 @@ export function SourcesDrawer({
   highlightedSourceId,
 }: SourcesDrawerProps) {
   if (!sources || sources.length === 0) return null;
+  const retrievedCount = sources.filter(
+    (source) => source.content?.trim() && !source.fetchError,
+  ).length;
 
   return (
     <div className="sources-drawer-section">
@@ -41,7 +45,10 @@ export function SourcesDrawer({
             📄
           </span>
           <span className="drawer-heading">
-            Cited Web Sources <span className="sources-count">({sources.length})</span>
+            Research Sources{" "}
+            <span className="sources-count">
+              ({retrievedCount}/{sources.length} retrieved)
+            </span>
           </span>
         </div>
         <div className="toggle-right">
@@ -86,9 +93,17 @@ export function SourcesDrawer({
                   {src.snippet && <p className="source-card-snippet">{src.snippet}</p>}
 
                   <div className="source-card-footer">
-                    <span className="source-external-link">
-                      Visit source <span className="arrow-glyph">↗</span>
-                    </span>
+                    {src.fetchError ? (
+                      <span className="source-retrieval-error">Page could not be retrieved</span>
+                    ) : src.content ? (
+                      <span className="source-external-link">
+                        Open source <span className="arrow-glyph">↗</span>
+                      </span>
+                    ) : (
+                      <span className="source-external-link">
+                        Visit source <span className="arrow-glyph">↗</span>
+                      </span>
+                    )}
                   </div>
                 </a>
               );

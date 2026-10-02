@@ -8,3 +8,8 @@ dist
 coverage
 *.log
 apps/api/evaluation-results
+data/
+apps/api/data/
+tmp/
+.tahr-review/
+supabase/.temp/

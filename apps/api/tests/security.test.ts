@@ -49,15 +49,23 @@ describe("SSRF: Private IP and Metadata Blocking", () => {
     expect(privateIp("255.255.255.255")).toBe(true); // broadcast
   });
 
-  it("blocks IPv6 loopback, link-local, unique local, and mapped IPv4", () => {
+  it("blocks IPv6 loopback, link-local, site-local, unique local, and mapped IPv4", () => {
     expect(privateIp("::1")).toBe(true);
     expect(privateIp("::")).toBe(true);
     expect(privateIp("fe80::1")).toBe(true);
     expect(privateIp("fc00::1")).toBe(true);
     expect(privateIp("fd12::1")).toBe(true);
+    expect(privateIp("fec0::1")).toBe(true);
+    expect(privateIp("fec0:0:0:0:0:0:0:1")).toBe(true);
+    expect(privateIp("fc00:0:0:0:0:0:0:1")).toBe(true);
+    expect(privateIp("fe80:0:0:0:0:0:0:1")).toBe(true);
     expect(privateIp("::ffff:127.0.0.1")).toBe(true);
     expect(privateIp("::ffff:169.254.169.254")).toBe(true);
     expect(privateIp("::ffff:10.0.0.1")).toBe(true);
+    expect(privateIp("::ffff:7f00:1")).toBe(true);
+    expect(privateIp("0:0:0:0:0:ffff:7f00:1")).toBe(true);
+    expect(privateIp("::ffff:c0a8:101")).toBe(true);
+    expect(privateIp("::ffff:808:808")).toBe(false);
   });
 
   it("allows public internet IP addresses", () => {
@@ -176,7 +184,8 @@ describe("Server Security & Guardrails", () => {
 
     if (response.statusCode === 200) {
       const body = JSON.parse(response.body) as Record<string, unknown>;
-      expect(body.search).toBe("connected");
+      expect(["configured", "missing_credentials"]).toContain(body.search);
+      expect(body.searchProviders).toEqual(["serper"]);
       expect(typeof body.llm).toBe("boolean");
       // Never expose the actual OPENROUTER_API_KEY
       expect(body.OPENROUTER_API_KEY).toBeUndefined();
