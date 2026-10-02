@@ -160,9 +160,10 @@ export class PostFollowUpService {
     await this.store.saveFollowUp(followUp);
   }
 
-  private async waitForResearch(id: string) {
+  private async waitForResearch(id: string, signal?: AbortSignal) {
     const deadline = Date.now() + config.MAX_RESEARCH_TIME_MS + 30_000;
     while (Date.now() < deadline) {
+      if (signal?.aborted) throw signal.reason;
       const session = await this.store.get(id);
       if (
         session &&
@@ -227,7 +228,33 @@ export class PostFollowUpService {
     return (await validate(fallback)).finalAnswer;
   }
 
-  private async run(followUp: ResearchFollowUp, post: ResearchPost) {
+  async runQueued(
+    id: string,
+    postId: string,
+    question: string,
+    signal: AbortSignal,
+  ): Promise<ResearchFollowUp> {
+    const post = await this.store.getPublishedPost(postId);
+    if (!post) throw new ResearchPostNotFoundError(postId);
+    const existing = await this.store.getFollowUp(id);
+    if (existing?.status === "COMPLETED") return existing;
+    const now = new Date().toISOString();
+    const followUp: ResearchFollowUp = {
+      id,
+      postId,
+      question,
+      status: "QUEUED",
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      usedLiveResearch: false,
+      sourceIds: [],
+    };
+    await this.store.saveFollowUp(followUp);
+    await this.run(followUp, post, signal);
+    return followUp;
+  }
+
+  private async run(followUp: ResearchFollowUp, post: ResearchPost, signal?: AbortSignal) {
     try {
       const live = needsLiveResearch(followUp.question, post);
       let sources = post.sources;
@@ -242,9 +269,9 @@ export class PostFollowUpService {
           provider: "saved-post",
           discoveredAt: post.researchedAt,
         }));
-        const started = await this.research.start(followUp.question, "quick", seeds);
+        const started = await this.research.start(followUp.question, "quick", seeds, { signal });
         await this.update(followUp, { liveResearchId: started.id });
-        research = await this.waitForResearch(started.id);
+        research = await this.waitForResearch(started.id, signal);
         if (research.status !== "COMPLETED") {
           const saved = citedEvidenceAnswer(followUp.question, post.sources, post.claims);
           if (!saved.startsWith("The saved research does not contain enough")) {

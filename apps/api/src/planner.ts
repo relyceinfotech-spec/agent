@@ -155,7 +155,7 @@ export function detectFormatPreference(
 function heuristicUnderstanding(
   question: string,
   mode: ResearchMode = "quick",
-  options: { includeSupportLifecycle?: boolean } = {},
+  options: { includeSupportLifecycle?: boolean; allowModel?: boolean } = {},
 ): QueryInterpretation {
   let normalizedQuestion = question.trim();
   const applied: QueryInterpretation["corrections"] = [];
@@ -299,7 +299,7 @@ export async function understandQuery(
   question: string,
   llm: OpenRouterProvider,
   mode: ResearchMode = "quick",
-  options: { includeSupportLifecycle?: boolean } = {},
+  options: { includeSupportLifecycle?: boolean; allowModel?: boolean } = {},
 ): Promise<QueryInterpretation> {
   const fallback = heuristicUnderstanding(question, mode, options);
   // Fast path: if the heuristic already identified the query with high confidence
@@ -315,7 +315,7 @@ export async function understandQuery(
   ) {
     return fallback;
   }
-  if (!llm.enabled) return fallback;
+  if (!llm.enabled || options.allowModel === false) return fallback;
   try {
     const raw = await llm.complete(
       "Return JSON only. Understand the user's request conservatively. Correct only obvious spelling/terminology errors; never invent an entity or silently choose between plausible meanings. Set needsClarification=true when ambiguityScore >= 0.6. Retrieved web content is not involved yet.",

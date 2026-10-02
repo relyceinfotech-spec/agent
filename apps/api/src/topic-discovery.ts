@@ -122,6 +122,19 @@ export async function discoverTopics(
   const seen = new Set<string>();
   const now = Date.now();
   const candidates: TopicCandidate[] = [];
+  for (const saved of existingTopics) {
+    if (
+      saved.status !== "CANDIDATE" ||
+      existingPosts.some(
+        (post) => post.topicId === saved.id || titleSimilarity(post.title, saved.title) >= 0.72,
+      )
+    )
+      continue;
+    const score = topicScore(saved, now);
+    if (!Number.isFinite(score) || score < 0.5) continue;
+    candidates.push({ ...saved, score });
+    seen.add(canonicalizeUrl(saved.url));
+  }
   const collectCandidates = async (items: FeedEntry[]) => {
     for (const entry of items) {
       const url = canonicalizeUrl(entry.url);

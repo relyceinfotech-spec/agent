@@ -549,7 +549,11 @@ describe("durable worker version/date retrieval regression", () => {
         session.sources.length,
       ),
     ).toBe(false);
-    const semanticCitationReport = model.metrics.citationEntailment;
+    expect(model.metrics.citationEntailment).toBeUndefined();
+    const semanticCitationReport = (
+      (await jobStore.getJob(jobId))?.result
+        ?.modelMetrics as unknown as import("../src/llm.js").LLMMetrics
+    )?.citationEntailment;
     expect(semanticCitationReport?.status, JSON.stringify(semanticCitationReport, null, 2)).toBe(
       "VALIDATED",
     );

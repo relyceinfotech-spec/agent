@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import { createClient } from "@supabase/supabase-js";
+import { currentWorkerContext, throwIfWorkerStopped } from "./worker-context.js";
 import type { ResearchSession } from "./domain.js";
 import type {
   AutonomousRun,
@@ -375,6 +376,7 @@ export class SupabaseStore
 
   async create(session: ResearchSession): Promise<void> {
     const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
+    if (await this.writeWorkerSession(session, ownerId, true)) return;
     const { error } = await this.research.from("max_research_sessions").insert({
       id: session.id,
       owner_id: ownerId ?? null,
@@ -400,9 +402,9 @@ export class SupabaseStore
 
   async update(session: ResearchSession): Promise<void> {
     const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
+    if (await this.writeWorkerSession(session, ownerId, false)) return;
     const values: any = {
       id: session.id,
-      ...(ownerId ? { owner_id: ownerId } : { owner_id: null }),
       created_at: session.createdAt,
       updated_at: session.updatedAt,
       status: session.status,
@@ -420,10 +422,52 @@ export class SupabaseStore
       if (!data) throw new Error("Research session could not be updated");
       return;
     }
-    const { error } = await this.research
+    const { data, error } = await this.research
       .from("max_research_sessions")
-      .upsert(values, { onConflict: "id" });
+      .update(values)
+      .eq("id", session.id)
+      .select("id")
+      .maybeSingle();
     raiseIfError(error);
+    if (!data) throw new Error("Research session could not be updated");
+  }
+
+  private async writeWorkerSession(
+    session: ResearchSession,
+    ownerId: string | undefined,
+    create: boolean,
+  ): Promise<boolean> {
+    const worker = currentWorkerContext();
+    if (!worker) return false;
+    throwIfWorkerStopped(!create && session.status === "CANCELLED");
+    const { error } = await this.research.rpc("max_write_worker_session", {
+      p_session: session,
+      p_owner_id: ownerId ?? null,
+      p_create: create,
+      p_job_id: worker.lease.job.id,
+      p_worker_id: worker.lease.workerId,
+      p_generation: worker.lease.generation,
+    });
+    raiseIfError(error);
+    return true;
+  }
+
+  private async writeWorkerContent(
+    kind: "topic" | "run" | "publish" | "followup",
+    data: unknown,
+  ): Promise<boolean> {
+    const worker = currentWorkerContext();
+    if (!worker) return false;
+    throwIfWorkerStopped(kind === "run" && (data as AutonomousRun).status === "CANCELLED");
+    const { error } = await this.content.rpc("max_write_worker_content", {
+      p_kind: kind,
+      p_data: data,
+      p_job_id: worker.lease.job.id,
+      p_worker_id: worker.lease.workerId,
+      p_generation: worker.lease.generation,
+    });
+    raiseIfError(error);
+    return true;
   }
 
   async list(limit = 50, cursor?: SessionCursor): Promise<ResearchSession[]> {
@@ -457,16 +501,47 @@ export class SupabaseStore
 
   async delete(id: string): Promise<void> {
     const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
-    let query = this.research.from("max_research_sessions").delete().eq("id", id);
-    if (ownerId) query = query.eq("owner_id", ownerId);
-    const { error } = await query;
+    const { error } = await this.research.rpc("max_delete_research_session", {
+      p_id: id,
+      p_owner_id: ownerId ?? null,
+    });
     raiseIfError(error);
+  }
+
+  async listDeletedIds(ids: string[]): Promise<Set<string>> {
+    if (!ids.length) return new Set();
+    const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
+    let query = this.research
+      .from("max_deleted_research_sessions")
+      .select("id")
+      .in("id", ids.slice(0, 100));
+    if (ownerId) query = query.eq("owner_id", ownerId);
+    const { data, error } = await query;
+    raiseIfError(error);
+    return new Set((data ?? []).map((row) => String(row.id)));
   }
 
   async recoverInterrupted(): Promise<number> {
     const { data, error } = await this.research.rpc("max_recover_interrupted_sessions");
     raiseIfError(error);
     return Number(data ?? 0);
+  }
+
+  async consumeRateLimit(scope: string, clientKey: string, windowMs: number, limit: number) {
+    const key = createHash("sha256").update(`${scope}\0${clientKey}`).digest("hex");
+    const { data, error } = await this.research.rpc("max_consume_rate_limit", {
+      p_key: key,
+      p_window_ms: windowMs,
+      p_limit: limit,
+    });
+    raiseIfError(error);
+    if (!data) throw new Error("Rate limit persistence is unavailable");
+    return {
+      allowed: data.allowed === true,
+      limit,
+      remaining: Number(data.remaining),
+      resetMs: Number(data.reset_ms),
+    };
   }
 
   async consumeUserQuota(
@@ -725,11 +800,19 @@ export class SupabaseStore
     };
   }
 
-  async claimJob(workerId: string, leaseSeconds: number): Promise<JobLease | undefined> {
-    const { data, error } = await this.research.rpc("max_claim_job", {
-      p_worker_id: workerId,
-      p_lease_seconds: leaseSeconds,
-    });
+  async claimJob(
+    workerId: string,
+    leaseSeconds: number,
+    jobId?: string,
+  ): Promise<JobLease | undefined> {
+    const { data, error } = await this.research.rpc(
+      jobId ? "max_claim_job_by_id" : "max_claim_job",
+      {
+        p_worker_id: workerId,
+        p_lease_seconds: leaseSeconds,
+        ...(jobId ? { p_job_id: jobId } : {}),
+      },
+    );
     raiseIfError(error);
     if (!data) return undefined;
     const job = durableJobFromRow(data);
@@ -886,6 +969,7 @@ export class SupabaseStore
 
   async saveTopic(topic: TopicCandidate): Promise<void> {
     const url = canonicalizeUrl(topic.url);
+    if (await this.writeWorkerContent("topic", { ...topic, url })) return;
     const { error } = await this.content.from("max_topics").upsert(
       {
         id: topic.id,
@@ -911,6 +995,7 @@ export class SupabaseStore
   }
 
   async saveRun(run: AutonomousRun): Promise<void> {
+    if (await this.writeWorkerContent("run", run)) return;
     const { error } = await this.content.from("max_autonomous_runs").upsert(
       {
         id: run.id,
@@ -964,6 +1049,7 @@ export class SupabaseStore
     ) {
       throw new Error("Published post, topic, and run state do not match");
     }
+    if (await this.writeWorkerContent("publish", { post, topic, run })) return;
     const { error } = await this.content.rpc("max_publish_post", {
       p_post: post,
       p_topic: topic,
@@ -1099,9 +1185,8 @@ export class SupabaseStore
     if (!identity || (ownerId !== undefined && identity.userId !== ownerId)) {
       throw new Error("Export access requires the authenticated owner context");
     }
-    const content = this.userContent();
-    if (!content) throw new Error("User-scoped export persistence is unavailable");
-    return content;
+    // Writes are server-only; every query below still explicitly filters owner_id.
+    return this.content;
   }
 
   async createExport(record: NewExportRecord): Promise<{ record: ExportRecord; created: boolean }> {
@@ -1343,6 +1428,7 @@ export class SupabaseStore
   }
 
   async saveFollowUp(followUp: ResearchFollowUp): Promise<void> {
+    if (await this.writeWorkerContent("followup", followUp)) return;
     const identity = currentAuthenticatedUser();
     const values = {
       id: followUp.id,
@@ -1374,11 +1460,12 @@ export class SupabaseStore
 
   async getFollowUp(id: string): Promise<ResearchFollowUp | undefined> {
     const identity = currentAuthenticatedUser();
+    const ownerId = identity?.userId ?? currentResearchOwnerId();
     let query = (this.userContent() ?? this.content)
       .from("max_post_followups")
       .select("data")
       .eq("id", id);
-    if (identity) query = query.eq("owner_id", identity.userId);
+    if (ownerId) query = query.eq("owner_id", ownerId);
     const { data, error } = await query.maybeSingle();
     raiseIfError(error);
     return data ? (data.data as ResearchFollowUp) : undefined;

@@ -728,3 +728,26 @@ describe("autonomous content agent", () => {
     store.close();
   });
 });
+
+describe("saved topic discovery backlog", () => {
+  it("returns timely unpublished candidates on later discovery runs", async () => {
+    const store = makeStore();
+    const saved = topic();
+    saved.summary =
+      "Official research measurements, reproducible benchmark methodology, implementation details and independent documented limitations for readers. ".repeat(
+        2,
+      );
+    try {
+      await store.saveTopic(saved);
+      const result = await discoverTopics(store, ["empty-feed"], async () => []);
+      expect(result.candidates.map((candidate) => candidate.id)).toContain(saved.id);
+      saved.status = "PUBLISHED";
+      await store.saveTopic(saved);
+      expect((await discoverTopics(store, ["empty-feed"], async () => [])).candidates).toHaveLength(
+        0,
+      );
+    } finally {
+      store.close();
+    }
+  });
+});

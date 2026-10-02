@@ -178,7 +178,7 @@ export class BillingService {
 
   async getEffectiveEntitlements(userId: string): Promise<EffectiveEntitlements> {
     const now = this.clock();
-    const storedSubscription = await this.repository.getSubscriptionForUser(userId);
+    const storedSubscription = await this.repository.getSubscriptionForUser(userId, now.getTime());
     const activeSubscription =
       storedSubscription && isEffectiveSubscription(storedSubscription, now.getTime())
         ? storedSubscription
@@ -430,7 +430,10 @@ export class BillingService {
     input: { cancelAtPeriodEnd: boolean; idempotencyKey: string },
   ): Promise<"requested" | "already_scheduled"> {
     if (!validIdempotencyKey(input.idempotencyKey)) throw new BillingWebhookValidationError();
-    const subscription = await this.repository.getSubscriptionForUser(ownerId);
+    const subscription = await this.repository.getSubscriptionForUser(
+      ownerId,
+      this.clock().getTime(),
+    );
     if (!subscription || !isEffectiveSubscription(subscription, this.clock().getTime())) {
       throw new BillingPlanUnavailableError();
     }
@@ -446,7 +449,10 @@ export class BillingService {
     input: { idempotencyKey: string },
   ): Promise<"requested" | "not_scheduled"> {
     if (!validIdempotencyKey(input.idempotencyKey)) throw new BillingWebhookValidationError();
-    const subscription = await this.repository.getSubscriptionForUser(ownerId);
+    const subscription = await this.repository.getSubscriptionForUser(
+      ownerId,
+      this.clock().getTime(),
+    );
     if (!subscription || !subscription.cancelAtPeriodEnd) return "not_scheduled";
     const provider = this.providers.get(subscription.provider);
     if (!provider) throw new BillingProviderNotConfiguredError(subscription.provider);
@@ -455,7 +461,10 @@ export class BillingService {
   }
 
   async retrieveSubscription(ownerId: string) {
-    const subscription = await this.repository.getSubscriptionForUser(ownerId);
+    const subscription = await this.repository.getSubscriptionForUser(
+      ownerId,
+      this.clock().getTime(),
+    );
     if (!subscription) return undefined;
     const provider = this.providers.get(subscription.provider);
     if (!provider) throw new BillingProviderNotConfiguredError(subscription.provider);

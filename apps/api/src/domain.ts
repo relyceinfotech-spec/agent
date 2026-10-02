@@ -447,6 +447,8 @@ export interface ResearchRecoveryRequirements {
 }
 
 export interface ResearchSession {
+  executionJobId?: string;
+  executionLeaseGeneration?: number;
   id: string;
   question: string;
   mode: ResearchMode;

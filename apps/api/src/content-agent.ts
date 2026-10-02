@@ -315,6 +315,7 @@ export class ContentAgent {
       };
       const session = await this.research.start(topic.title, "deep", [seed], {
         allowSnippetEvidence: false,
+        signal,
       });
       run.researchId = session.id;
       await this.store.saveRun(run);

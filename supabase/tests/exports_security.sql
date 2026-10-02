@@ -87,10 +87,11 @@ begin
   end if;
 
   if not has_column_privilege('authenticated', 'content.max_exports', 'payload_base64', 'SELECT')
-     or not has_column_privilege('authenticated', 'content.max_exports', 'payload_base64', 'UPDATE')
-     or not has_table_privilege('authenticated', 'content.max_exports', 'DELETE')
+     or has_any_column_privilege('authenticated', 'content.max_exports', 'INSERT')
+     or has_any_column_privilege('authenticated', 'content.max_exports', 'UPDATE')
+     or has_table_privilege('authenticated', 'content.max_exports', 'DELETE')
      or not has_table_privilege('service_role', 'content.max_exports', 'UPDATE') then
-    raise exception 'Required owner-scoped download, lifecycle, or service grants are missing';
+    raise exception 'Exports must allow owner downloads and require service-authorized writes';
   end if;
 end;
 $$;

@@ -12,6 +12,7 @@ import {
   retryTransient,
 } from "../src/security.js";
 import { extractPdf } from "../src/pdf.js";
+import { retrieveSource } from "../src/source-retrieval.js";
 import { createToolRegistry } from "../src/agent/tools.js";
 import { OpenRouterProvider } from "../src/llm.js";
 import type { Claim, Source } from "../src/domain.js";
@@ -224,5 +225,36 @@ describe("source retrieval and extraction safety", () => {
     validateExtraction(document);
     expect(document.content).toContain("reproducible benchmark");
     expect(document.contentType).toBe("pdf");
+  });
+
+  it("retrieves a PDF identified by content type at an extensionless URL", async () => {
+    const url = "https://example.org/download?id=report";
+    const bytes = samplePdf(
+      "This research document contains a reproducible benchmark and detailed evidence for the results. The method compares independent observations and explains uncertainty and limitations for readers.",
+    );
+    let browserCalls = 0;
+    const retrieved = await retrieveSource(
+      {
+        question: "Explain the benchmark results",
+        allowSnippetEvidence: false,
+        result: { title: "Benchmark report", url, snippet: "Research results" },
+      },
+      {
+        fetch: async (_url, init) => ({
+          url,
+          response: new Response(init?.method === "HEAD" ? null : bytes, {
+            headers: { "content-type": "application/pdf" },
+          }),
+          dispose: async () => {},
+        }),
+        browser: async () => {
+          browserCalls++;
+          throw new Error("PDF should not launch a browser");
+        },
+      },
+    );
+    expect(retrieved.retrievalMethod).toBe("pdf");
+    expect(retrieved.document.content).toContain("reproducible benchmark");
+    expect(browserCalls).toBe(0);
   });
 });

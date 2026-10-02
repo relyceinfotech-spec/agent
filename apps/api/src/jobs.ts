@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { withOperationContext } from "./operation-context.js";
+import { withWorkerContext } from "./worker-context.js";
 
 export type DurableJobKind = "research" | "post_agent";
 export type DurableJobStatus =
@@ -72,7 +74,7 @@ export interface JobHeartbeatResult {
 
 export interface DurableJobStore {
   enqueueJob(input: EnqueueJobInput): Promise<EnqueueJobResult>;
-  claimJob(workerId: string, leaseSeconds: number): Promise<JobLease | undefined>;
+  claimJob(workerId: string, leaseSeconds: number, jobId?: string): Promise<JobLease | undefined>;
   heartbeatJob(
     lease: JobLease,
     leaseSeconds: number,
@@ -152,6 +154,19 @@ export class InMemoryDurableJobStore implements DurableJobStore {
     }
 
     const nowMs = this.clock();
+    if (
+      input.kind === "research" &&
+      typeof input.payload.sessionId === "string" &&
+      [...this.jobs.values()].some(
+        (job) =>
+          job.kind === "research" &&
+          job.ownerScope === input.ownerScope &&
+          job.payload.sessionId === input.payload.sessionId &&
+          ["queued", "retrying", "running", "cancel_requested"].includes(job.status),
+      )
+    ) {
+      throw new Error("Research session already has an active job");
+    }
     let quotaResult: EnqueueJobResult["quota"];
     if (input.quota) {
       quotaResult = this.consumeQuota(input.quota, nowMs);
@@ -181,7 +196,11 @@ export class InMemoryDurableJobStore implements DurableJobStore {
     return { job: structuredClone(job), created: true, quota: quotaResult };
   }
 
-  async claimJob(workerId: string, leaseSeconds: number): Promise<JobLease | undefined> {
+  async claimJob(
+    workerId: string,
+    leaseSeconds: number,
+    jobId?: string,
+  ): Promise<JobLease | undefined> {
     this.validateLease(leaseSeconds);
     const nowMs = this.clock();
     this.recoverExpired(nowMs);
@@ -189,6 +208,7 @@ export class InMemoryDurableJobStore implements DurableJobStore {
       .filter(
         (candidate) =>
           (candidate.status === "queued" || candidate.status === "retrying") &&
+          (!jobId || candidate.id === jobId) &&
           Date.parse(candidate.availableAt) <= nowMs,
       )
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0];
@@ -448,7 +468,7 @@ export class DurableQueueWorker {
   }
 
   async stop(): Promise<void> {
-    if (!this.started) return;
+    if (!this.started && !this.controllers.size) return;
     this.stopping = true;
     for (const controller of this.controllers.values()) {
       controller.abort(new Error("Worker is shutting down"));
@@ -457,6 +477,18 @@ export class DurableQueueWorker {
     await Promise.all(this.completion.values());
     this.loopTasks = [];
     this.started = false;
+  }
+
+  async runNow(jobId: string): Promise<boolean> {
+    if (this.stopping) return false;
+    const lease = await this.store.claimJob(
+      `${this.workerIdPrefix}-request-${randomUUID()}`,
+      this.leaseSeconds,
+      jobId,
+    );
+    if (!lease) return false;
+    await withOperationContext(() => this.execute(lease));
+    return true;
   }
 
   private async poll(workerId: string): Promise<void> {
@@ -472,7 +504,13 @@ export class DurableQueueWorker {
         await new Promise((resolve) => setTimeout(resolve, this.pollIntervalMs));
         continue;
       }
-      await this.execute(lease);
+      try {
+        await withOperationContext(() => this.execute(lease!));
+      } catch {
+        // Persistence may be unavailable during the terminal transition. Keep polling;
+        // the database recovers the unfinished lease when it expires.
+        await new Promise((resolve) => setTimeout(resolve, this.pollIntervalMs));
+      }
     }
   }
 
@@ -513,10 +551,34 @@ export class DurableQueueWorker {
 
     const run = (async () => {
       try {
-        const result = await this.handlers[lease.job.kind](lease.job, {
-          signal: controller.signal,
-          reportProgress,
-        });
+        const assertLease = async (allowCancellation = false) => {
+          if (controller.signal.aborted && !(allowCancellation && cancellationSeen))
+            throw controller.signal.reason;
+          const current = await this.store.getJob(lease.job.id);
+          if (
+            !current ||
+            !["running", "cancel_requested"].includes(current.status) ||
+            current.leaseOwner !== lease.workerId ||
+            current.leaseGeneration !== lease.generation ||
+            !current.leaseExpiresAt ||
+            Date.parse(current.leaseExpiresAt) <= Date.now()
+          ) {
+            leaseLost = true;
+            controller.abort(new Error("Job lease was lost"));
+            throw controller.signal.reason;
+          }
+          if (current.status === "cancel_requested") {
+            cancellationSeen = true;
+            controller.abort(new Error("Job cancellation requested"));
+            if (!allowCancellation) throw controller.signal.reason;
+          }
+        };
+        const result = await withWorkerContext(lease, controller.signal, assertLease, () =>
+          this.handlers[lease.job.kind](lease.job, {
+            signal: controller.signal,
+            reportProgress,
+          }),
+        );
         latestProgress = {
           ...latestProgress,
           stage: "terminal_transition",

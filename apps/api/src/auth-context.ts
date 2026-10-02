@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { withOperationContext } from "./operation-context.js";
 
 export interface AuthenticatedUserContext {
   userId: string;
@@ -13,7 +14,7 @@ export function withAuthenticatedUser<T>(
   identity: AuthenticatedUserContext,
   operation: () => T,
 ): T {
-  return userContext.run(identity, operation);
+  return withOperationContext(() => userContext.run(identity, operation));
 }
 
 export function currentAuthenticatedUser(): AuthenticatedUserContext | undefined {

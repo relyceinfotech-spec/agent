@@ -3,7 +3,13 @@ import type { ReleaseHistorySourceKind, SearchResult, Source } from "./domain.js
 import { browserFetch } from "./browser.js";
 import { extractHtml, extractRetrievedDocument, validateExtraction } from "./extract.js";
 import { config } from "./config.js";
-import { readBoundedPrefixText, readBoundedText, safeFetchWithRetry } from "./security.js";
+import {
+  readBoundedBytes,
+  readBoundedPrefixText,
+  readBoundedText,
+  safeFetchWithRetry,
+} from "./security.js";
+import { extractPdf } from "./pdf.js";
 import type { ExtractedDocument } from "./extract.js";
 import type { RequestedFactKind } from "./requested-facts.js";
 import {
@@ -20,7 +26,7 @@ import {
   throwIfResearchInactive,
 } from "./execution-context.js";
 
-export type RetrievalMethod = "serper_snippet" | "rss" | "structured" | "http" | "browser";
+export type RetrievalMethod = "serper_snippet" | "rss" | "structured" | "http" | "browser" | "pdf";
 
 export interface RetrievedSource {
   url: string;
@@ -642,7 +648,13 @@ async function readPreview(
 async function readFullDocument(
   url: string,
   dependencies: SourceRetrievalDependencies,
-): Promise<{ url: string; raw: string; contentType: string; link: string | null }> {
+): Promise<{
+  url: string;
+  raw: string;
+  contentType: string;
+  link: string | null;
+  document?: ExtractedDocument;
+}> {
   const fetched = await runResearchStage("http_extraction", () =>
     dependencies.fetch(url, { method: "GET" }),
   );
@@ -650,6 +662,16 @@ async function readFullDocument(
     if (!fetched.response.ok) throw new Error(`HTTP ${fetched.response.status}`);
     const contentType = fetched.response.headers.get("content-type") ?? "";
     const link = fetched.response.headers.get("link");
+    if (/^application\/pdf\b/i.test(contentType)) {
+      const bytes = await runResearchStage("http_extraction", () =>
+        readBoundedBytes(fetched.response, 8_000_000, config.FETCH_TIMEOUT_MS),
+      );
+      const document = await runResearchStage("http_extraction", () =>
+        extractPdf(bytes, new URL(fetched.url)),
+      );
+      validateExtraction(document);
+      return { url: fetched.url, raw: "", contentType, link, document };
+    }
     if (!isSupported(contentType)) {
       throw new Error(`Unsupported source content type: ${contentType || "missing"}`);
     }
@@ -1461,6 +1483,22 @@ async function retrieveSourceWithTrace(
     reasons.push("A safe metadata-only HEAD request did not yield source hints.");
   }
   const pageUrl = new URL(head?.url ?? input.result.url);
+  if (head && /^application\/pdf\b/i.test(head.contentType)) {
+    const full = await readFullDocument(head.url, dependencies);
+    if (full.document) {
+      attempts.push("http", "pdf");
+      return success(
+        full.url,
+        "",
+        full.contentType,
+        full.document,
+        "pdf",
+        attempts,
+        ["rss", "structured", "browser"],
+        [...reasons, "The server identified the source as a PDF document."],
+      );
+    }
+  }
   const feedUrls = [
     ...advertisedLinks(head?.link ?? null, pageUrl, "feed"),
     ...(head && /rss|atom|xml/i.test(head.contentType) ? [head.url] : []),
@@ -1726,7 +1764,8 @@ async function retrieveSourceWithTrace(
   );
   const full = await readFullDocument(preview?.url ?? head?.url ?? input.result.url, dependencies);
   if (!isHtml(full.contentType)) {
-    const document = extractRetrievedDocument(full.raw, new URL(full.url), full.contentType);
+    const document =
+      full.document ?? extractRetrievedDocument(full.raw, new URL(full.url), full.contentType);
     const missingFacts = missingRequestedFactsForDocument(
       input.question,
       document,
@@ -1737,7 +1776,7 @@ async function retrieveSourceWithTrace(
       full.raw,
       full.contentType,
       document,
-      "http",
+      full.document ? "pdf" : "http",
       attempts,
       ["browser"],
       missingFacts.length > 0

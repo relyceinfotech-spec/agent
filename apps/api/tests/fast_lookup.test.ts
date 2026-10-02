@@ -6,6 +6,83 @@ import { MemorySessionStore } from "../src/store.js";
 import { OpenRouterProvider } from "../src/llm.js";
 
 describe("evidence-first fast lookup", () => {
+  it.each([
+    "What version was React 18.2.0?",
+    "What is the latest React version and its release date?",
+    "What is the current Bun version?",
+  ])("does not complete unsupported lookup: %s", async (question) => {
+    const react = question.includes("React");
+    const interpretation: QueryInterpretation = {
+      normalizedQuestion: question,
+      intent: "Find release information",
+      entities: [react ? "React" : "Bun"],
+      topic: "software release",
+      dimensions: ["version"],
+      corrections: [],
+      ambiguityScore: 0,
+      ambiguityReasons: [],
+      needsClarification: false,
+      formatPreference: "lookup",
+    };
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "understand_query",
+      description: "fixture",
+      execute: async () => interpretation,
+    });
+    tools.register({
+      name: "web_search",
+      description: "fixture",
+      execute: async () => [
+        {
+          url: react ? "https://registry.npmjs.org/react/latest" : "https://bun.sh/blog/release",
+          title: react ? "React package metadata" : "Bun release",
+          snippet: "Release metadata",
+        },
+      ],
+    });
+    tools.register({
+      name: "fetch_url",
+      description: "fixture",
+      execute: async (input) => ({
+        url: (input as { url: string }).url,
+        html: "fixture",
+      }),
+    });
+    tools.register({
+      name: "extract_content",
+      description: "fixture",
+      execute: async () => ({
+        title: react ? "React package metadata" : "Bun release",
+        content: react
+          ? "Published version or release tag: 99.0.0"
+          : "No verified current Bun release is documented.",
+      }),
+    });
+    const llm = new OpenRouterProvider();
+    const enabled = vi.spyOn(llm, "enabled", "get").mockReturnValue(true);
+    const synthesize = vi
+      .spyOn(llm, "synthesize")
+      .mockResolvedValue("Insufficient evidence to establish the requested version or date.");
+    const validation = vi.spyOn(llm, "validateCitedAnswer");
+    try {
+      const response = await new AutonomousAgent(
+        tools,
+        {} as never,
+        llm,
+        new MemorySessionStore(),
+      ).handle(question, false);
+      expect(synthesize).toHaveBeenCalledOnce();
+      expect(validation).not.toHaveBeenCalled();
+      expect(response.session?.status).toBe("FAILED");
+      expect(response.answer).not.toContain("99.0.0");
+    } finally {
+      enabled.mockRestore();
+      synthesize.mockRestore();
+      validation.mockRestore();
+    }
+  });
+
   it("routes explicitly required official-source lookups through the bounded research loop, not Deep mode", async () => {
     const question = "What is the latest React version? Use official React sources.";
     const interpretation: QueryInterpretation = {

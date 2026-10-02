@@ -128,7 +128,7 @@ describe("bounded citation-quality API E2E with deterministic providers", () => 
         },
       });
       expect(chatResponse.statusCode).toBe(202);
-      const started = chatResponse.json() as { researchId: string };
+      const started = chatResponse.json() as { researchId: string; jobId: string };
       const deadline = Date.now() + 5_000;
       let session: Awaited<ReturnType<SqliteSessionStore["get"]>>;
       do {
@@ -142,10 +142,12 @@ describe("bounded citation-quality API E2E with deterministic providers", () => 
       expect(session?.sources.some((source) => source.content?.includes(flutterClaim))).toBe(true);
       expect(session?.answer).toContain("[1]");
       expect(session?.steps.map((step) => step.label).join(" ")).toContain("verify_claim");
-      expect(model.metrics.citationEntailment).toMatchObject({ status: "VALIDATED" });
-      expect(
-        model.metrics.citationEntailment?.items.find((item) => item.sourceIds.length > 0),
-      ).toMatchObject({
+      const job = await getServerBackgroundServices(app).jobStore.getJob(started.jobId);
+      const report = (job?.result?.modelMetrics as unknown as import("../src/llm.js").LLMMetrics)
+        ?.citationEntailment;
+      expect(model.metrics.citationEntailment).toBeUndefined();
+      expect(report).toMatchObject({ status: "VALIDATED" });
+      expect(report?.items.find((item) => item.sourceIds.length > 0)).toMatchObject({
         verdict: "SUPPORTED",
         method: "exact_match",
       });

@@ -174,6 +174,9 @@ export const rateLimiter = new RateLimiter(
 
 export async function createServer(dependencies: ServerDependencies = {}) {
   const app = Fastify({
+    trustProxy: config.MAX_TRUSTED_PROXIES.split(",")
+      .map((proxy) => proxy.trim())
+      .filter(Boolean),
     logger: {
       level: config.NODE_ENV === "production" ? "info" : "debug",
       serializers: {
@@ -226,7 +229,13 @@ export async function createServer(dependencies: ServerDependencies = {}) {
   app.addHook("onRequest", async (request, reply) => {
     if (request.url.startsWith("/api/")) {
       const clientIp = request.ip || "127.0.0.1";
-      const result = rateLimiter.check(clientIp);
+      const result = await checkRateLimit(
+        "api",
+        clientIp,
+        config.RATE_LIMIT_WINDOW_MS,
+        config.RATE_LIMIT_MAX_REQUESTS,
+        rateLimiter,
+      );
 
       void reply.header("X-RateLimit-Limit", result.limit);
       void reply.header("X-RateLimit-Remaining", result.remaining);
@@ -260,9 +269,22 @@ export async function createServer(dependencies: ServerDependencies = {}) {
     dependencies.jobStore ??
     (store instanceof SupabaseStore
       ? store
-      : config.NODE_ENV === "test"
-        ? new InMemoryDurableJobStore()
-        : new SqliteDurableJobStore(resolve(config.MAX_DATABASE_PATH ?? "data/max.sqlite")));
+      : store instanceof SqliteSessionStore
+        ? store.createJobStore()
+        : config.NODE_ENV === "test"
+          ? new InMemoryDurableJobStore()
+          : new SqliteDurableJobStore(resolve(config.MAX_DATABASE_PATH ?? "data/max.sqlite")));
+  async function checkRateLimit(
+    scope: string,
+    key: string,
+    windowMs: number,
+    limit: number,
+    fallback: RateLimiter,
+  ) {
+    return store.consumeRateLimit
+      ? store.consumeRateLimit(scope, key, windowMs, limit)
+      : fallback.check(key);
+  }
   const search =
     dependencies.searchProvider ??
     new ResilientSearchProvider([{ name: "serper", provider: new SerperProvider() }]);
@@ -290,17 +312,26 @@ export async function createServer(dependencies: ServerDependencies = {}) {
         }
       : createPostAgentLLMProviders());
   const postRegistry = createToolRegistry(search, postAgentLLM.research, store, postAgentLLM);
-  const postResearch = new ResearchRunner(store, search, postAgentLLM.planner, postRegistry, {
-    maxSteps: 8,
-    maxQueries: 2,
-    maxSources: 4,
-    maxPages: 3,
-    maxSearchPasses: 2,
-    maxClaimsToVerify: 8,
-    maxTimeMs: 120_000,
-    maxModelDecisions: 8,
-    ...dependencies.postAgentResearchBudget,
-  });
+  const postResearch = new ResearchRunner(
+    store,
+    search,
+    postAgentLLM.planner,
+    postRegistry,
+    {
+      maxSteps: 8,
+      maxQueries: 2,
+      maxSources: 4,
+      maxPages: 3,
+      maxSearchPasses: 2,
+      maxClaimsToVerify: 8,
+      maxTimeMs: 120_000,
+      maxModelDecisions: 8,
+      ...dependencies.postAgentResearchBudget,
+    },
+    undefined,
+    false,
+    postAgentLLM.research,
+  );
   const contentAgent = new ContentAgent(
     store,
     postResearch,
@@ -323,10 +354,97 @@ export async function createServer(dependencies: ServerDependencies = {}) {
   const followUpLimiter = new RateLimiter(60_000, 5);
   const shareResolveLimiter = dependencies.shareResolveRateLimiter ?? new RateLimiter(60_000, 30);
   const exportPdfRenderer = dependencies.exportPdfRenderer ?? renderExportPdf;
+  function jobModelMetrics(): JobJsonValue {
+    const metrics = llm.metrics ?? { calls: 0, failures: 0, durationMs: 0, usage: {} };
+    return JSON.parse(
+      JSON.stringify({
+        calls: metrics.calls,
+        failures: metrics.failures,
+        durationMs: metrics.durationMs,
+        usage: metrics.usage,
+        citationEntailment: metrics.citationEntailment,
+        synthesis: metrics.synthesis,
+      }),
+    ) as JobJsonValue;
+  }
   const queueWorker = new DurableQueueWorker(
     jobStore,
     {
-      research: async (job, context) => {
+      research: async (job, context): Promise<Record<string, JobJsonValue>> => {
+        if (job.payload.task === "followup") {
+          const execute = () =>
+            followUps.runQueued(
+              job.id,
+              String(job.payload.postId),
+              String(job.payload.question),
+              context.signal,
+            );
+          const followUp = job.ownerId
+            ? await withResearchOwner(job.ownerId, execute)
+            : await execute();
+          if (followUp.status === "FAILED") throw new Error(followUp.error ?? "Follow-up failed");
+          return { followUpId: followUp.id, status: followUp.status };
+        }
+        if (job.payload.task === "chat") {
+          const execute = async () => {
+            const sessionId = String(job.payload.sessionId);
+            const response = await agent.handle(
+              String(job.payload.question),
+              job.payload.mode === "deep",
+              typeof job.payload.memoryContext === "string" ? job.payload.memoryContext : undefined,
+              async (question, mode, memoryContext, interpretation) => {
+                const session = await runner.runQueued(sessionId, question, mode, [], {
+                  signal: context.signal,
+                  memoryContext,
+                  interpretation,
+                  researchChatOptimization: true,
+                });
+                if (!session) throw new Error("Chat research result is unavailable");
+                return { session, jobId: job.id };
+              },
+              isQueryInterpretation(job.payload.interpretation) &&
+                job.payload.interpretation.ambiguityScore < 0.4
+                ? job.payload.interpretation
+                : undefined,
+            );
+            if (response.route === "direct") {
+              const now = new Date().toISOString();
+              const session: ResearchSession = {
+                id: sessionId,
+                question: String(job.payload.question),
+                mode: "quick",
+                status: "COMPLETED",
+                createdAt: job.createdAt,
+                updatedAt: now,
+                sources: [],
+                claims: [],
+                steps: [],
+                answer: response.answer,
+              };
+              if (await store.get(sessionId)) await store.update(session);
+              else await store.create(session);
+            }
+            if (job.payload.memoryToolEvent)
+              response.toolEvents.unshift(
+                job.payload
+                  .memoryToolEvent as unknown as import("./agent/autonomous.js").AgentToolEvent,
+              );
+            const persisted = await store.get(sessionId);
+            if (!persisted) throw new Error("Chat result could not be persisted");
+            if (persisted.status === "FAILED")
+              throw new Error(persisted.error ?? "Chat research failed");
+            const { session: _session, sources: _sources, ...compact } = response;
+            return {
+              sessionId,
+              status: persisted.status,
+              modelMetrics: jobModelMetrics(),
+              response: JSON.parse(
+                JSON.stringify({ ...compact, researchId: sessionId, jobId: job.id }),
+              ) as JobJsonValue,
+            };
+          };
+          return job.ownerId ? withResearchOwner(job.ownerId, execute) : execute();
+        }
         const payload = job.payload;
         const sessionId = payload.sessionId;
         const question = payload.question;
@@ -382,7 +500,9 @@ export async function createServer(dependencies: ServerDependencies = {}) {
           if (!session) throw new Error("Research worker did not persist a session result");
           if (session.status === "FAILED") {
             if (job.attempts < job.maxAttempts && !isNonRetryableResearchFailure(session.error)) {
-              await store.update({ ...session, status: "QUEUED", error: undefined });
+              const retry = () => store.update({ ...session, status: "QUEUED", error: undefined });
+              if (job.ownerId) await withResearchOwner(job.ownerId, retry);
+              else await retry();
               throw new RetryableJobError(session.error ?? "Research attempt failed");
             }
             throw new Error(session.error ?? "Research failed after the final attempt");
@@ -619,6 +739,72 @@ export async function createServer(dependencies: ServerDependencies = {}) {
     };
   }
 
+  async function researchJob(id: string, ownerId: string, session?: ResearchSession) {
+    return (
+      (await jobStore.getJobForSession(id, ownerId)) ??
+      (session?.executionJobId
+        ? await jobStore.getOwnedJob(session.executionJobId, ownerId)
+        : undefined)
+    );
+  }
+
+  async function researchSnapshot(
+    session: ResearchSession | undefined,
+    job: DurableJob | undefined,
+  ): Promise<ResearchSession | undefined> {
+    if (!job) return session;
+    if (!session) return job.payload.task === "followup" ? undefined : queuedResearchSnapshot(job);
+    const terminal = ["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CLARIFICATION"].includes(
+      session.status,
+    );
+    if (
+      !terminal &&
+      session.executionLeaseGeneration !== undefined &&
+      session.executionLeaseGeneration < job.leaseGeneration &&
+      session.id !== job.payload.sessionId
+    ) {
+      const superseded = {
+        ...session,
+        status: "FAILED" as const,
+        updatedAt: job.updatedAt,
+        error: "Research attempt was superseded by a recovered worker",
+      };
+      await store.update(superseded);
+      return superseded;
+    }
+    if (["queued", "retrying"].includes(job.status))
+      return session.id === job.payload.sessionId
+        ? queuedResearchSnapshot(job)
+        : terminal
+          ? session
+          : { ...session, status: "QUEUED", updatedAt: job.updatedAt };
+    if (["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CLARIFICATION"].includes(session.status))
+      return session;
+    if (["failed", "cancelled", "cancel_requested"].includes(job.status)) {
+      const terminal = {
+        ...session,
+        status: job.status === "failed" ? ("FAILED" as const) : ("CANCELLED" as const),
+        updatedAt: job.updatedAt,
+        error:
+          job.errorSummary ??
+          (job.status === "failed" ? "Worker job failed" : "Research cancelled"),
+      };
+      await store.update(terminal);
+      return terminal;
+    }
+    if (job.status === "completed") {
+      const terminal = {
+        ...session,
+        status: "FAILED" as const,
+        updatedAt: job.updatedAt,
+        error: "Worker finished without a terminal research result",
+      };
+      await store.update(terminal);
+      return terminal;
+    }
+    return session;
+  }
+
   function publicJob(job: DurableJob) {
     return {
       id: job.id,
@@ -650,6 +836,8 @@ export async function createServer(dependencies: ServerDependencies = {}) {
     sessionId?: string;
     idempotencyKey?: string;
     chargeQuota?: boolean;
+    quotaKey?: UserQuotaKey;
+    taskPayload?: Record<string, JobJsonValue>;
   }): Promise<{
     job?: DurableJob;
     quota?: { allowed: boolean; used: number; resetsAt: string };
@@ -674,6 +862,7 @@ export async function createServer(dependencies: ServerDependencies = {}) {
           }
         : {}),
       ...(input.researchChatOptimization ? { researchChatOptimization: true } : {}),
+      ...input.taskPayload,
     };
     let quota:
       { ownerId: string; key: UserQuotaKey; windowSeconds: number; limit: number } | undefined;
@@ -686,8 +875,14 @@ export async function createServer(dependencies: ServerDependencies = {}) {
         return { blocked: "unavailable" };
       }
       if (!entitlements.enabled) return { blocked: "account" };
-      const key: UserQuotaKey = input.mode === "deep" ? "deep_research" : "research";
-      const featureKey = key === "deep_research" ? "deepResearch" : "research";
+      const key: UserQuotaKey =
+        input.quotaKey ?? (input.mode === "deep" ? "deep_research" : "research");
+      const featureKey =
+        key === "deep_research"
+          ? "deepResearch"
+          : key === "followup"
+            ? "postFollowUps"
+            : "research";
       const definition =
         entitlements.features[featureKey] === false ? undefined : entitlements.limits[key];
       if (!definition) return { blocked: "capability" as const };
@@ -852,6 +1047,7 @@ export async function createServer(dependencies: ServerDependencies = {}) {
           const mode: ResearchMode = parsed.data.deepResearch ? "deep" : "quick";
           if (
             existingJob.kind !== "research" ||
+            existingJob.payload.task !== "chat" ||
             existingJob.payload.question !== parsed.data.message ||
             existingJob.payload.mode !== mode
           ) {
@@ -861,12 +1057,20 @@ export async function createServer(dependencies: ServerDependencies = {}) {
             typeof existingJob.payload.sessionId === "string"
               ? existingJob.payload.sessionId
               : existingJob.id;
+          if ((await store.listDeletedIds?.([sessionId]))?.has(sessionId))
+            return reply.notFound("Research session not found");
           const session = await store.get(sessionId);
+          if (existingJob.status === "completed" && existingJob.result?.response) {
+            const response = existingJob.result.response as Record<string, JobJsonValue>;
+            return reply
+              .code(response.route === "direct" || response.answer ? 200 : 202)
+              .send({ ...response, session, sources: session?.sources });
+          }
           return reply.code(202).send({
             route: mode === "deep" ? "deep" : "web",
             researchId: sessionId,
             jobId: existingJob.id,
-            session: session ?? queuedResearchSnapshot(existingJob),
+            session: await researchSnapshot(session, existingJob),
             toolEvents: [
               {
                 tool: "idempotency_replay",
@@ -879,7 +1083,6 @@ export async function createServer(dependencies: ServerDependencies = {}) {
           });
         }
       }
-      if (!(await consumeQuota(request.authUser.id, quotaKey, reply))) return reply;
 
       const explicitMemory = extractExplicitMemoryCandidate(parsed.data.message);
       if (explicitMemory) {
@@ -945,30 +1148,54 @@ export async function createServer(dependencies: ServerDependencies = {}) {
         request.log.warn("Memory retrieval failed; continuing without saved context");
       }
 
-      const response = await agent.handle(
-        parsed.data.message,
-        parsed.data.deepResearch,
+      const preview = await agent.preview(parsed.data.message, parsed.data.deepResearch);
+      const queued = await enqueueResearchJob({
+        ownerId: request.authUser.id,
+        question: parsed.data.message,
+        mode: parsed.data.deepResearch ? "deep" : "quick",
         memoryContext,
-        async (question, mode, queuedMemoryContext, interpretation) => {
-          const queued = await enqueueResearchJob({
-            ownerId: request.authUser.id,
-            question,
-            mode,
-            memoryContext: queuedMemoryContext,
-            interpretation,
-            researchChatOptimization: true,
-            idempotencyKey,
-          });
-          if (queued.blocked === "account") throw new Error("This account is disabled");
-          if (queued.blocked === "capability") {
-            throw new Error("Research is not enabled for this account");
-          }
-          if (!queued.job) throw new Error("Research job could not be persisted");
-          return { jobId: queued.job.id, session: queuedResearchSnapshot(queued.job) };
+        interpretation: preview.interpretation,
+        researchChatOptimization: true,
+        idempotencyKey,
+        chargeQuota: true,
+        taskPayload: {
+          task: "chat",
+          ...(memoryToolEvent
+            ? { memoryToolEvent: memoryToolEvent as unknown as JobJsonValue }
+            : {}),
         },
-      );
-      if (memoryToolEvent) response.toolEvents.unshift(memoryToolEvent);
-      return reply.code(response.route === "direct" || response.answer ? 200 : 202).send(response);
+      });
+      if (queued.blocked === "account") return reply.forbidden("This account is disabled");
+      if (queued.blocked === "capability")
+        return reply.forbidden("This capability is not enabled for this account");
+      if (queued.blocked === "unavailable")
+        return reply.serviceUnavailable("Account entitlements are temporarily unavailable");
+      if (sendQuotaRejection(queued, quotaKey, reply)) return reply;
+      if (!queued.job) return reply.internalServerError("Could not persist chat request");
+      // Fast responses still return inline. Slow work continues under a durable lease
+      // and clients can follow the same research stream used by queued research.
+      if (preview.decision.effort !== "high") {
+        const execution = queueWorker.runNow(queued.job.id).catch(() => undefined);
+        await Promise.race([execution, new Promise((resolve) => setTimeout(resolve, 250))]);
+      }
+      const current = await jobStore.getOwnedJob(queued.job.id, request.authUser.id);
+      const session = await store.get(String(queued.job.payload.sessionId));
+      if (current?.status === "completed" && current.result?.response) {
+        const response = current.result.response as Record<string, JobJsonValue>;
+        return reply
+          .code(response.route === "direct" || response.answer ? 200 : 202)
+          .send({ ...response, session, sources: session?.sources });
+      }
+      return reply
+        .code(202)
+        .send({
+          route: parsed.data.deepResearch ? "deep" : "web",
+          interpretation: preview.interpretation,
+          researchId: queued.job.payload.sessionId,
+          jobId: queued.job.id,
+          session: await researchSnapshot(session, current ?? queued.job),
+          toolEvents: memoryToolEvent ? [memoryToolEvent] : [],
+        });
     }),
   );
 
@@ -1135,13 +1362,16 @@ export async function createServer(dependencies: ServerDependencies = {}) {
         typeof job.payload.sessionId === "string" ? [job.payload.sessionId] : [],
       );
       const persistedJobSessionIds = await store.listExistingIds(jobSessionIds);
+      const deletedSessionIds = (await store.listDeletedIds?.(jobSessionIds)) ?? new Set<string>();
       const detachedActiveJobs = cursor
         ? []
         : jobs.filter((job) => {
             const sessionId = job.payload.sessionId;
             return (
               job.kind === "research" &&
+              job.payload.task !== "followup" &&
               typeof sessionId === "string" &&
+              !deletedSessionIds.has(sessionId) &&
               !persistedJobSessionIds.has(sessionId)
             );
           });
@@ -1149,18 +1379,22 @@ export async function createServer(dependencies: ServerDependencies = {}) {
       for (const job of jobs) {
         if (
           job.kind === "research" &&
+          job.payload.task !== "followup" &&
           typeof job.payload.sessionId === "string" &&
-          ["queued", "retrying"].includes(job.status) &&
           !activeJobsBySession.has(job.payload.sessionId)
         ) {
           activeJobsBySession.set(job.payload.sessionId, job);
         }
       }
       return [
-        ...sessions.map((session) => {
-          const job = activeJobsBySession.get(session.id);
-          return job ? queuedResearchSnapshot(job) : session;
-        }),
+        ...(await Promise.all(
+          sessions.map(async (session) => {
+            const job =
+              activeJobsBySession.get(session.id) ??
+              jobs.find((candidate) => candidate.id === session.executionJobId);
+            return (await researchSnapshot(session, job))!;
+          }),
+        )),
         ...detachedActiveJobs.map(queuedResearchSnapshot),
       ];
     }),
@@ -1169,13 +1403,14 @@ export async function createServer(dependencies: ServerDependencies = {}) {
   app.get<{ Params: { id: string } }>(
     "/api/research/:id",
     requireUser(async (request, reply) => {
+      if ((await store.listDeletedIds?.([request.params.id]))?.has(request.params.id))
+        return reply.notFound("Research session not found");
       const session = await store.get(request.params.id);
-      const job = await jobStore.getJobForSession(request.params.id, request.authUser.id);
+      const job = await researchJob(request.params.id, request.authUser.id, session);
+      if (!session && job?.payload.task === "followup")
+        return reply.notFound("Research session not found");
       if (!session && !job) return reply.notFound("Research session not found");
-      if (!session && job) return queuedResearchSnapshot(job);
-      if (session && job && ["queued", "retrying"].includes(job.status))
-        return queuedResearchSnapshot(job);
-      return session;
+      return researchSnapshot(session, job);
     }),
   );
 
@@ -1262,7 +1497,11 @@ export async function createServer(dependencies: ServerDependencies = {}) {
   app.post<{ Params: { id: string } }>(
     "/api/research/:id/cancel",
     requireUser(async (request, reply) => {
-      const job = await jobStore.getJobForSession(request.params.id, request.authUser.id);
+      const job = await researchJob(
+        request.params.id,
+        request.authUser.id,
+        await store.get(request.params.id),
+      );
       if (job) {
         const cancelled = await jobStore.cancelJob(job.id, request.authUser.id);
         const session = await store.get(request.params.id);
@@ -1286,11 +1525,12 @@ export async function createServer(dependencies: ServerDependencies = {}) {
     "/api/research/:id",
     requireUser(async (request, reply) => {
       const session = await store.get(request.params.id);
-      if (!session) return reply.notFound("Research session not found");
-      const job = await jobStore.getJobForSession(request.params.id, request.authUser.id);
+      const job = await researchJob(request.params.id, request.authUser.id, session);
+      if (!session && (!job || job.payload.task === "followup"))
+        return reply.notFound("Research session not found");
       if (job && ["queued", "retrying", "running", "cancel_requested"].includes(job.status)) {
         await jobStore.cancelJob(job.id, request.authUser.id);
-        if (!["COMPLETED", "FAILED", "CANCELLED"].includes(session.status)) {
+        if (session && !["COMPLETED", "FAILED", "CANCELLED"].includes(session.status)) {
           await runner.cancel(session.id);
         }
       }
@@ -1723,7 +1963,9 @@ export async function createServer(dependencies: ServerDependencies = {}) {
     async (request, reply) => {
       void reply.header("Cache-Control", "private, no-store, max-age=0");
       void reply.header("Pragma", "no-cache");
-      const allowance = shareResolveLimiter.check(request.ip || "127.0.0.1");
+      const allowance = dependencies.shareResolveRateLimiter
+        ? shareResolveLimiter.check(request.ip || "127.0.0.1")
+        : await checkRateLimit("share", request.ip || "127.0.0.1", 60_000, 30, shareResolveLimiter);
       void reply.header("X-RateLimit-Limit", allowance.limit);
       void reply.header("X-RateLimit-Remaining", allowance.remaining);
       if (!allowance.allowed) {
@@ -1807,7 +2049,13 @@ export async function createServer(dependencies: ServerDependencies = {}) {
   app.post<{ Params: { id: string } }>(
     "/api/posts/:id/ask",
     requireUser(async (request, reply) => {
-      const allowance = followUpLimiter.check(request.ip || "127.0.0.1");
+      const allowance = await checkRateLimit(
+        "followup",
+        request.authUser.id,
+        60_000,
+        5,
+        followUpLimiter,
+      );
       if (!allowance.allowed) return reply.tooManyRequests("Too many post follow-up requests");
       const parsed = z
         .object({ question: z.string().trim().min(4).max(1000) })
@@ -1816,8 +2064,35 @@ export async function createServer(dependencies: ServerDependencies = {}) {
       try {
         if (!(await store.getPublishedPost(request.params.id)))
           return reply.notFound("Research post not found");
-        if (!(await consumeQuota(request.authUser.id, "followup", reply))) return reply;
-        return reply.code(202).send(await followUps.ask(request.params.id, parsed.data.question));
+        const idempotencyKey = readIdempotencyKey(request);
+        if (idempotencyKey === null) return reply.badRequest("Invalid Idempotency-Key");
+        const queued = await enqueueResearchJob({
+          ownerId: request.authUser.id,
+          question: parsed.data.question,
+          mode: "quick",
+          chargeQuota: true,
+          quotaKey: "followup",
+          idempotencyKey,
+          taskPayload: { task: "followup", postId: request.params.id },
+        });
+        if (queued.blocked === "account" || queued.blocked === "capability")
+          return reply.forbidden("Follow-ups are not enabled for this account");
+        if (queued.blocked === "unavailable")
+          return reply.serviceUnavailable("Account entitlements are temporarily unavailable");
+        if (sendQuotaRejection(queued, "followup", reply)) return reply;
+        if (!queued.job) return reply.internalServerError("Could not persist follow-up request");
+        return reply
+          .code(202)
+          .send({
+            id: queued.job.id,
+            postId: request.params.id,
+            question: parsed.data.question,
+            status: "QUEUED",
+            createdAt: queued.job.createdAt,
+            updatedAt: queued.job.updatedAt,
+            usedLiveResearch: false,
+            sourceIds: [],
+          });
       } catch (error) {
         if (error instanceof ResearchPostNotFoundError)
           return reply.notFound("Research post not found");
@@ -1829,7 +2104,28 @@ export async function createServer(dependencies: ServerDependencies = {}) {
   app.get<{ Params: { id: string; followUpId: string } }>(
     "/api/posts/:id/ask/:followUpId",
     requireUser(async (request, reply) => {
-      const followUp = await store.getFollowUp(request.params.followUpId);
+      let followUp = await store.getFollowUp(request.params.followUpId);
+      const job = await jobStore.getOwnedJob(request.params.followUpId, request.authUser.id);
+      if (job?.payload.task === "followup" && job.payload.postId === request.params.id) {
+        if (!followUp)
+          followUp = {
+            id: job.id,
+            postId: request.params.id,
+            question: String(job.payload.question),
+            status: "QUEUED",
+            createdAt: job.createdAt,
+            updatedAt: job.updatedAt,
+            usedLiveResearch: false,
+            sourceIds: [],
+          };
+        if (["failed", "cancelled"].includes(job.status))
+          followUp = {
+            ...followUp,
+            status: "FAILED",
+            error: job.errorSummary ?? "Follow-up stopped",
+            updatedAt: job.updatedAt,
+          };
+      }
       return followUp?.postId === request.params.id
         ? followUp
         : reply.notFound("Research follow-up not found");
@@ -1900,8 +2196,12 @@ export async function createServer(dependencies: ServerDependencies = {}) {
     "/api/research/:id/events",
     requireUser(async (request, reply) => {
       const ownerId = request.authUser.id;
+      if ((await store.listDeletedIds?.([request.params.id]))?.has(request.params.id))
+        return reply.notFound("Research session not found");
       let currentSession = await store.get(request.params.id);
-      let currentJob = await jobStore.getJobForSession(request.params.id, ownerId);
+      let currentJob = await researchJob(request.params.id, ownerId, currentSession);
+      if (!currentSession && currentJob?.payload.task === "followup")
+        return reply.notFound("Research session not found");
       if (!currentSession && !currentJob) return reply.notFound("Research session not found");
       if (!currentSession && currentJob) currentSession = queuedResearchSnapshot(currentJob);
       reply.hijack();
@@ -1929,13 +2229,10 @@ export async function createServer(dependencies: ServerDependencies = {}) {
       try {
         while (!closed && !response.destroyed) {
           const latest = await store.get(request.params.id);
-          currentJob = await jobStore.getJobForSession(request.params.id, ownerId);
-          currentSession =
-            latest ?? (currentJob ? queuedResearchSnapshot(currentJob) : currentSession);
+          currentJob = await researchJob(request.params.id, ownerId, latest);
+          if ((await store.listDeletedIds?.([request.params.id]))?.has(request.params.id)) break;
+          currentSession = await researchSnapshot(latest, currentJob);
           if (!currentSession) break;
-          if (currentJob && ["queued", "retrying"].includes(currentJob.status)) {
-            currentSession = queuedResearchSnapshot(currentJob);
-          }
           if (currentSession.updatedAt !== lastUpdatedAt || lastStepCount === 0) {
             send({ type: "research.snapshot", session: currentSession }, currentSession.updatedAt);
             for (const step of currentSession.steps.slice(lastStepCount)) {
@@ -1973,6 +2270,15 @@ export async function createServer(dependencies: ServerDependencies = {}) {
     if (reply.sent) return;
 
     const err = error as { statusCode?: number; message?: string };
+    if (
+      /Research session already has an active job|max_jobs_active_research_session_idx|Idempotency key was already used/i.test(
+        err.message ?? "",
+      )
+    ) {
+      return reply
+        .code(409)
+        .send({ error: "This request conflicts with an existing research job." });
+    }
     const status = err.statusCode ?? 500;
     if (status === 413) {
       return reply.code(413).send({ error: "Payload exceeds maximum allowed size of 64KB." });

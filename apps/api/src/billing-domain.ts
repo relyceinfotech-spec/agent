@@ -69,7 +69,7 @@ export type BillingWebhookDisposition =
 export interface BillingRepository {
   listPlans(): Promise<BillingPlan[]>;
   getPlan(planId: string): Promise<BillingPlan | undefined>;
-  getSubscriptionForUser(ownerId: string): Promise<BillingSubscription | undefined>;
+  getSubscriptionForUser(ownerId: string, nowMs?: number): Promise<BillingSubscription | undefined>;
   getCustomerAccount(
     ownerId: string,
     provider: string,

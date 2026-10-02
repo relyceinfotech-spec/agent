@@ -439,7 +439,9 @@ export function createToolRegistry(
     description: "Normalize and interpret a user request before any web search.",
     execute: async (input) => {
       const question = textInput(input, "question", 2000);
-      return understandQuery(question, planner);
+      return understandQuery(question, planner, "quick", {
+        allowModel: (input as { allowModel?: boolean }).allowModel !== false,
+      });
     },
   });
 

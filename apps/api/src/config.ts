@@ -109,6 +109,7 @@ const schema = z.object({
   MAX_CONTENT_BYTES: z.coerce.number().int().positive().default(2_000_000),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   RATE_LIMIT_MAX_REQUESTS: z.coerce.number().int().positive().default(60),
+  MAX_TRUSTED_PROXIES: z.string().default(""),
   MAX_BODY_BYTES: z.coerce.number().int().positive().default(65536),
   MAX_CONCURRENT_FETCHES: z.coerce.number().int().positive().default(4),
 });

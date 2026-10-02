@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { currentWorkerContext } from "../worker-context.js";
 import type {
   ResearchSession,
   ResearchMode,
@@ -19,7 +20,11 @@ import { runWithResearchExecutionContext } from "../execution-context.js";
 import type { ResearchBudget } from "../research.js";
 import { SourceRetrievalError } from "../source-retrieval.js";
 import { subjectEntityMismatchReason } from "../entities.js";
-import { buildRequestedFactRequirements, extractRequestedFacts } from "../requested-facts.js";
+import {
+  buildRequestedFactRequirements,
+  extractRequestedFacts,
+  requestedFactCoverage,
+} from "../requested-facts.js";
 
 type FastLookupLimits = Pick<
   ResearchBudget,
@@ -56,6 +61,13 @@ export interface ChatResponse {
 }
 
 export class AutonomousAgent {
+  async preview(question: string, deepResearch: boolean) {
+    const interpretation = (await this.tools.execute("understand_query", {
+      question,
+      allowModel: false,
+    })) as QueryInterpretation;
+    return { interpretation, decision: this.route(interpretation, deepResearch) };
+  }
   constructor(
     private readonly tools: ToolRegistry,
     private readonly runner: ResearchRunner,
@@ -181,8 +193,10 @@ export class AutonomousAgent {
     const controller = new AbortController();
     const deadlineAt = startedAt + this.fastLookupLimits.maxTimeMs;
     const timeout = setTimeout(() => controller.abort(), Math.max(0, deadlineAt - Date.now()));
+    const parent = currentWorkerContext()?.signal;
+    const signal = parent ? AbortSignal.any([controller.signal, parent]) : controller.signal;
     try {
-      return await runWithResearchExecutionContext({ deadlineAt, signal: controller.signal }, () =>
+      return await runWithResearchExecutionContext({ deadlineAt, signal }, () =>
         this.fastWebLookupWithinBudget(
           question,
           interpretation,
@@ -444,16 +458,27 @@ export class AutonomousAgent {
             /Published version or release tag:\s*(\d+\.\d+\.\d+)/i,
           )?.[1]
         : undefined;
-    if (isReactVersionLookup && version && registryIndex >= 0) {
+    const canAnswerFromLatestRegistry =
+      isReactVersionLookup &&
+      version &&
+      registryIndex >= 0 &&
+      /\b(latest|current|newest|most recent)\b/i.test(question) &&
+      !/\b\d+\.\d+(?:\.\d+)?\b/.test(question) &&
+      requestedFacts.every((fact) => fact === "version" || fact === "latestness");
+    if (canAnswerFromLatestRegistry) {
       answer = `The latest published React release on npm is version ${version} [${registryIndex + 1}].`;
-      answer = (await this.llm.validateCitedAnswer(answer, evidenceSources)).finalAnswer;
+      const validation = await this.llm.validateCitedAnswer(answer, evidenceSources);
+      answer = validation.finalAnswer;
       toolEvents.push({
         tool: "synthesize",
         status: "complete",
         message: "Answered from verified structured source data",
         phase: "tool",
       });
-      answerSucceeded = true;
+      answerSucceeded =
+        validation.status === "VALIDATED" &&
+        !validation.failure &&
+        requestedFactCoverage(question, [answer], { requestedFacts }).missing.length === 0;
     } else if (evidenceSources.every((source) => !source.content?.trim())) {
       answer =
         "I couldn't verify this current information from a retrieved source. Please try again later or narrow the question.";
@@ -490,7 +515,17 @@ export class AutonomousAgent {
           undefined,
           memoryContext,
         );
-        answerSucceeded = answer.trim().length > 0;
+        const metrics = this.llm.metrics;
+        answerSucceeded =
+          answer.trim().length > 0 &&
+          metrics.citationEntailment?.status === "VALIDATED" &&
+          !metrics.citationEntailment.failure &&
+          metrics.synthesis?.finalAnswerSource !== "unavailable" &&
+          metrics.synthesis?.requiredFactCoverage.missing.length === 0 &&
+          metrics.synthesis?.evidenceFactCoverage.missing.length === 0 &&
+          !/Insufficient evidence|couldn't verify|cannot present it as sufficiently verified/i.test(
+            answer,
+          );
         if (!answerSucceeded) {
           answer = "I couldn't produce an answer grounded in the retrieved source content.";
         }
@@ -513,7 +548,11 @@ export class AutonomousAgent {
     }
 
     // 5. Persist the actual outcome; a transparent fallback is not a completed research result.
-    const sessionId = randomUUID();
+    const job = currentWorkerContext()?.lease.job;
+    const sessionId =
+      job?.payload.task === "chat" && typeof job.payload.sessionId === "string"
+        ? job.payload.sessionId
+        : randomUUID();
     const retrievedSources = evidenceSources.filter((source) => source.content?.trim());
     const fetchErrors = fetchedSources
       .map((source) => source.fetchError)
@@ -532,6 +571,8 @@ export class AutonomousAgent {
       question,
       mode: "quick",
       status: answerSucceeded ? "COMPLETED" : "FAILED",
+      executionJobId: job?.id,
+      executionLeaseGeneration: currentWorkerContext()?.lease.generation,
       createdAt: now,
       updatedAt: new Date().toISOString(),
       plan,
@@ -608,12 +649,22 @@ export class AutonomousAgent {
       memoryContext?: string,
       interpretation?: QueryInterpretation,
     ) => Promise<{ session: ResearchSession; jobId: string }>,
+    interpretationOverride?: QueryInterpretation,
   ): Promise<ChatResponse> {
     const startedAt = Date.now();
     const toolEvents: AgentToolEvent[] = [];
-    const interpretation = await this.use<QueryInterpretation>(toolEvents, "understand_query", {
-      question,
-    });
+    const interpretation =
+      interpretationOverride ??
+      (await this.use<QueryInterpretation>(toolEvents, "understand_query", {
+        question,
+      }));
+    if (interpretationOverride)
+      toolEvents.push({
+        tool: "understand_query",
+        status: "complete",
+        message: "Applied the persisted request interpretation",
+        phase: "tool",
+      });
     const decision = this.route(interpretation, deepResearch);
     toolEvents.push({
       tool: "decide_next_action",

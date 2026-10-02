@@ -1,5 +1,7 @@
 import type { ResearchSession } from "./domain.js";
 import { DatabaseSync } from "node:sqlite";
+import { SqliteDurableJobStore } from "./job-store.js";
+import { currentWorkerContext, throwIfWorkerStopped } from "./worker-context.js";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -74,6 +76,7 @@ export interface ContentStore {
 }
 
 export interface SessionStore {
+  listDeletedIds?(ids: string[]): Promise<Set<string>>;
   create(session: ResearchSession): Promise<void>;
   get(id: string): Promise<ResearchSession | undefined>;
   update(session: ResearchSession): Promise<void>;
@@ -260,11 +263,26 @@ export interface MaxStore
   recoverInterrupted(): number | Promise<number>;
   recoverAutonomousRuns(): number | Promise<number>;
   close(): void | Promise<void>;
+  consumeRateLimit?(
+    scope: string,
+    clientKey: string,
+    windowMs: number,
+    limit: number,
+  ): Promise<{
+    allowed: boolean;
+    limit: number;
+    remaining: number;
+    resetMs: number;
+  }>;
 }
 
 export class MemorySessionStore implements SessionStore {
   private readonly data = new Map<string, { session: ResearchSession; ownerId?: string }>();
+  private readonly deleted = new Map<string, string | undefined>();
   async create(session: ResearchSession) {
+    await currentWorkerContext()?.assertLease(session.status === "CANCELLED");
+    throwIfWorkerStopped(session.status === "CANCELLED");
+    if (this.deleted.has(session.id)) throw new Error("Research session was deleted");
     const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
     this.data.set(session.id, {
       session: structuredClone(session),
@@ -278,6 +296,9 @@ export class MemorySessionStore implements SessionStore {
     return value ? structuredClone(value.session) : undefined;
   }
   async update(session: ResearchSession) {
+    await currentWorkerContext()?.assertLease(session.status === "CANCELLED");
+    throwIfWorkerStopped(session.status === "CANCELLED");
+    if (this.deleted.has(session.id)) throw new Error("Research session was deleted");
     const current = this.data.get(session.id);
     const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
     if (ownerId && current?.ownerId !== ownerId) return;
@@ -316,13 +337,65 @@ export class MemorySessionStore implements SessionStore {
   async delete(id: string) {
     const row = this.data.get(id);
     const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
-    if (!ownerId || row?.ownerId === ownerId) this.data.delete(id);
+    if ((row && (!ownerId || row.ownerId === ownerId)) || (!row && ownerId)) {
+      this.deleted.set(id, row?.ownerId ?? ownerId);
+      this.data.delete(id);
+    }
+  }
+  async listDeletedIds(ids: string[]): Promise<Set<string>> {
+    const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
+    return new Set(
+      ids.filter((id) => this.deleted.has(id) && (!ownerId || this.deleted.get(id) === ownerId)),
+    );
   }
 }
 
 /** Durable embedded session store; callers retain the same SessionStore contract. */
 export class SqliteSessionStore implements MaxStore {
   private readonly database: DatabaseSync;
+  createJobStore(): SqliteDurableJobStore {
+    return new SqliteDurableJobStore(this.database);
+  }
+
+  private assertWorkerLease(allowCancellation = false): void {
+    const worker = currentWorkerContext();
+    if (!worker) return;
+    throwIfWorkerStopped(allowCancellation);
+    const lease = worker.lease;
+    const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId() ?? null;
+    if ((lease.job.ownerId ?? null) !== ownerId) throw new Error("Research owner mismatch");
+    // Tests can use an in-memory queue alongside an embedded session database.
+    if (
+      !this.database
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='max_jobs'")
+        .get()
+    )
+      return;
+    const row = this.database
+      .prepare(
+        `SELECT id FROM max_jobs WHERE id = ?
+      AND lease_owner = ? AND lease_generation = ? AND lease_expires_at > ? AND (status = 'running' OR (status = 'cancel_requested' AND ?))`,
+      )
+      .get(lease.job.id, lease.workerId, lease.generation, Date.now(), allowCancellation ? 1 : 0);
+    if (!row) throw new Error("Job lease was lost");
+  }
+
+  private async workerWrite(operation: () => void, allowCancellation = false): Promise<void> {
+    if (!currentWorkerContext()) {
+      operation();
+      return;
+    }
+    await currentWorkerContext()!.assertLease(allowCancellation);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.assertWorkerLease(allowCancellation);
+      operation();
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -330,6 +403,10 @@ export class SqliteSessionStore implements MaxStore {
     this.database.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA busy_timeout = 5000;
+      CREATE TABLE IF NOT EXISTS deleted_research_sessions (id TEXT PRIMARY KEY, owner_id TEXT);
+      CREATE TABLE IF NOT EXISTS request_rate_limits (key TEXT PRIMARY KEY, window_end INTEGER NOT NULL, used INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS request_rate_limits_expiry ON request_rate_limits(window_end);
+
       CREATE TABLE IF NOT EXISTS research_sessions (
         id TEXT PRIMARY KEY,
         owner_id TEXT,
@@ -532,24 +609,26 @@ export class SqliteSessionStore implements MaxStore {
   }
 
   async saveTopic(topic: TopicCandidate): Promise<void> {
-    const url = canonicalizeUrl(topic.url);
-    this.database
-      .prepare(
-        `
+    await this.workerWrite(() => {
+      const url = canonicalizeUrl(topic.url);
+      this.database
+        .prepare(
+          `
       INSERT INTO topics (id, url, status, score, discovered_at, data)
       VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         status = excluded.status, score = excluded.score, data = excluded.data
     `,
-      )
-      .run(
-        topic.id,
-        url,
-        topic.status,
-        topic.score,
-        topic.discoveredAt,
-        JSON.stringify({ ...topic, url }),
-      );
+        )
+        .run(
+          topic.id,
+          url,
+          topic.status,
+          topic.score,
+          topic.discoveredAt,
+          JSON.stringify({ ...topic, url }),
+        );
+    });
   }
 
   async listTopics(limit = 100): Promise<TopicCandidate[]> {
@@ -560,16 +639,18 @@ export class SqliteSessionStore implements MaxStore {
   }
 
   async saveRun(run: AutonomousRun): Promise<void> {
-    this.database
-      .prepare(
-        `
+    await this.workerWrite(() => {
+      this.database
+        .prepare(
+          `
       INSERT INTO autonomous_runs (id, status, created_at, updated_at, data)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         status = excluded.status, updated_at = excluded.updated_at, data = excluded.data
     `,
-      )
-      .run(run.id, run.status, run.createdAt, run.updatedAt, JSON.stringify(run));
+        )
+        .run(run.id, run.status, run.createdAt, run.updatedAt, JSON.stringify(run));
+    }, run.status === "CANCELLED");
   }
 
   async getRun(id: string): Promise<AutonomousRun | undefined> {
@@ -586,8 +667,10 @@ export class SqliteSessionStore implements MaxStore {
   }
 
   async savePost(post: ResearchPost): Promise<void> {
+    await currentWorkerContext()?.assertLease();
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.assertWorkerLease();
       this.insertPostRows(post);
       this.database.exec("COMMIT");
     } catch (error) {
@@ -597,6 +680,7 @@ export class SqliteSessionStore implements MaxStore {
   }
 
   async publishPost(post: ResearchPost, topic: TopicCandidate, run: AutonomousRun): Promise<void> {
+    await currentWorkerContext()?.assertLease();
     if (
       post.topicId !== topic.id ||
       run.topicId !== topic.id ||
@@ -608,6 +692,7 @@ export class SqliteSessionStore implements MaxStore {
 
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.assertWorkerLease();
       this.insertPostRows(post);
       const topicUpdate = this.database
         .prepare(
@@ -696,29 +781,31 @@ export class SqliteSessionStore implements MaxStore {
   }
 
   async saveFollowUp(followUp: ResearchFollowUp): Promise<void> {
-    const ownerId = currentAuthenticatedUser()?.userId ?? null;
-    this.database
-      .prepare(
-        `
+    await this.workerWrite(() => {
+      const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId() ?? null;
+      this.database
+        .prepare(
+          `
       INSERT INTO post_followups (id, owner_id, post_id, status, updated_at, data)
       VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         status = excluded.status, updated_at = excluded.updated_at, data = excluded.data
       WHERE post_followups.owner_id IS excluded.owner_id
     `,
-      )
-      .run(
-        followUp.id,
-        ownerId,
-        followUp.postId,
-        followUp.status,
-        followUp.updatedAt,
-        JSON.stringify(followUp),
-      );
+        )
+        .run(
+          followUp.id,
+          ownerId,
+          followUp.postId,
+          followUp.status,
+          followUp.updatedAt,
+          JSON.stringify(followUp),
+        );
+    });
   }
 
   async getFollowUp(id: string): Promise<ResearchFollowUp | undefined> {
-    const userId = currentAuthenticatedUser()?.userId;
+    const userId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
     const row = (
       userId
         ? this.database
@@ -877,22 +964,30 @@ export class SqliteSessionStore implements MaxStore {
   }
 
   async create(session: ResearchSession): Promise<void> {
-    const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId() ?? null;
-    this.database
-      .prepare(
-        `
+    await this.workerWrite(() => {
+      if (
+        this.database
+          .prepare("SELECT id FROM deleted_research_sessions WHERE id = ?")
+          .get(session.id)
+      )
+        throw new Error("Research session was deleted");
+      const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId() ?? null;
+      this.database
+        .prepare(
+          `
       INSERT INTO research_sessions (id, owner_id, created_at, updated_at, status, data)
       VALUES (?, ?, ?, ?, ?, ?)
     `,
-      )
-      .run(
-        session.id,
-        ownerId,
-        session.createdAt,
-        session.updatedAt,
-        session.status,
-        JSON.stringify(session),
-      );
+        )
+        .run(
+          session.id,
+          ownerId,
+          session.createdAt,
+          session.updatedAt,
+          session.status,
+          JSON.stringify(session),
+        );
+    });
   }
 
   async get(id: string): Promise<ResearchSession | undefined> {
@@ -908,20 +1003,28 @@ export class SqliteSessionStore implements MaxStore {
   }
 
   async update(session: ResearchSession): Promise<void> {
-    const userId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
-    const query = userId
-      ? this.database.prepare(`
+    await this.workerWrite(() => {
+      if (
+        this.database
+          .prepare("SELECT id FROM deleted_research_sessions WHERE id = ?")
+          .get(session.id)
+      )
+        throw new Error("Research session was deleted");
+      const userId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
+      const query = userId
+        ? this.database.prepare(`
           UPDATE research_sessions SET updated_at = ?, status = ?, data = ?
           WHERE id = ? AND owner_id = ?
         `)
-      : this.database.prepare(`
+        : this.database.prepare(`
           UPDATE research_sessions SET updated_at = ?, status = ?, data = ? WHERE id = ?
         `);
-    if (userId) {
-      query.run(session.updatedAt, session.status, JSON.stringify(session), session.id, userId);
-    } else {
-      query.run(session.updatedAt, session.status, JSON.stringify(session), session.id);
-    }
+      if (userId) {
+        query.run(session.updatedAt, session.status, JSON.stringify(session), session.id, userId);
+      } else {
+        query.run(session.updatedAt, session.status, JSON.stringify(session), session.id);
+      }
+    }, session.status === "CANCELLED");
   }
 
   async list(
@@ -962,14 +1065,73 @@ export class SqliteSessionStore implements MaxStore {
     return new Set(rows.map((row) => row.id));
   }
 
+  async listDeletedIds(ids: string[]): Promise<Set<string>> {
+    const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
+    return new Set(
+      ids.filter((id) =>
+        this.database
+          .prepare(
+            `SELECT id FROM deleted_research_sessions WHERE id = ? ${ownerId ? "AND owner_id = ?" : ""}`,
+          )
+          .get(...(ownerId ? [id, ownerId] : [id])),
+      ),
+    );
+  }
+
   async delete(id: string): Promise<void> {
-    const userId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
-    if (userId) {
+    const ownerId = currentAuthenticatedUser()?.userId ?? currentResearchOwnerId();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database
+        .prepare(
+          `SELECT owner_id FROM research_sessions WHERE id = ? ${ownerId ? "AND owner_id = ?" : ""}`,
+        )
+        .get(...(ownerId ? [id, ownerId] : [id])) as { owner_id: string | null } | undefined;
+      if (
+        row ||
+        (ownerId && !this.database.prepare("SELECT id FROM research_sessions WHERE id = ?").get(id))
+      ) {
+        this.database
+          .prepare("INSERT OR IGNORE INTO deleted_research_sessions (id, owner_id) VALUES (?, ?)")
+          .run(id, row?.owner_id ?? ownerId ?? null);
+        this.database.prepare("DELETE FROM research_sessions WHERE id = ?").run(id);
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async consumeRateLimit(scope: string, clientKey: string, windowMs: number, limit: number) {
+    const now = Date.now();
+    const windowEnd = (Math.floor(now / windowMs) + 1) * windowMs;
+    const key = createHash("sha256").update(`${scope}\0${clientKey}`).digest("hex");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
       this.database
-        .prepare("DELETE FROM research_sessions WHERE id = ? AND owner_id = ?")
-        .run(id, userId);
-    } else {
-      this.database.prepare("DELETE FROM research_sessions WHERE id = ?").run(id);
+        .prepare(
+          "DELETE FROM request_rate_limits WHERE key IN (SELECT key FROM request_rate_limits WHERE window_end <= ? LIMIT 100)",
+        )
+        .run(now);
+      const row = this.database
+        .prepare(
+          `INSERT INTO request_rate_limits(key,window_end,used) VALUES (?,?,1)
+        ON CONFLICT(key) DO UPDATE SET window_end=excluded.window_end,
+          used=CASE WHEN request_rate_limits.window_end=excluded.window_end THEN MIN(request_rate_limits.used+1,?) ELSE 1 END
+        RETURNING used`,
+        )
+        .get(key, windowEnd, limit + 1) as { used: number };
+      this.database.exec("COMMIT");
+      return {
+        allowed: row.used <= limit,
+        limit,
+        remaining: Math.max(0, limit - row.used),
+        resetMs: windowEnd - now,
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
     }
   }
 

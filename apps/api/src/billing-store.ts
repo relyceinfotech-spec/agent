@@ -186,7 +186,21 @@ export class SupabaseBillingRepository implements BillingRepository {
     return data ? planFromRow(data) : undefined;
   }
 
-  async getSubscriptionForUser(ownerId: string): Promise<BillingSubscription | undefined> {
+  async getSubscriptionForUser(
+    ownerId: string,
+    nowMs = Date.now(),
+  ): Promise<BillingSubscription | undefined> {
+    const { data: active, error: activeError } = await this.billing
+      .from("subscriptions")
+      .select("*")
+      .eq("owner_id", ownerId)
+      .in("status", ["active", "trialing"])
+      .or(`current_period_end.is.null,current_period_end.gt.${new Date(nowMs).toISOString()}`)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    raiseIfError(activeError);
+    if (active) return subscriptionFromRow(active);
     const { data, error } = await this.billing
       .from("subscriptions")
       .select("*")
@@ -298,10 +312,14 @@ export class InMemoryBillingRepository implements BillingRepository {
     return plan ? structuredClone(plan) : undefined;
   }
 
-  async getSubscriptionForUser(ownerId: string): Promise<BillingSubscription | undefined> {
-    const subscription = [...this.subscriptions.values()]
-      .filter((item) => item.ownerId === ownerId)
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+  async getSubscriptionForUser(
+    ownerId: string,
+    nowMs = Date.now(),
+  ): Promise<BillingSubscription | undefined> {
+    const subscription = selectSubscription(
+      [...this.subscriptions.values()].filter((item) => item.ownerId === ownerId),
+      nowMs,
+    );
     return subscription ? structuredClone(subscription) : undefined;
   }
 
@@ -399,4 +417,21 @@ export class InMemoryBillingRepository implements BillingRepository {
       structuredClone(subscription),
     );
   }
+}
+
+function selectSubscription(
+  subscriptions: BillingSubscription[],
+  nowMs: number,
+): BillingSubscription | undefined {
+  const ordered = [...subscriptions].sort(
+    (left, right) =>
+      right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id),
+  );
+  return (
+    ordered.find(
+      (item) =>
+        ["active", "trialing"].includes(item.status) &&
+        (!item.currentPeriodEnd || Date.parse(item.currentPeriodEnd) > nowMs),
+    ) ?? ordered[0]
+  );
 }

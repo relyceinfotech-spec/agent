@@ -1,4 +1,6 @@
 import { config } from "./config.js";
+import { operationState } from "./operation-context.js";
+import { currentWorkerContext } from "./worker-context.js";
 import { getResearchExecutionContext } from "./execution-context.js";
 import type { Claim, ResearchMode, ResearchPlan, Source, ResearchState } from "./domain.js";
 import {
@@ -164,11 +166,46 @@ function classifySynthesisFailure(error: unknown): string {
   return classifyOpenRouterFailure(error) ?? "PROVIDER_FAILURE";
 }
 
+function emptyMetrics(): LLMMetrics {
+  return { calls: 0, failures: 0, durationMs: 0, usage: {}, records: [] };
+}
+
 export class OpenRouterProvider {
-  private readonly callRecords: LLMCallRecord[] = [];
+  private readonly defaultMetrics = emptyMetrics();
   private deadlineAt?: number;
-  private citationEntailment?: CitationEntailmentReport;
-  private synthesisMetrics?: LLMSynthesisMetrics;
+  private get metricState(): LLMMetrics {
+    return operationState(this, this.defaultMetrics, emptyMetrics);
+  }
+  private get citationEntailment() {
+    return this.metricState.citationEntailment;
+  }
+  private set citationEntailment(value: CitationEntailmentReport | undefined) {
+    this.metricState.citationEntailment = value;
+  }
+  private get synthesisMetrics() {
+    return this.metricState.synthesis;
+  }
+  private set synthesisMetrics(value: LLMSynthesisMetrics | undefined) {
+    this.metricState.synthesis = value;
+  }
+  private recordCall(call: LLMCallRecord): void {
+    const metrics = this.metricState;
+    metrics.calls++;
+    metrics.failures += call.error ? 1 : 0;
+    metrics.durationMs += call.durationMs;
+    for (const key of [
+      "promptTokens",
+      "completionTokens",
+      "reasoningTokens",
+      "totalTokens",
+      "cost",
+    ] as const) {
+      const value = call.usage?.[key];
+      if (value !== undefined) metrics.usage[key] = (metrics.usage[key] ?? 0) + value;
+    }
+    metrics.records.push(call);
+    if (metrics.records.length > 200) metrics.records.shift();
+  }
   readonly role: NonNullable<OpenRouterProviderOptions["role"]>;
   readonly model: string;
   readonly fallbackModel?: string;
@@ -197,28 +234,12 @@ export class OpenRouterProvider {
     return Boolean(config.OPENROUTER_API_KEY);
   }
   get metrics(): LLMMetrics {
-    const usage = this.callRecords.reduce<LLMUsage>((total, call) => {
-      if (!call.usage) return total;
-      for (const key of [
-        "promptTokens",
-        "completionTokens",
-        "reasoningTokens",
-        "totalTokens",
-        "cost",
-      ] as const) {
-        const value = call.usage[key];
-        if (value !== undefined) total[key] = (total[key] ?? 0) + value;
-      }
-      return total;
-    }, {});
+    const state = this.metricState;
     return {
-      calls: this.callRecords.length,
-      failures: this.callRecords.filter((call) => call.error).length,
-      durationMs: this.callRecords.reduce((total, call) => total + call.durationMs, 0),
-      usage,
-      records: [...this.callRecords],
-      citationEntailment: this.citationEntailment,
-      synthesis: this.synthesisMetrics ? structuredClone(this.synthesisMetrics) : undefined,
+      ...state,
+      usage: { ...state.usage },
+      records: [...state.records],
+      synthesis: state.synthesis ? structuredClone(state.synthesis) : undefined,
     };
   }
 
@@ -320,7 +341,7 @@ export class OpenRouterProvider {
         effectiveTimeoutMs,
       };
       const controller = new AbortController();
-      const contextSignal = executionContext?.signal;
+      const contextSignal = executionContext?.signal ?? currentWorkerContext()?.signal;
       let usage: LLMUsage | undefined;
       let responseParseResult: LLMCallRecord["responseParseResult"] = options.responseFormat
         ? "NOT_PARSED"
@@ -404,7 +425,7 @@ export class OpenRouterProvider {
             throw error;
           }
         }
-        this.callRecords.push({
+        this.recordCall({
           durationMs: Date.now() - startedAt,
           role: this.role,
           model,
@@ -429,7 +450,7 @@ export class OpenRouterProvider {
           : deadlineAbort
             ? "research_deadline"
             : undefined;
-        this.callRecords.push({
+        this.recordCall({
           durationMs: Date.now() - startedAt,
           role: this.role,
           model,

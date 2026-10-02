@@ -7,6 +7,7 @@ class BillingQuery implements PromiseLike<{ data: Row[]; error: null }> {
   private readonly filters: Array<[string, unknown]> = [];
   private maximum = Number.POSITIVE_INFINITY;
   private staged: Row | undefined;
+  private currentPeriodAfter?: number;
 
   constructor(
     private readonly rows: Row[],
@@ -19,6 +20,16 @@ class BillingQuery implements PromiseLike<{ data: Row[]; error: null }> {
 
   eq(column: string, value: unknown) {
     this.filters.push([column, value]);
+    return this;
+  }
+  in(column: string, values: unknown[]) {
+    this.filters.push([column, values]);
+    return this;
+  }
+  or(value: string) {
+    this.currentPeriodAfter = Date.parse(
+      value.replace("current_period_end.is.null,current_period_end.gt.", ""),
+    );
     return this;
   }
 
@@ -61,8 +72,14 @@ class BillingQuery implements PromiseLike<{ data: Row[]; error: null }> {
   }
 
   private filtered() {
-    let result = this.rows.filter((row) =>
-      this.filters.every(([column, value]) => row[column] === value),
+    let result = this.rows.filter(
+      (row) =>
+        this.filters.every(([column, value]) =>
+          Array.isArray(value) ? value.includes(row[column]) : row[column] === value,
+        ) &&
+        (this.currentPeriodAfter === undefined ||
+          row.current_period_end == null ||
+          Date.parse(String(row.current_period_end)) > this.currentPeriodAfter),
     );
     if (this.orderState.column) {
       const column = this.orderState.column;
@@ -171,6 +188,28 @@ describe("SupabaseBillingRepository", () => {
       "sub-a",
     );
     expect(await repository.getSubscriptionForUser("user-c")).toBeUndefined();
+    const active = fake.tables.get("subscriptions")![0];
+    fake.tables
+      .get("subscriptions")!
+      .push({
+        ...active,
+        id: "cancelled",
+        status: "canceled",
+        external_subscription_id: "sub-old",
+        updated_at: "2026-10-01T12:00:00.000Z",
+      });
+    expect((await repository.getSubscriptionForUser("user-a"))?.externalSubscriptionId).toBe(
+      "sub-a",
+    );
+    active.current_period_end = "2026-09-27T12:00:00.000Z";
+    expect(
+      (await repository.getSubscriptionForUser("user-a", Date.parse("2026-09-26")))
+        ?.externalSubscriptionId,
+    ).toBe("sub-a");
+    expect(
+      (await repository.getSubscriptionForUser("user-a", Date.parse("2026-10-02")))
+        ?.externalSubscriptionId,
+    ).toBe("sub-old");
   });
 
   it("applies only the normalized webhook RPC and accepts its disposition", async () => {

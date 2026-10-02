@@ -38,12 +38,14 @@ type SqliteJobRow = {
 export class SqliteDurableJobStore implements DurableJobStore {
   private readonly database: DatabaseSync;
   private closed = false;
+  private readonly ownsDatabase: boolean;
 
   constructor(
-    path: string,
+    path: string | DatabaseSync,
     private readonly clock: () => number = Date.now,
   ) {
-    this.database = new DatabaseSync(path);
+    this.ownsDatabase = typeof path === "string";
+    this.database = typeof path === "string" ? new DatabaseSync(path) : path;
     this.database.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA busy_timeout = 10000;
@@ -88,6 +90,22 @@ export class SqliteDurableJobStore implements DurableJobStore {
         PRIMARY KEY (user_id, quota_key)
       );
     `);
+    this.database.exec(`
+      BEGIN IMMEDIATE;
+      WITH ranked AS (
+        SELECT id, ROW_NUMBER() OVER (PARTITION BY owner_scope,json_extract(payload_json,'$.sessionId')
+          ORDER BY (status='running') DESC,created_at,id) AS position
+        FROM max_jobs WHERE kind='research' AND json_extract(payload_json,'$.sessionId') IS NOT NULL
+          AND status IN ('queued','retrying','running','cancel_requested')
+      )
+      UPDATE max_jobs SET status='failed',lease_owner=NULL,lease_expires_at=NULL,
+        error_summary='Superseded competing research job',updated_at=${Date.now()},finished_at=${Date.now()}
+      WHERE id IN (SELECT id FROM ranked WHERE position>1);
+      CREATE UNIQUE INDEX IF NOT EXISTS max_jobs_active_research_session_idx
+        ON max_jobs(owner_scope,json_extract(payload_json,'$.sessionId'))
+        WHERE kind='research' AND status IN ('queued','retrying','running','cancel_requested');
+      COMMIT;
+    `);
   }
 
   async enqueueJob(input: EnqueueJobInput): Promise<EnqueueJobResult> {
@@ -111,6 +129,15 @@ export class SqliteDurableJobStore implements DurableJobStore {
         }
       }
 
+      if (input.kind === "research" && typeof input.payload.sessionId === "string") {
+        const active = this.database
+          .prepare(
+            `SELECT id FROM max_jobs WHERE kind='research' AND owner_scope=?
+          AND json_extract(payload_json, '$.sessionId')=? AND status IN ('queued','retrying','running','cancel_requested')`,
+          )
+          .get(input.ownerScope, input.payload.sessionId);
+        if (active) throw new Error("Research session already has an active job");
+      }
       const now = this.clock();
       let quota: EnqueueJobResult["quota"];
       if (input.quota) {
@@ -151,7 +178,11 @@ export class SqliteDurableJobStore implements DurableJobStore {
     }
   }
 
-  async claimJob(workerId: string, leaseSeconds: number): Promise<JobLease | undefined> {
+  async claimJob(
+    workerId: string,
+    leaseSeconds: number,
+    jobId?: string,
+  ): Promise<JobLease | undefined> {
     validateLease(leaseSeconds);
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -168,10 +199,10 @@ export class SqliteDurableJobStore implements DurableJobStore {
       const candidate = this.database
         .prepare(
           `SELECT * FROM max_jobs
-             WHERE status IN ('queued', 'retrying') AND available_at <= ?
+             WHERE status IN ('queued', 'retrying') AND available_at <= ? AND (? IS NULL OR id = ?)
              ORDER BY created_at, id LIMIT 1`,
         )
-        .get(now) as SqliteJobRow | undefined;
+        .get(now, jobId ?? null, jobId ?? null) as SqliteJobRow | undefined;
       if (!candidate) {
         this.database.exec("COMMIT");
         return undefined;
@@ -370,7 +401,7 @@ export class SqliteDurableJobStore implements DurableJobStore {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    this.database.close();
+    if (this.ownsDatabase) this.database.close();
   }
 
   private validateInput(input: EnqueueJobInput) {

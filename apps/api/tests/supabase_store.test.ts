@@ -104,7 +104,21 @@ class FakeQuery implements PromiseLike<{ data: Row[]; error: { message: string }
 
 function fakeClient() {
   const tables = new Map<string, Row[]>();
-  const rpc = vi.fn(async (_name: string, _args?: Row) => ({ data: null, error: null }));
+  const rpc = vi.fn(async (name: string, args?: Row) => {
+    if (name === "max_delete_research_session") {
+      const rows = tables.get("max_research_sessions") ?? [];
+      const index = rows.findIndex(
+        (row) => row.id === args?.p_id && (row.owner_id ?? null) === (args?.p_owner_id ?? null),
+      );
+      if (index >= 0) {
+        const deleted = tables.get("max_deleted_research_sessions") ?? [];
+        deleted.push({ id: rows[index].id, owner_id: rows[index].owner_id });
+        tables.set("max_deleted_research_sessions", deleted);
+        rows.splice(index, 1);
+      }
+    }
+    return { data: null, error: null };
+  });
   const client = {
     schema(_schema: string) {
       return this;

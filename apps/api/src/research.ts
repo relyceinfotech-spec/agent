@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { currentWorkerContext } from "./worker-context.js";
 import { config } from "./config.js";
 import {
   activeResearchStage,
@@ -811,6 +812,7 @@ export class ResearchRunner {
     private readonly budgetOverrides: Partial<ResearchBudget> = {},
     private readonly evaluationBudgetCeilings?: Partial<ResearchBudget>,
     private readonly adaptiveEvidenceLoop = false,
+    private readonly synthesisProvider = llm,
   ) {
     if (evaluationBudgetCeilings && config.NODE_ENV !== "test") {
       throw new Error("Extended research budgets are available only in test/evaluation mode");
@@ -835,6 +837,7 @@ export class ResearchRunner {
       memoryContext?: string;
       interpretation?: QueryInterpretation;
       researchChatOptimization?: boolean;
+      signal?: AbortSignal;
     } = {},
   ): Promise<ResearchSession> {
     const now = new Date().toISOString();
@@ -843,6 +846,8 @@ export class ResearchRunner {
       question,
       mode,
       status: "QUEUED",
+      executionJobId: currentWorkerContext()?.lease.job.id,
+      executionLeaseGeneration: currentWorkerContext()?.lease.generation,
       seedResults: seedResults.slice(0, 3),
       createdAt: now,
       updatedAt: now,
@@ -853,10 +858,16 @@ export class ResearchRunner {
       steps: [],
     };
     await this.store.create(session);
-    this.activeControllers.set(session.id, new AbortController());
+    const controller = new AbortController();
+    const abortFromParent = () => controller.abort(options.signal?.reason);
+    if (options.signal?.aborted) abortFromParent();
+    else options.signal?.addEventListener("abort", abortFromParent, { once: true });
+    this.activeControllers.set(session.id, controller);
     this.snippetEvidencePolicy.set(session.id, options.allowSnippetEvidence ?? true);
     if (options.memoryContext) this.memoryContexts.set(session.id, options.memoryContext);
-    void this.run(session.id, undefined, options);
+    void this.run(session.id, controller, options)
+      .finally(() => options.signal?.removeEventListener("abort", abortFromParent))
+      .catch(() => undefined);
     return session;
   }
   async runQueued(
@@ -921,6 +932,11 @@ export class ResearchRunner {
           searchRecoveries: [],
           steps: [],
         };
+    const worker = currentWorkerContext();
+    if (worker) {
+      session.executionJobId = worker.lease.job.id;
+      session.executionLeaseGeneration = worker.lease.generation;
+    }
     if (current) await this.store.update(session);
     else await this.store.create(session);
 
@@ -2666,7 +2682,7 @@ export class ResearchRunner {
           const researchState = this.computeResearchState(state);
           const synthesisClaims = this.synthesisClaims(state);
           const synthStart = performance.now();
-          const citationReportBefore = this.llm.metrics?.citationEntailment;
+          const citationReportBefore = this.synthesisProvider.metrics?.citationEntailment;
           if (!evidence.sufficient)
             answer = `Research collected evidence but cannot present it as sufficiently verified: ${evidence.reasons.join(
               "; ",
@@ -2689,7 +2705,7 @@ export class ResearchRunner {
               }),
             )) as string;
           }
-          const citationReportAfter = this.llm.metrics?.citationEntailment;
+          const citationReportAfter = this.synthesisProvider.metrics?.citationEntailment;
           citationValidationFailed =
             evidence.sufficient &&
             hasCitationValidationFailure(
@@ -2765,7 +2781,7 @@ export class ResearchRunner {
         try {
           const budgetResearchState = this.computeResearchState(state);
           const synthStart = performance.now();
-          const citationReportBefore = this.llm.metrics?.citationEntailment;
+          const citationReportBefore = this.synthesisProvider.metrics?.citationEntailment;
           answer = (await runResearchStage("synthesis", () =>
             this.registry.execute("synthesize", {
               kind: "research",
@@ -2779,7 +2795,7 @@ export class ResearchRunner {
               researchChatOptimization: state.researchChatOptimization,
             }),
           )) as string;
-          const citationReportAfter = this.llm.metrics?.citationEntailment;
+          const citationReportAfter = this.synthesisProvider.metrics?.citationEntailment;
           citationValidationFailed = hasCitationValidationFailure(
             citationReportBefore,
             citationReportAfter,
@@ -2812,9 +2828,9 @@ export class ResearchRunner {
         ? `${INSUFFICIENT_EVIDENCE_ERROR_PREFIX} ${finalEvidence.reasons.join("; ")}`
         : hasResearchChatFinalCoverageFailure(
               state.researchChatOptimization,
-              this.llm.metrics?.synthesis?.requiredFactCoverage,
+              this.synthesisProvider.metrics?.synthesis?.requiredFactCoverage,
             )
-          ? `${INSUFFICIENT_EVIDENCE_ERROR_PREFIX} the final answer omitted required facts: ${this.llm.metrics?.synthesis?.requiredFactCoverage.missing.join(", ") ?? "one or more required facts"}`
+          ? `${INSUFFICIENT_EVIDENCE_ERROR_PREFIX} the final answer omitted required facts: ${this.synthesisProvider.metrics?.synthesis?.requiredFactCoverage.missing.join(", ") ?? "one or more required facts"}`
           : citationValidationFailed
             ? `${CITATION_VALIDATION_ERROR_PREFIX} the final answer did not pass semantic or structural citation validation.`
             : !synthesisCompleted

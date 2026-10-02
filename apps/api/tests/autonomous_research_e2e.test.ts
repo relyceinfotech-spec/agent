@@ -8,7 +8,7 @@ import { createToolRegistry } from "../src/agent/tools.js";
 import { ResearchRunner } from "../src/research.js";
 import { ResilientSearchProvider } from "../src/search.js";
 import { SqliteSessionStore } from "../src/store.js";
-import { createServer } from "../src/server.js";
+import { createServer, getServerBackgroundServices } from "../src/server.js";
 import { validateCitationEntailment } from "../src/citation-entailment.js";
 import type { OpenRouterProvider } from "../src/llm.js";
 import type { SearchResult } from "../src/domain.js";
@@ -230,6 +230,7 @@ describe("autonomous shared-research end-to-end flow", () => {
           maxModelDecisions: 2,
         },
       });
+      getServerBackgroundServices(api).worker.start();
       try {
         const discover = await api.inject({ method: "GET", url: "/api/discover" });
         expect(discover.statusCode).toBe(200);

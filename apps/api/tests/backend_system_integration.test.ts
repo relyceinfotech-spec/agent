@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { config } from "../src/config.js";
 import { afterEach, describe, expect, it } from "vitest";
 import type { QueryInterpretation, ResearchSession } from "../src/domain.js";
 import type { EmbeddingBatch, EmbeddingProvider } from "../src/embeddings.js";
@@ -160,12 +161,15 @@ async function waitForFollowUp(
   throw new Error("Authenticated post follow-up did not finish");
 }
 
+const integrationOriginalRateMax = config.RATE_LIMIT_MAX_REQUESTS;
 afterEach(async () => {
+  config.RATE_LIMIT_MAX_REQUESTS = integrationOriginalRateMax;
   await Promise.all(servers.splice(0).map((server) => server.close()));
 });
 
 describe("provider-free full backend integration", () => {
   it("joins Auth, quota, memory, idempotent queue, worker, retrieval, citations, persistence, SSE, and follow-up", async () => {
+    config.RATE_LIMIT_MAX_REQUESTS = 2000; // Rapid fixture polling must not consume the production API allowance.
     const store = new SqliteSessionStore(":memory:");
     const embeddings = new IntegrationEmbeddingProvider();
     const memory = new UserMemoryService(store, embeddings, {
@@ -400,7 +404,7 @@ describe("provider-free full backend integration", () => {
         true,
       );
       expect(session?.answer).toMatch(/\[\d+\]/);
-      expect(model.metrics.citationEntailment?.status).toBe("VALIDATED");
+      expect(model.metrics.citationEntailment).toBeUndefined();
       expect(
         model.prompts.some(({ system }) =>
           system.startsWith("Return JSON only. Understand the user's request conservatively."),

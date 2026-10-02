@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DurableQueueWorker,
   InMemoryDurableJobStore,
@@ -21,7 +21,10 @@ function input(overrides: Partial<EnqueueJobInput> = {}): EnqueueJobInput {
     ownerId: ownerA,
     ownerScope: `user:${ownerA}`,
     idempotencyKey: "request-1",
-    payload: { sessionId: "session-1", question: "Explain durable queues" },
+    payload: {
+      sessionId: overrides.id ? `session-${overrides.id}` : "session-1",
+      question: "Explain durable queues",
+    },
     maxAttempts: 3,
     ...overrides,
   };
@@ -53,7 +56,7 @@ describe("durable queue state machine", () => {
   it("returns the original job for an idempotent replay", async () => {
     const store = new InMemoryDurableJobStore();
     const first = await enqueue(store);
-    const replay = await store.enqueueJob(input({ id: "other-id" }));
+    const replay = await store.enqueueJob(input({ id: "other-id", payload: input().payload }));
     expect(replay.created).toBe(false);
     expect(replay.job?.id).toBe(first.id);
   });
@@ -81,7 +84,9 @@ describe("durable queue state machine", () => {
     const store = new InMemoryDurableJobStore();
     const quota = { ownerId: ownerA, key: "research", windowSeconds: 60, limit: 1 };
     const first = await store.enqueueJob(input({ quota }));
-    const replay = await store.enqueueJob(input({ id: "other-id", quota }));
+    const replay = await store.enqueueJob(
+      input({ id: "other-id", quota, payload: input().payload }),
+    );
     expect(first.quota?.used).toBe(1);
     expect(replay.created).toBe(false);
     expect(replay.quota).toBeUndefined();
@@ -309,6 +314,29 @@ describe("durable queue state machine", () => {
       sessionId: "session-1",
       status: "COMPLETED",
     });
+  });
+
+  it("continues polling when completion and failure persistence both throw", async () => {
+    const store = new InMemoryDurableJobStore();
+    const first = await enqueue(store, { id: "first", idempotencyKey: undefined });
+    const second = await enqueue(store, { id: "second", idempotencyKey: undefined });
+    vi.spyOn(store, "completeJob").mockRejectedValueOnce(new Error("database unavailable"));
+    vi.spyOn(store, "failJob").mockRejectedValueOnce(new Error("database unavailable"));
+    const worker = new DurableQueueWorker(
+      store,
+      {
+        research: async () => ({ status: "COMPLETED" }),
+        post_agent: async () => ({}),
+      },
+      { pollIntervalMs: 100, leaseSeconds: 5 },
+    );
+    worker.start();
+    try {
+      await waitFor(async () => (await store.getJob(second.id))?.status === "completed");
+      expect((await store.getJob(first.id))?.status).toBe("running");
+    } finally {
+      await worker.stop();
+    }
   });
 
   it("persists terminal transition progress after handler-reported recovery progress", async () => {
