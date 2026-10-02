@@ -2,7 +2,7 @@
   "name": "research-agent-max",
   "private": true,
   "version": "0.1.0",
-  "packageManager": "pnpm@9.15.4",
+  "packageManager": "pnpm@10.28.2",
   "scripts": {
     "dev": "pnpm --parallel --filter @research-max/api --filter @research-max/web dev",
     "build": "pnpm --filter @research-max/api build && pnpm --filter @research-max/web build",
