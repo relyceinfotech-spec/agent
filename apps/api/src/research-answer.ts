@@ -563,6 +563,7 @@ export function buildDeterministicResearchAnswer(args: {
       latestnessVersion,
       releaseEvidence,
       officialSourcesRequired,
+      requestedPredicate: plan.interpretation.requestedPredicate,
     }),
     question,
     supportedClaims,
@@ -635,7 +636,10 @@ export function buildDeterministicResearchAnswer(args: {
 
   const answer = renderStructuredResearchAnswer(statements, sources);
   const answerCoverage = enforceResearchChatBoundedFactCoverage(
-    requestedFactCoverage(question, [answer], { requestedFacts }),
+    requestedFactCoverage(question, [answer], {
+      requestedFacts,
+      requestedPredicate: plan.interpretation.requestedPredicate,
+    }),
     question,
     supportedClaims,
     sources,

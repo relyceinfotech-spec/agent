@@ -23,6 +23,7 @@ export class ContentAgent {
     (progress: Record<string, string | number | boolean | null>) => Promise<boolean>
   >();
   private scheduler?: ReturnType<typeof setInterval>;
+  private schedulerTickInFlight = false;
 
   constructor(
     private readonly store: PlatformStore,
@@ -97,12 +98,18 @@ export class ContentAgent {
     const intervalMs = options.intervalMs ?? config.AUTONOMOUS_INTERVAL_MINUTES * 60_000;
     if (this.scheduler || !enabled) return;
     this.scheduler = setInterval(() => {
-      if (!this.activeRunId && this.queue.length === 0) {
-        void (async () => {
+      if (this.schedulerTickInFlight || this.activeRunId || this.queue.length > 0) return;
+      this.schedulerTickInFlight = true;
+      void (async () => {
+        try {
           if (await this.hasActiveDurableRun?.()) return;
           await this.trigger(undefined, "schedule");
-        })().catch((error) => console.error("Autonomous scheduler failed to queue a run", error));
-      }
+        } catch {
+          console.error("Autonomous scheduler failed to queue a run");
+        } finally {
+          this.schedulerTickInFlight = false;
+        }
+      })();
     }, intervalMs);
     this.scheduler.unref();
   }

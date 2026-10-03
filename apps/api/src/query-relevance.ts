@@ -1,4 +1,5 @@
-import { extractKnownEntities } from "./entities.js";
+import { containsExactEntity, extractKnownEntities } from "./entities.js";
+import { extractRequestedPredicate } from "./requested-facts.js";
 // Request wording and research dimensions cannot establish subject relevance.
 const contextWords = new Set(
   `a an and are as at be between by can could current describe differences different do does explain find for from have how in information into is it latest most new of on or overview performance research should strategies strategy tell than that the their them these this those to tradeoffs use verified verify versus vs what when where which who why will with would compare comparison stable version versions system systems release releases official documentation notes evidence recent pricing price cost date dates published historical using cite exact available availability benefits`.split(
@@ -88,6 +89,10 @@ export function querySubjectMismatchReason(
 ): string | undefined {
   const terms = querySubjectTerms(question);
   const text = candidate.toLowerCase();
+  const requestedPredicate = extractRequestedPredicate(question);
+  if (requestedPredicate && !containsExactEntity(candidate, requestedPredicate.entity)) {
+    return "Candidate does not mention the requested entity.";
+  }
   const requestedEntities = extractKnownEntities(question);
   const candidateEntities = extractKnownEntities(candidate);
   if (

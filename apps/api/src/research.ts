@@ -71,11 +71,14 @@ import {
   extractRequestedFacts,
   classifyEvidenceStatus,
   classifyEvidenceStatusFromCoverage,
+  hasCompleteRequestedFactCoverage,
   missingRequestedFactSupportFromCoverage,
   missingRequestedFactSupport as checkMissingRequestedFactSupport,
   requestedFactCoverage,
+  requestedPredicatePresent,
   type RequestedFactCoverage,
   type RequestedFactKind,
+  type RequestedPredicateRequirement,
 } from "./requested-facts.js";
 export { classifyEvidenceStatus } from "./requested-facts.js";
 
@@ -191,7 +194,9 @@ export function hasResearchChatFinalCoverageFailure(
   researchChatOptimization: boolean,
   coverage: RequestedFactCoverage | undefined,
 ): boolean {
-  return Boolean(researchChatOptimization && coverage?.missing.length);
+  return Boolean(
+    researchChatOptimization && coverage && !hasCompleteRequestedFactCoverage(coverage),
+  );
 }
 
 export function missingRequestedFactSupport(
@@ -203,6 +208,7 @@ export function missingRequestedFactSupport(
     requestedFacts?: RequestedFactKind[];
     releaseEvidence?: ReleaseEvidenceRecord[];
     officialSourcesRequired?: boolean;
+    requestedPredicate?: RequestedPredicateRequirement;
   } = {},
 ): string[] {
   return checkMissingRequestedFactSupport(question, verifiedClaimTexts, options);
@@ -223,6 +229,7 @@ function factCoverageOptions(
   requestedFacts: RequestedFactKind[];
   releaseEvidence: ReleaseEvidenceRecord[];
   officialSourcesRequired: boolean;
+  requestedPredicate?: RequestedPredicateRequirement;
 } {
   return {
     latestnessProven,
@@ -230,6 +237,7 @@ function factCoverageOptions(
     requestedFacts: requestedFactsForPlan(plan),
     releaseEvidence,
     officialSourcesRequired: plan.interpretation.sourceRequirements?.officialSources === "required",
+    requestedPredicate: plan.interpretation.requestedPredicate,
   };
 }
 
@@ -819,6 +827,7 @@ export class ResearchRunner {
   private readonly activeControllers = new Map<string, AbortController>();
   private readonly snippetEvidencePolicy = new Map<string, boolean>();
   private readonly memoryContexts = new Map<string, string>();
+  private readonly conversationContexts = new Map<string, string>();
   private readonly registry: ToolRegistry;
   constructor(
     private readonly store: SessionStore,
@@ -851,6 +860,7 @@ export class ResearchRunner {
     options: {
       allowSnippetEvidence?: boolean;
       memoryContext?: string;
+      conversationContext?: string;
       interpretation?: QueryInterpretation;
       researchChatOptimization?: boolean;
       signal?: AbortSignal;
@@ -881,6 +891,8 @@ export class ResearchRunner {
     this.activeControllers.set(session.id, controller);
     this.snippetEvidencePolicy.set(session.id, options.allowSnippetEvidence ?? true);
     if (options.memoryContext) this.memoryContexts.set(session.id, options.memoryContext);
+    if (options.conversationContext)
+      this.conversationContexts.set(session.id, options.conversationContext);
     void this.run(session.id, controller, options)
       .finally(() => options.signal?.removeEventListener("abort", abortFromParent))
       .catch(() => undefined);
@@ -894,6 +906,7 @@ export class ResearchRunner {
     options: {
       allowSnippetEvidence?: boolean;
       memoryContext?: string;
+      conversationContext?: string;
       resume?: boolean;
       signal?: AbortSignal;
       interpretation?: QueryInterpretation;
@@ -980,6 +993,7 @@ export class ResearchRunner {
     this.activeControllers.set(id, controller);
     this.snippetEvidencePolicy.set(id, options.allowSnippetEvidence ?? true);
     if (options.memoryContext) this.memoryContexts.set(id, options.memoryContext);
+    if (options.conversationContext) this.conversationContexts.set(id, options.conversationContext);
     try {
       await this.run(id, controller, {
         interpretation:
@@ -1199,8 +1213,23 @@ export class ResearchRunner {
     );
   }
 
+  private hasUnresolvedRequestedPredicate(state: LoopState): boolean {
+    const requirement = state.plan.interpretation.requestedPredicate;
+    if (!state.researchChatOptimization || !requirement || state.plan.interpretation.comparison)
+      return false;
+    return (
+      this.computeResearchState(state).requestedFactCoverage?.requestedPredicate?.present !== true
+    );
+  }
+
   private pageLimitForPass(state: LoopState, budget: ResearchBudget): number {
     if (state.searchPasses > 0 || budget.maxSearchPasses === 0) return budget.maxPages;
+    if (
+      this.hasUnresolvedRequestedPredicate(state) &&
+      budget.maxPages >= 2 &&
+      this.canSearchAgain(state, budget)
+    )
+      return budget.maxPages - 1;
     if (
       state.researchChatOptimization &&
       state.mode === "quick" &&
@@ -1510,7 +1539,7 @@ export class ResearchRunner {
       present: [],
       missing: [],
     };
-    const missingRequestedFacts = canonicalCoverage.missing;
+    const missingRequestedFacts = missingRequestedFactSupportFromCoverage(canonicalCoverage);
     const supported = supportedClaims.length;
     const sourceDomains = new Map(state.fetchedSources.map((source) => [source.id, source.domain]));
     const independentDomains = new Set(
@@ -1631,7 +1660,9 @@ export class ResearchRunner {
     }
     if (
       canSearchMore &&
-      (canFetchMore || this.isFocusedLifecycleLookup(state)) &&
+      (canFetchMore ||
+        this.isFocusedLifecycleLookup(state) ||
+        this.hasUnresolvedRequestedPredicate(state)) &&
       this.needsMoreEvidence(state, budget)
     )
       return "search_again";
@@ -1812,18 +1843,59 @@ export class ResearchRunner {
     const supportedSources = state.fetchedSources.filter((source) =>
       supportedClaims.some((claim) => claim.sourceIds.includes(source.id)),
     );
-    const candidates = comparison
-      ? ranked.filter((source) => !state.fetchedUrls.has(source.url))
-      : ranked;
     const recoveryRequirements = state.researchChatOptimization
       ? state.searchRecoveries.at(-1)?.requirements
       : undefined;
+    const unresolvedPredicate =
+      recoveryRequirements?.requestedPredicate && !recoveryRequirements.requestedPredicate.resolved
+        ? recoveryRequirements.requestedPredicate.requirement
+        : undefined;
+    const candidates =
+      comparison || unresolvedPredicate
+        ? ranked.filter((source) => !state.fetchedUrls.has(source.url))
+        : ranked;
+    if (unresolvedPredicate) {
+      const recoveryQueries = new Set(
+        (state.searchRecoveries.at(-1)?.queries ?? []).map((query) => query.trim().toLowerCase()),
+      );
+      candidates.sort((left, right) => {
+        const leftIsFresh = recoveryQueries.has((left.query ?? "").trim().toLowerCase());
+        const rightIsFresh = recoveryQueries.has((right.query ?? "").trim().toLowerCase());
+        const leftNamesFact = requestedPredicatePresent(
+          `${left.title}. ${left.snippet}`,
+          unresolvedPredicate,
+        );
+        const rightNamesFact = requestedPredicatePresent(
+          `${right.title}. ${right.snippet}`,
+          unresolvedPredicate,
+        );
+        return (
+          Number(rightIsFresh) - Number(leftIsFresh) ||
+          Number(rightNamesFact) - Number(leftNamesFact) ||
+          right.quality.overall - left.quality.overall
+        );
+      });
+    }
+    const reservePredicateSource =
+      state.researchChatOptimization &&
+      !!state.plan.interpretation.requestedPredicate &&
+      !comparison &&
+      state.searchRecoveries.length === 0 &&
+      budget.maxSources >= 2 &&
+      this.canSearchAgain(state, budget);
+    const sourceLimit = comparison
+      ? Math.max(0, budget.maxSources - state.fetchedSources.length)
+      : unresolvedPredicate
+        ? Math.max(0, budget.maxSources - state.fetchedSources.length)
+        : reservePredicateSource
+          ? budget.maxSources - 1
+          : budget.maxSources;
     const officialSourceRequirement =
       state.plan.interpretation.sourceRequirements?.officialSources ?? "none";
     const selection = selectResearchSourcesWithDecisions(
       candidates,
       state.plan.interpretation.entities,
-      comparison ? Math.max(0, budget.maxSources - state.fetchedSources.length) : budget.maxSources,
+      sourceLimit,
       officialSourceRequirement,
       state.question,
       recoveryRequirements,
@@ -1985,7 +2057,12 @@ export class ResearchRunner {
         Math.min(initialQueryLimit, budget.maxQueries - state.queriesIssued),
       );
       const results = await this.searchWithTrace(id, action, queries);
-      state.rawResults.push(...results);
+      state.rawResults.push(
+        ...results.map((result) => ({
+          ...result,
+          ...(result.query || queries.length !== 1 ? {} : { query: queries[0] }),
+        })),
+      );
       state.queriesIssued += queries.length;
       state.searched = true;
       if (state.researchChatOptimization) await this.triageSources(id, state, budget);
@@ -2608,6 +2685,14 @@ export class ResearchRunner {
       ].sort((left, right) => compareVersions(left, right) ?? 0);
       const recoveryRequirements: ResearchRecoveryRequirements = {
         comparison: researchState.comparisonCoverage,
+        ...(state.plan.interpretation.requestedPredicate
+          ? {
+              requestedPredicate: {
+                requirement: state.plan.interpretation.requestedPredicate,
+                resolved: researchState.requestedFactCoverage?.requestedPredicate?.present === true,
+              },
+            }
+          : {}),
         requestedFacts: factCoverage.required,
         resolvedFacts: factCoverage.present,
         unresolvedFacts: factCoverage.missing,
@@ -2688,7 +2773,9 @@ export class ResearchRunner {
       const queries = accepted ? [candidate] : [];
       const recovery = {
         reason: evidence.reasons,
-        missingRequestedFacts: recoveryRequirements.unresolvedFacts,
+        missingRequestedFacts: missingRequestedFactSupportFromCoverage(
+          researchState.requestedFactCoverage ?? factCoverage,
+        ),
         officialSourceRequirement,
         requirements: recoveryRequirements,
         queries,
@@ -2707,11 +2794,15 @@ export class ResearchRunner {
         return;
       }
       const results = await this.searchWithTrace(id, action, queries);
+      const resultsWithQuery = results.map((result) => ({
+        ...result,
+        ...(result.query || queries.length !== 1 ? {} : { query: queries[0] }),
+      }));
       // Newly targeted results win equal-quality ties before the bounded
       // selection can be filled by older results from the initial query.
       if (state.researchChatOptimization && state.plan.interpretation.comparison)
-        state.rawResults.unshift(...results);
-      else state.rawResults.push(...results);
+        state.rawResults.unshift(...resultsWithQuery);
+      else state.rawResults.push(...resultsWithQuery);
       state.queriesIssued += queries.length;
       state.searchPasses += 1;
       state.triaged = false;
@@ -2846,6 +2937,7 @@ export class ResearchRunner {
       if (timer) clearTimeout(timer);
       this.snippetEvidencePolicy.delete(id);
       this.memoryContexts.delete(id);
+      this.conversationContexts.delete(id);
       if (this.activeControllers.get(id) === controller) this.activeControllers.delete(id);
     }
   }
@@ -3017,6 +3109,7 @@ export class ResearchRunner {
                 researchState,
                 mode: session.mode,
                 memoryContext: this.memoryContexts.get(id),
+                conversationContext: this.conversationContexts.get(id),
                 researchChatOptimization: state.researchChatOptimization,
               }),
             )) as string;
@@ -3111,6 +3204,7 @@ export class ResearchRunner {
               researchState: budgetResearchState,
               mode: session.mode,
               memoryContext: this.memoryContexts.get(id),
+              conversationContext: this.conversationContexts.get(id),
               researchChatOptimization: state.researchChatOptimization,
             }),
           )) as string;

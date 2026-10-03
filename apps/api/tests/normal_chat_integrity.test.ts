@@ -9,6 +9,7 @@ import { OpenRouterProvider } from "../src/llm.js";
 import {
   buildPlan,
   planFastLookupQuery,
+  preserveQueryRequirements,
   rewriteQueries,
   understandQuery,
   validateRecoveryQuery,
@@ -640,6 +641,129 @@ describe("normal Chat integrity", () => {
     for (const term of terms) expect(query).toContain(term);
     if (question.includes("2022")) expect(query).not.toContain("latest");
   });
+
+  it("locks a precise entity predicate into initial and recovery search queries", async () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const llm = offline();
+    const interpretation = await understandQuery(question, llm, "quick", { allowModel: false });
+    expect(interpretation.requestedPredicate).toMatchObject({
+      predicate: "CEO",
+      entity: "Relyce Infotech",
+    });
+
+    const drifted = { ...interpretation, normalizedQuestion: "Who leads Relyce Infotech?" };
+    expect(planFastLookupQuery(drifted, question)).toMatch(/Relyce Infotech.*CEO/i);
+    expect(preserveQueryRequirements("Who leads Relyce Infotech", drifted)).toMatch(/CEO/i);
+
+    const plan = await buildPlan(question, "quick", llm, drifted);
+    expect(plan.queries).toHaveLength(1);
+    expect(plan.queries[0]).toMatch(/Relyce Infotech.*CEO/i);
+    expect(plan.interpretation.entities).toContain("Relyce Infotech");
+
+    const recoveryRequirements = {
+      requestedPredicate: { requirement: plan.interpretation.requestedPredicate!, resolved: false },
+      requestedFacts: [],
+      resolvedFacts: [],
+      unresolvedFacts: [],
+      latestnessRequired: false,
+      latestnessResolved: false,
+      qualifiers: { latest: false, stable: false },
+      officialSourceRequirement: "none" as const,
+      officialEvidenceResolved: false,
+    };
+    const recovery = await rewriteQueries(
+      question,
+      plan,
+      [],
+      "quick",
+      llm,
+      undefined,
+      recoveryRequirements,
+    );
+    expect(recovery).toHaveLength(1);
+    expect(recovery[0]).toMatch(/Relyce Infotech/i);
+    expect(recovery[0]).toMatch(/chief executive officer/i);
+    expect(
+      validateRecoveryQuery(
+        "Relyce Infotech company leadership",
+        question,
+        plan,
+        recoveryRequirements,
+      ).accepted,
+    ).toBe(false);
+    expect(validateRecoveryQuery(recovery[0]!, question, plan, recoveryRequirements).accepted).toBe(
+      true,
+    );
+    const evidenceRecoveryQuery = "Relyce Infotech chief executive officer source evidence CEO";
+    expect(
+      validateRecoveryQuery(
+        evidenceRecoveryQuery,
+        question,
+        plan,
+        recoveryRequirements,
+        plan.objectives,
+      ),
+    ).toMatchObject({ accepted: true, reasons: [] });
+  });
+
+  it("rejects a candidate about another company's matching CEO fact", () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const unrelated = "Sudip Singh is the CEO and MD of ITC Infotech.";
+    expect(querySubjectMismatchReason(question, unrelated)).toMatch(/requested entity/i);
+    expect(
+      rankResults(question, [
+        {
+          title: "ITC Infotech CEO and MD",
+          snippet: unrelated,
+          url: "https://example.com/itc-ceo",
+        },
+      ])[0]?.subjectMismatchReason,
+    ).toMatch(/requested entity/i);
+    expect(
+      querySubjectMismatchReason(question, "Relyce Infotech CEO and leadership profile"),
+    ).toBeUndefined();
+  });
+
+  it("keeps a model-generated paraphrase from replacing a precise requested predicate", async () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const llm = new OpenRouterProvider();
+    vi.spyOn(llm, "enabled", "get").mockReturnValue(true);
+    vi.spyOn(llm, "complete").mockResolvedValue(
+      JSON.stringify({
+        queryGroups: [
+          {
+            category: "DIRECT",
+            queries: ["Who leads the company?", "Infotech leadership"],
+          },
+        ],
+      }),
+    );
+    const base = await understandQuery(question, offline(), "quick", { allowModel: false });
+    const plan = await buildPlan(question, "quick", llm, {
+      ...base,
+      ambiguityScore: 0.5,
+      needsClarification: false,
+    });
+
+    expect(plan.queries).toContain("Relyce Infotech CEO source");
+    expect(plan.queries.some((query) => /\bleads?\b|\bleadership\b/i.test(query))).toBe(false);
+  });
+
+  it.each([
+    ["Who founded OpenAI?", "OpenAI", "founded"],
+    ["Who is the CTO of Acme Systems?", "Acme Systems", "CTO"],
+    ["Where is Tesla headquartered?", "Tesla", "headquartered"],
+  ])(
+    "preserves the requested predicate in a fast query: %s",
+    async (question, entity, predicate) => {
+      const interpretation = await understandQuery(question, offline(), "quick", {
+        allowModel: false,
+      });
+      const query = planFastLookupQuery(interpretation, question);
+      expect(query).toContain(entity);
+      expect(query.toLowerCase()).toContain(predicate.toLowerCase());
+    },
+  );
 
   it("rejects model interpretation and discovery drift, then preserves vector subject in recovery", async () => {
     const question = "Explain vector indexing performance strategies";

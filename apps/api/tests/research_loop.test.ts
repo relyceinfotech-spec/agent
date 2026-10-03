@@ -1809,4 +1809,415 @@ describe("autonomous research loop", () => {
       config.OPENROUTER_API_KEY = previousKey;
     }
   });
+
+  it("recovers with the exact requested predicate and fails closed on generic entity evidence", async () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const queries: string[] = [];
+    const fetched: Array<{ url: string; content: string }> = [];
+    const initialResults: SearchResult[] = [
+      {
+        title: "ITC Infotech CEO Sudip Singh",
+        url: "https://itc.example/leadership/sudip-singh",
+        snippet: "Sudip Singh is the CEO and MD of ITC Infotech.",
+      },
+      {
+        title: "Relyce Infotech overview",
+        url: "https://in.linkedin.com/company/relyce-infotech",
+        snippet: "Relyce Infotech is led by an experienced team of technology professionals.",
+      },
+      {
+        title: "Relyce Infotech team profile",
+        url: "https://company-directory.example/relyce-infotech",
+        snippet: "Relyce Infotech is an Indian software and consulting company.",
+      },
+    ];
+    const recoveryResult: SearchResult = {
+      title: "Relyce Infotech leadership profile",
+      url: "https://leadership-index.example/relyce-infotech",
+      snippet: "Company leadership and executive profile for Relyce Infotech.",
+    };
+    const results = [...initialResults, recoveryResult];
+    const contents = [
+      "Sudip Singh is the CEO and MD of ITC Infotech.",
+      "Relyce Infotech is led by a team of experienced professionals and provides application development, cloud, and IT consulting services to businesses.",
+      "Relyce Infotech is an Indian software and consulting company serving business customers.",
+      "Relyce Infotech is a technology consulting company with a team of executives and software engineers.",
+    ];
+    const llm = new OpenRouterProvider();
+    Object.defineProperty(llm, "enabled", { get: () => false });
+    const registry = createToolRegistry({ search: async () => [] }, llm);
+    const runInitialSearch = async (input: unknown) => {
+      const payload = input as { queries?: string[] };
+      const batch = payload.queries ?? [];
+      return batch.flatMap((query) => {
+        queries.push(query);
+        return initialResults.map((result) => ({ ...result, query }));
+      });
+    };
+    registry.register({
+      name: "web_search",
+      description: "Mock initial search",
+      execute: runInitialSearch,
+    });
+    registry.register({
+      name: "search_again",
+      description: "Mock recovery search",
+      execute: async (input) => {
+        const batch = (input as { queries?: string[] }).queries ?? [];
+        return batch.flatMap((query) => {
+          queries.push(query);
+          return [{ ...recoveryResult, query }];
+        });
+      },
+    });
+    registry.register({
+      name: "fetch_url",
+      description: "Return a generic company page fixture",
+      execute: async (input) => {
+        const source = input as { url: string; title: string; snippet: string };
+        const index = Math.max(
+          0,
+          results.findIndex((result) => result.url === source.url),
+        );
+        const content = contents[index]!;
+        fetched.push({ url: source.url, content });
+        return {
+          url: source.url,
+          html: "",
+          contentType: "text/html",
+          retrievalMethod: "http",
+          extractionStatus: "SUCCEEDED",
+          extractionConfidence: 0.9,
+          retrievedContentLength: content.length,
+          document: {
+            title: source.title,
+            domain: new URL(source.url).hostname,
+            content,
+            headings: [],
+            contentType: "article",
+          },
+        };
+      },
+    });
+    registry.register({
+      name: "extract_content",
+      description: "Use the fixture document unchanged",
+      execute: async (input) => (input as { document: unknown }).document,
+    });
+    registry.register({
+      name: "verify_claim",
+      description: "Mark only the supplied generic claim supported by its page",
+      execute: async (input) => ({
+        claim: (input as { claim: string }).claim,
+        verdict: "supported",
+        rationale: "The page contains the company profile statement.",
+      }),
+    });
+    registry.register({
+      name: "detect_conflict",
+      description: "No conflict in generic profile fixtures",
+      execute: async () => [],
+    });
+
+    const store = new MemorySessionStore();
+    const runner = new ResearchRunner(
+      store,
+      { search: async () => [] },
+      llm,
+      registry,
+      {
+        maxSteps: 12,
+        maxQueries: 2,
+        maxSources: 2,
+        maxPages: 2,
+        maxSearchPasses: 1,
+        maxClaimsToVerify: 2,
+        maxTimeMs: 10_000,
+        maxModelDecisions: 0,
+      },
+      undefined,
+      true,
+    );
+    const started = await runner.start(question, "quick", [], { researchChatOptimization: true });
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const current = await store.get(started.id);
+      if (["COMPLETED", "FAILED", "CANCELLED"].includes(current?.status ?? "")) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const completed = await store.get(started.id);
+
+    expect(queries).toHaveLength(2);
+    expect(queries[0]).toMatch(/Relyce Infotech.*CEO/i);
+    expect(queries[1]).toMatch(/Relyce Infotech.*chief executive officer/i);
+    expect(queries.every((query) => /CEO|chief executive officer/i.test(query))).toBe(true);
+    expect(fetched).toHaveLength(2);
+    expect(initialResults.map((source) => source.url)).toContain(fetched[0]?.url);
+    expect(fetched.map((source) => source.url)).not.toContain(initialResults[0]!.url);
+    expect(fetched[1]?.url).toBe(recoveryResult.url);
+    expect(fetched.map((source) => source.url)).not.toContain(initialResults[2]!.url);
+    expect(completed?.status).toBe("FAILED");
+    expect(completed?.error).toMatch(/^INSUFFICIENT_EVIDENCE:/);
+    expect(completed?.answer).toMatch(/Insufficient evidence/i);
+    expect(completed?.answer).toMatch(/CEO/i);
+    expect(completed?.answer).not.toMatch(/Sudip Singh|ITC Infotech/i);
+    expect(completed?.answer).not.toMatch(/IT consulting|software development company/i);
+    expect(completed?.state?.requestedFactCoverage?.requestedPredicate).toEqual({
+      predicate: "CEO",
+      present: false,
+    });
+    expect(completed?.searchRecoveries?.[0]?.requirements?.requestedPredicate).toEqual({
+      requirement: expect.objectContaining({
+        predicate: "CEO",
+        entity: "Relyce Infotech",
+      }),
+      resolved: false,
+    });
+    expect(completed?.searchRecoveries?.[0]?.queries).toEqual([queries[1]]);
+  });
+
+  it("completes a precise entity lookup when verified evidence states the requested predicate", async () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const result: SearchResult = {
+      title: "Relyce Infotech leadership",
+      url: "https://relyceinfotech.com/en/leadership",
+      snippet: "Jane Doe is the chief executive officer of Relyce Infotech.",
+    };
+    const content =
+      "Jane Doe is the chief executive officer of Relyce Infotech, where she leads its product and engineering teams.";
+    const llm = new OpenRouterProvider();
+    Object.defineProperty(llm, "enabled", { get: () => false });
+    const registry = createToolRegistry({ search: async () => [] }, llm);
+    registry.register({
+      name: "web_search",
+      description: "Return the exact-predicate result",
+      execute: async (input) => {
+        const queries = (input as { queries?: string[] }).queries ?? [];
+        return queries.map((query) => ({ ...result, query }));
+      },
+    });
+    registry.register({
+      name: "fetch_url",
+      description: "Return the CEO source fixture",
+      execute: async () => ({
+        url: result.url,
+        html: "",
+        contentType: "text/html",
+        retrievalMethod: "http",
+        extractionStatus: "SUCCEEDED",
+        extractionConfidence: 0.9,
+        retrievedContentLength: content.length,
+        document: {
+          title: result.title,
+          domain: new URL(result.url).hostname,
+          content,
+          headings: [],
+          contentType: "article",
+        },
+      }),
+    });
+    registry.register({
+      name: "extract_content",
+      description: "Use the source document unchanged",
+      execute: async (input) => (input as { document: unknown }).document,
+    });
+    registry.register({
+      name: "verify_claim",
+      description: "Verify the role claim against the exact source passage",
+      execute: async (input) => ({
+        claim: (input as { claim: string }).claim,
+        verdict: "supported",
+      }),
+    });
+    registry.register({
+      name: "detect_conflict",
+      description: "No conflicting role evidence in the fixture",
+      execute: async () => [],
+    });
+    registry.register({
+      name: "synthesize",
+      description: "Return the verified requested fact with its citation",
+      execute: async () => "Jane Doe is the CEO of Relyce Infotech. [1]",
+    });
+
+    const store = new MemorySessionStore();
+    const runner = new ResearchRunner(
+      store,
+      { search: async () => [] },
+      llm,
+      registry,
+      {
+        maxSteps: 10,
+        maxQueries: 2,
+        maxSources: 1,
+        maxPages: 1,
+        maxSearchPasses: 1,
+        maxClaimsToVerify: 1,
+        maxTimeMs: 10_000,
+        maxModelDecisions: 0,
+      },
+      undefined,
+      true,
+    );
+    const started = await runner.start(question, "quick", [], { researchChatOptimization: true });
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const current = await store.get(started.id);
+      if (["COMPLETED", "FAILED", "CANCELLED"].includes(current?.status ?? "")) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const completed = await store.get(started.id);
+
+    expect(completed?.status).toBe("COMPLETED");
+    expect(completed?.answer).toContain("Jane Doe is the CEO of Relyce Infotech.");
+    expect(completed?.state?.requestedFactCoverage?.requestedPredicate).toEqual({
+      predicate: "CEO",
+      present: true,
+    });
+    expect(completed?.searchRecoveries).toHaveLength(0);
+  });
+
+  it("completes precise-fact recovery only from the recovered exact-entity predicate source", async () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const unrelated: SearchResult = {
+      title: "ITC Infotech CEO Sudip Singh",
+      url: "https://itc.example/leadership/sudip-singh",
+      snippet: "Sudip Singh is the CEO and MD of ITC Infotech.",
+    };
+    const recovered: SearchResult = {
+      title: "Relyce Infotech chief executive officer",
+      url: "https://relyceinfotech.com/en/leadership",
+      snippet: "Jane Doe is the chief executive officer of Relyce Infotech.",
+    };
+    const recoveredContent =
+      "Jane Doe is the chief executive officer of Relyce Infotech, where she leads its product and engineering teams.";
+    const queries: string[] = [];
+    const fetchedUrls: string[] = [];
+    const verifiedClaims: string[] = [];
+    const synthesisInputs: unknown[] = [];
+    const llm = new OpenRouterProvider();
+    Object.defineProperty(llm, "enabled", { get: () => false });
+    const registry = createToolRegistry({ search: async () => [] }, llm);
+    registry.register({
+      name: "web_search",
+      description: "Return an unrelated company's CEO source on the initial search",
+      execute: async (input) => {
+        const batch = (input as { queries?: string[] }).queries ?? [];
+        return batch.flatMap((query) => {
+          queries.push(query);
+          return [{ ...unrelated, query }];
+        });
+      },
+    });
+    registry.register({
+      name: "search_again",
+      description: "Return the exact requested entity and predicate during recovery",
+      execute: async (input) => {
+        const batch = (input as { queries?: string[] }).queries ?? [];
+        return batch.flatMap((query) => {
+          queries.push(query);
+          return [{ ...recovered, query }];
+        });
+      },
+    });
+    registry.register({
+      name: "fetch_url",
+      description: "Return the recovered exact-entity source body",
+      execute: async (input) => {
+        const source = input as { url: string; title: string };
+        fetchedUrls.push(source.url);
+        return {
+          url: source.url,
+          html: "",
+          contentType: "text/html",
+          retrievalMethod: "http",
+          extractionStatus: "SUCCEEDED",
+          extractionConfidence: 0.95,
+          retrievedContentLength: recoveredContent.length,
+          document: {
+            title: source.title,
+            domain: new URL(source.url).hostname,
+            content: recoveredContent,
+            headings: [],
+            contentType: "article",
+          },
+        };
+      },
+    });
+    registry.register({
+      name: "extract_content",
+      description: "Use the fetched source document unchanged",
+      execute: async (input) => (input as { document: unknown }).document,
+    });
+    registry.register({
+      name: "verify_claim",
+      description: "Verify extracted claims against the recovered page",
+      execute: async (input) => {
+        const claim = (input as { claim: string }).claim;
+        verifiedClaims.push(claim);
+        return {
+          claim,
+          verdict: "supported",
+          rationale: "The recovered source states the named entity and CEO predicate together.",
+        };
+      },
+    });
+    registry.register({
+      name: "detect_conflict",
+      description: "No conflict in the recovered exact-fact fixture",
+      execute: async () => [],
+    });
+    registry.register({
+      name: "synthesize",
+      description: "Synthesize the verified recovered fact with its citation",
+      execute: async (input) => {
+        synthesisInputs.push(input);
+        return "Jane Doe is the CEO of Relyce Infotech. [1]";
+      },
+    });
+
+    const store = new MemorySessionStore();
+    const runner = new ResearchRunner(
+      store,
+      { search: async () => [] },
+      llm,
+      registry,
+      {
+        maxSteps: 12,
+        maxQueries: 2,
+        maxSources: 2,
+        maxPages: 2,
+        maxSearchPasses: 1,
+        maxClaimsToVerify: 2,
+        maxTimeMs: 10_000,
+        maxModelDecisions: 0,
+      },
+      undefined,
+      true,
+    );
+    const started = await runner.start(question, "quick", [], { researchChatOptimization: true });
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const current = await store.get(started.id);
+      if (["COMPLETED", "FAILED", "CANCELLED"].includes(current?.status ?? "")) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const completed = await store.get(started.id);
+
+    expect(queries).toHaveLength(2);
+    expect(queries[0]).toMatch(/Relyce Infotech.*CEO/i);
+    expect(queries[1]).toMatch(/Relyce Infotech.*chief executive officer/i);
+    expect(fetchedUrls).toEqual([recovered.url]);
+    expect(completed?.searchRecoveries).toHaveLength(1);
+    expect(completed?.searchRecoveries?.[0]?.queries).toEqual([queries[1]]);
+    expect(completed?.status).toBe("COMPLETED");
+    expect(completed?.error).toBeUndefined();
+    expect(completed?.answer).toBe("Jane Doe is the CEO of Relyce Infotech. [1]");
+    expect(verifiedClaims.length).toBeGreaterThan(0);
+    expect(verifiedClaims.every((claim) => /Jane Doe|Relyce Infotech/i.test(claim))).toBe(true);
+    expect(JSON.stringify(synthesisInputs)).toContain(recovered.url);
+    expect(JSON.stringify(synthesisInputs)).toContain("Jane Doe");
+    expect(JSON.stringify(synthesisInputs)).not.toContain(unrelated.url);
+    expect(completed?.state?.requestedFactCoverage?.requestedPredicate).toEqual({
+      predicate: "CEO",
+      present: true,
+    });
+  });
 });

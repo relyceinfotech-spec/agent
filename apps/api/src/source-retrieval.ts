@@ -185,6 +185,12 @@ export function assessSerperSnippet(
   }
 
   const factCoverage = requestedFactCoverage(question, snippet, { requestedFacts });
+  if (factCoverage.requestedPredicate && !factCoverage.requestedPredicate.present) {
+    return {
+      sufficient: false,
+      reason: `The snippet does not state the requested ${factCoverage.requestedPredicate.predicate} fact.`,
+    };
+  }
   const asksForVersion = factCoverage.required.includes("version");
   const asksForReleaseDate = factCoverage.required.includes("release date");
   const asksForPrice = factCoverage.required.includes("price");
@@ -279,9 +285,11 @@ function missingRequestedFactsForDocument(
   researchChatOptimization = false,
 ): string[] {
   if (!researchChatOptimization) return [];
-  const missing = requestedFacts?.length
-    ? requestedFactCoverage(question, document.content, { requestedFacts }).missing
-    : [];
+  const coverage = requestedFactCoverage(question, document.content, { requestedFacts });
+  const missing: string[] = requestedFacts?.length ? [...coverage.missing] : [];
+  if (coverage.requestedPredicate && !coverage.requestedPredicate.present) {
+    missing.push(`requested ${coverage.requestedPredicate.predicate} fact`);
+  }
   const comparison = comparisonObjective(question);
   if (
     comparison &&
@@ -1852,9 +1860,15 @@ async function retrieveSourceWithTrace(
     );
   }
 
-  const missingFacts = requestedFactCoverage(input.question, document.content, {
+  const missingCoverage = requestedFactCoverage(input.question, document.content, {
     requestedFacts: input.requestedFacts,
-  }).missing;
+  });
+  const missingFacts = [
+    ...missingCoverage.missing,
+    ...(missingCoverage.requestedPredicate && !missingCoverage.requestedPredicate.present
+      ? [`requested ${missingCoverage.requestedPredicate.predicate} fact`]
+      : []),
+  ];
   if (missingFacts.length > 0 && indicatesClientRenderedContent(full.raw)) {
     reasons.push(
       `Normal HTML extraction omitted requested fact(s): ${missingFacts.join(", ")}; hydration markers indicate client-rendered content, so bounded browser rendering was warranted.`,
@@ -1872,9 +1886,15 @@ async function retrieveSourceWithTrace(
       reasons,
     );
     validateExtraction(renderedDocument);
-    const renderedMissingFacts = requestedFactCoverage(input.question, renderedDocument.content, {
+    const renderedCoverage = requestedFactCoverage(input.question, renderedDocument.content, {
       requestedFacts: input.requestedFacts,
-    }).missing;
+    });
+    const renderedMissingFacts = [
+      ...renderedCoverage.missing,
+      ...(renderedCoverage.requestedPredicate && !renderedCoverage.requestedPredicate.present
+        ? [`requested ${renderedCoverage.requestedPredicate.predicate} fact`]
+        : []),
+    ];
     reasons.push(
       renderedMissingFacts.length === 0
         ? "Rendered page exposed the requested fact values absent from normal HTML."

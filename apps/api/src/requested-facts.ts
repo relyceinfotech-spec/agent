@@ -16,6 +16,16 @@ export interface RequestedFactCoverage {
   required: RequestedFactKind[];
   present: RequestedFactKind[];
   missing: RequestedFactKind[];
+  requestedPredicate?: {
+    predicate: string;
+    present: boolean;
+  };
+}
+
+export interface RequestedPredicateRequirement {
+  predicate: string;
+  entity: string;
+  aliases: string[];
 }
 
 export interface RequestedFactRequirements {
@@ -67,6 +77,158 @@ const featureStabilityPattern =
   /\b(?:features?|apis?|capabilities|experiments?|flags?|components?|hooks?|transitions?|refs?|renderers?)\b[^.!?\n]{0,120}\bstable\b|\bstable\b[^.!?\n]{0,120}\b(?:features?|apis?|capabilities|experiments?|flags?|components?|hooks?|transitions?|refs?|renderers?)\b/i;
 const releaseStabilityPattern =
   /\b(?:stable(?:\s+[a-z][\w.-]*){0,2}\s+(?:release|version|channel)|(?:release|version|channel)\s+(?:is|was|became|remains)\s+(?:the\s+)?(?:latest\s+)?stable|(?:is|was|became|remains)\s+(?:now\s+)?(?:a\s+|the\s+)?stable(?:\s+(?:release|version|channel))?|(?:latest|newest|current)\s+stable(?:\s+[a-z][\w.-]*){0,2}\s+(?:release|version|channel)|stable\s*\/\s*latest|latest\s*\/\s*stable)\b/i;
+
+const predicateStopWords = new Set([
+  "a",
+  "an",
+  "the",
+  "is",
+  "are",
+  "was",
+  "were",
+  "does",
+  "do",
+  "did",
+  "of",
+  "at",
+  "in",
+  "for",
+  "who",
+  "what",
+  "when",
+  "where",
+  "which",
+  "how",
+  "has",
+  "have",
+  "had",
+  "with",
+  "from",
+]);
+
+const broadConceptPredicatePattern =
+  /\b(?:capabilit(?:y|ies)|features?|strengths?|weaknesses?|benefits?|limitations?|trade-offs?|overviews?|purposes?|use cases?|functionality|architecture|design|performance)\b/i;
+
+const predicateAliases: Record<string, string[]> = {
+  ceo: ["chief executive officer"],
+  cfo: ["chief financial officer"],
+  cto: ["chief technology officer", "chief technical officer"],
+  coo: ["chief operating officer"],
+  headquarters: ["headquarter", "head office", "main office"],
+  headquartered: ["headquarters", "head office", "main office"],
+};
+
+function cleanPredicatePart(value: string): string {
+  return value
+    .replace(/[?!.]+$/g, "")
+    .replace(/^(?:the|a|an)\s+/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function looksLikeNamedSubject(value: string): boolean {
+  return extractKnownEntities(value).length > 0 || /\b[\p{Lu}][\p{L}\p{N}&.'-]*/u.test(value);
+}
+
+function predicateForms(predicate: string): string[] {
+  const normalized = cleanPredicatePart(predicate);
+  const forms = [normalized, ...(predicateAliases[normalized.toLowerCase()] ?? [])];
+  const words = normalized.split(/\s+/);
+  if (words.length === 1) {
+    const word = words[0]!.toLowerCase();
+    if (word.endsWith("ied") && word.length > 4) {
+      const stem = `${word.slice(0, -3)}y`;
+      forms.push(stem, `${stem}er`, `${stem}ing`);
+    } else if (word.endsWith("ed") && word.length > 4) {
+      const stem = word.slice(0, -2);
+      forms.push(stem, `${stem}er`, `${stem}ing`);
+    } else if (word.endsWith("er") && word.length > 4) {
+      const stem = word.slice(0, -2);
+      forms.push(stem, `${stem}ed`, `${stem}ing`);
+    }
+  }
+  return [...new Set(forms.map(cleanPredicatePart).filter(Boolean))].slice(0, 6);
+}
+
+/** Extract a precise relation from common entity-question forms without broadening its meaning. */
+export function extractRequestedPredicate(
+  question: string,
+): RequestedPredicateRequirement | undefined {
+  // The established typed checklist remains authoritative for version, price, and specification facts.
+  if (extractRequestedFacts(question).length > 0) return undefined;
+
+  const text = question.trim().replace(/\s+/g, " ");
+  const patterns: Array<{ pattern: RegExp; predicateGroup: number; entityGroup: number }> = [
+    {
+      pattern:
+        /^(?:who|what|when|where)\s+(?:is|are|was|were|does|do|did)\s+(?:the\s+)?(.+?)\s+(?:of|at|in|for)\s+(.+?)\??$/i,
+      predicateGroup: 1,
+      entityGroup: 2,
+    },
+    {
+      pattern: /^(?:who|what|where)\s+(?:is|are|was|were)\s+(.+?)[’']s\s+(.+?)\??$/i,
+      predicateGroup: 2,
+      entityGroup: 1,
+    },
+    {
+      pattern: /^(?:where|when)\s+(?:is|are|was|were)\s+(.+?)\s+([\p{L}][\p{L}-]{2,})\??$/iu,
+      predicateGroup: 2,
+      entityGroup: 1,
+    },
+    {
+      pattern: /^who\s+([\p{L}][\p{L}-]{2,})\s+(.+?)\??$/iu,
+      predicateGroup: 1,
+      entityGroup: 2,
+    },
+    {
+      pattern: /^when\s+was\s+(.+?)\s+([\p{L}][\p{L}-]{2,})\??$/iu,
+      predicateGroup: 2,
+      entityGroup: 1,
+    },
+  ];
+
+  for (const { pattern, predicateGroup, entityGroup } of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const predicate = cleanPredicatePart(match[predicateGroup] ?? "");
+    const entity = cleanPredicatePart(match[entityGroup] ?? "");
+    if (
+      !predicate ||
+      predicateStopWords.has(predicate.toLowerCase()) ||
+      broadConceptPredicatePattern.test(predicate) ||
+      !entity ||
+      !looksLikeNamedSubject(entity)
+    ) {
+      continue;
+    }
+    return { predicate, entity, aliases: predicateForms(predicate) };
+  }
+  return undefined;
+}
+
+export function requestedPredicatePresent(
+  evidence: string | string[],
+  requirement?: RequestedPredicateRequirement,
+): boolean {
+  if (!requirement) return true;
+  const items = Array.isArray(evidence) ? evidence : [evidence];
+  return items.some((item) =>
+    item.split(/\n+|(?<=[.!?;])\s+/).some((statement) => {
+      if (!containsExactEntity(statement, requirement.entity)) return false;
+      return requirement.aliases.some((alias) => {
+        const words = alias.split(/\s+/).map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+        return new RegExp(`\\b${words.join("\\s+")}\\b`, "i").test(statement);
+      });
+    }),
+  );
+}
+
+export function hasCompleteRequestedFactCoverage(coverage: RequestedFactCoverage): boolean {
+  return (
+    coverage.missing.length === 0 &&
+    (!coverage.requestedPredicate || coverage.requestedPredicate.present)
+  );
+}
 
 export function extractRequestedFacts(
   question: string,
@@ -309,11 +471,13 @@ export function requestedFactCoverage(
     requestedFacts?: RequestedFactKind[];
     releaseEvidence?: ReleaseFactEvidence[];
     officialSourcesRequired?: boolean;
+    requestedPredicate?: RequestedPredicateRequirement;
   } = {},
 ): RequestedFactCoverage {
   const required = options.requestedFacts ?? extractRequestedFacts(question);
   const evidenceItems = Array.isArray(evidence) ? evidence : [evidence];
   const combinedEvidence = evidenceItems.join("\n");
+  const requestedPredicate = options.requestedPredicate ?? extractRequestedPredicate(question);
   const stableRequired = required.includes("stable status") || /\bstable\b/i.test(question);
   const releaseEvidence = (options.releaseEvidence ?? []).filter(
     (record) => !options.officialSourcesRequired || record.officialSource,
@@ -415,11 +579,30 @@ export function requestedFactCoverage(
     return hasFact(kind, combinedEvidence);
   });
   const missing = required.filter((kind) => !present.includes(kind));
-  return { required, present, missing };
+  return {
+    required,
+    present,
+    missing,
+    ...(requestedPredicate
+      ? {
+          requestedPredicate: {
+            predicate: requestedPredicate.predicate,
+            present: requestedPredicatePresent(evidenceItems, requestedPredicate),
+          },
+        }
+      : {}),
+  };
 }
 
 export function missingRequestedFactSupportFromCoverage(coverage: RequestedFactCoverage): string[] {
-  return coverage.missing.map((kind) => missingFactMessages[kind]);
+  return [
+    ...coverage.missing.map((kind) => missingFactMessages[kind]),
+    ...(coverage.requestedPredicate && !coverage.requestedPredicate.present
+      ? [
+          `the requested ${coverage.requestedPredicate.predicate} fact is not stated in verified evidence`,
+        ]
+      : []),
+  ];
 }
 
 export function classifyEvidenceStatusFromCoverage(
@@ -427,7 +610,7 @@ export function classifyEvidenceStatusFromCoverage(
   hasVerifiedEvidence: boolean,
 ): EvidenceStatus {
   if (!hasVerifiedEvidence) return "INSUFFICIENT_EVIDENCE";
-  return coverage.missing.length > 0 ? "GENERIC_SUPPORT" : "SUPPORTED_EVIDENCE";
+  return hasCompleteRequestedFactCoverage(coverage) ? "SUPPORTED_EVIDENCE" : "GENERIC_SUPPORT";
 }
 
 const missingFactMessages: Record<RequestedFactKind, string> = {
@@ -450,6 +633,7 @@ export function missingRequestedFactSupport(
     requestedFacts?: RequestedFactKind[];
     releaseEvidence?: ReleaseFactEvidence[];
     officialSourcesRequired?: boolean;
+    requestedPredicate?: RequestedPredicateRequirement;
   } = {},
 ): string[] {
   return missingRequestedFactSupportFromCoverage(
@@ -467,6 +651,7 @@ export function classifyEvidenceStatus(
     requestedFacts?: RequestedFactKind[];
     releaseEvidence?: ReleaseFactEvidence[];
     officialSourcesRequired?: boolean;
+    requestedPredicate?: RequestedPredicateRequirement;
   } = {},
 ): EvidenceStatus {
   return classifyEvidenceStatusFromCoverage(

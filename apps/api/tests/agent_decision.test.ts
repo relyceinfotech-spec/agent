@@ -23,6 +23,49 @@ function emptySession(question: string, mode: ResearchSession["mode"]): Research
 }
 
 describe("autonomous decision quality v1", () => {
+  it.each([
+    ["Who is the CEO of Relyce Infotech?", "web", "medium"],
+    ["Who founded OpenAI?", "web", "medium"],
+    ["What is Tesla headquarters?", "web", "medium"],
+    ["What is the CTO of Microsoft?", "web", "medium"],
+    ["What does Company X do?", "web", "medium"],
+    ["Explain JavaScript closures.", "direct", "low"],
+    ["How do embeddings work?", "direct", "low"],
+    ["Compare HNSW and IVF.", "direct", "low"],
+    ["What is the latest React version?", "web", "medium"],
+    ["Compare current HNSW and IVF benchmarks.", "web", "high"],
+    ["Compare HNSW and IVF with citations.", "web", "high"],
+  ] as const)("classifies factual lookup vs stable chat: %s", async (question, route, effort) => {
+    const llm = new OpenRouterProvider();
+    const agent = new AutonomousAgent(
+      createToolRegistry({ search: async () => [] }, llm),
+      {} as ResearchRunner,
+      llm,
+    );
+    const preview = await agent.preview(question, false);
+    expect(preview.decision).toMatchObject({ route, effort });
+  });
+
+  it("keeps explicit Deep Research and clarification priority", async () => {
+    const llm = new OpenRouterProvider();
+    const agent = new AutonomousAgent(
+      createToolRegistry({ search: async () => [] }, llm),
+      {} as ResearchRunner,
+      llm,
+    );
+    expect(
+      (await agent.preview("Who is the CEO of Relyce Infotech?", true)).decision,
+    ).toMatchObject({
+      route: "deep",
+      effort: "high",
+    });
+    const ambiguousCase = agentEvaluationCases.find((testCase) => testCase.expect.clarification);
+    expect(ambiguousCase).toBeDefined();
+    const ambiguous = await agent.preview(ambiguousCase!.prompt, false);
+    expect(ambiguous.interpretation.needsClarification).toBe(true);
+    expect(ambiguous.decision.route).toBe("web");
+  });
+
   it("routes representative prompts and records the decision trace", async () => {
     const llm = new OpenRouterProvider();
     const registry = createToolRegistry(

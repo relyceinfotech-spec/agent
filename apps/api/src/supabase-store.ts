@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import { createClient } from "@supabase/supabase-js";
 import { currentWorkerContext, throwIfWorkerStopped } from "./worker-context.js";
@@ -13,6 +13,12 @@ import { canonicalizeUrl } from "./security.js";
 import { normalizeResearchSessionQueryLimit } from "./store.js";
 import type {
   ContentStore,
+  ConversationCursor,
+  ConversationMessageCursor,
+  ConversationMessageRecord,
+  ConversationRecord,
+  ConversationStore,
+  AppendConversationUserMessageInput,
   KnowledgeStore,
   QuotaConsumption,
   SessionStore,
@@ -30,6 +36,11 @@ import type {
   ExportCompletion,
   ExportStore,
   SessionCursor,
+} from "./store.js";
+import {
+  ConversationIdempotencyConflictError,
+  ConversationNotFoundError,
+  serializeBoundedConversationContext,
 } from "./store.js";
 import type { ExportFormat, ExportResourceType, ExportStatus } from "./exports.js";
 import { MAX_EXPORT_ATTEMPTS } from "./exports.js";
@@ -310,6 +321,7 @@ export class SupabaseStore
     UserMemoryStore,
     ShareStore,
     ExportStore,
+    ConversationStore,
     DurableJobStore
 {
   private readonly research: SupabaseSchemaClient;
@@ -945,6 +957,221 @@ export class SupabaseStore
       .limit(1);
     raiseIfError(error);
     return Boolean(data?.length);
+  }
+
+  private conversationFromRow(row: Row): ConversationRecord {
+    return {
+      id: String(row.id),
+      ownerId: String(row.owner_id),
+      title: String(row.title),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      nextTurnIndex: Number(row.next_turn_index),
+    };
+  }
+
+  private conversationMessageFromRow(row: Row): ConversationMessageRecord {
+    return {
+      id: String(row.id),
+      conversationId: String(row.conversation_id),
+      ownerId: String(row.owner_id),
+      turnIndex: Number(row.turn_index),
+      position: Number(row.position),
+      role: String(row.role) as ConversationMessageRecord["role"],
+      content: String(row.content),
+      createdAt: String(row.created_at),
+      researchId: row.research_id ? String(row.research_id) : undefined,
+      jobId: row.job_id ? String(row.job_id) : undefined,
+    };
+  }
+
+  async createConversation(
+    ownerId: string,
+    title = "New chat",
+    id = randomUUID(),
+  ): Promise<ConversationRecord> {
+    const now = new Date().toISOString();
+    const { data, error } = await this.research
+      .from("max_conversations")
+      .insert({ id, owner_id: ownerId, title, created_at: now, updated_at: now })
+      .select("id,owner_id,title,created_at,updated_at,next_turn_index")
+      .single();
+    raiseIfError(error);
+    if (!data) throw new Error("Conversation could not be created");
+    return this.conversationFromRow(data);
+  }
+
+  async listConversations(
+    ownerId: string,
+    limit = 20,
+    cursor?: ConversationCursor,
+  ): Promise<ConversationRecord[]> {
+    let query = this.research
+      .from("max_conversations")
+      .select("id,owner_id,title,created_at,updated_at,next_turn_index")
+      .eq("owner_id", ownerId);
+    if (cursor) {
+      query = query.or(
+        `updated_at.lt.${cursor.updatedAt},and(updated_at.eq.${cursor.updatedAt},id.lt.${cursor.id})`,
+      );
+    }
+    const { data, error } = await query
+      .order("updated_at", { ascending: false })
+      .order("id", { ascending: false })
+      .limit(Math.max(1, Math.min(51, Math.trunc(limit))));
+    raiseIfError(error);
+    return (data ?? []).map((row: Row) => this.conversationFromRow(row));
+  }
+
+  async getConversation(ownerId: string, id: string): Promise<ConversationRecord | undefined> {
+    const { data, error } = await this.research
+      .from("max_conversations")
+      .select("id,owner_id,title,created_at,updated_at,next_turn_index")
+      .eq("id", id)
+      .eq("owner_id", ownerId)
+      .maybeSingle();
+    raiseIfError(error);
+    return data ? this.conversationFromRow(data) : undefined;
+  }
+
+  async deleteConversation(ownerId: string, id: string): Promise<boolean> {
+    const { data, error } = await this.research
+      .from("max_conversations")
+      .delete()
+      .eq("id", id)
+      .eq("owner_id", ownerId)
+      .select("id");
+    raiseIfError(error);
+    return Boolean(data?.length);
+  }
+
+  async listConversationMessages(
+    ownerId: string,
+    conversationId: string,
+    limit = 50,
+    cursor?: ConversationMessageCursor,
+  ): Promise<ConversationMessageRecord[]> {
+    let query = this.research
+      .from("max_conversation_messages")
+      .select(
+        "id,conversation_id,owner_id,turn_index,position,role,content,created_at,research_id,job_id",
+      )
+      .eq("owner_id", ownerId)
+      .eq("conversation_id", conversationId);
+    if (cursor) query = query.lt("position", cursor.position);
+    const { data, error } = await query
+      .order("position", { ascending: false })
+      .limit(Math.max(1, Math.min(101, Math.trunc(limit))));
+    raiseIfError(error);
+    return (data ?? []).reverse().map((row: Row) => this.conversationMessageFromRow(row));
+  }
+
+  async appendConversationUserMessage(input: AppendConversationUserMessageInput): Promise<{
+    conversation: ConversationRecord;
+    message: ConversationMessageRecord;
+    inserted: boolean;
+  }> {
+    try {
+      const { data, error } = await this.research.rpc("max_append_conversation_user_message", {
+        p_owner_id: input.ownerId,
+        p_conversation_id: input.conversationId ?? null,
+        p_new_conversation_id: input.newConversationId,
+        p_message_id: input.messageId,
+        p_title: input.title,
+        p_content: input.content,
+        p_created_at: input.createdAt,
+        p_request_key_hash: input.requestKeyHash ?? null,
+      });
+      raiseIfError(error);
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        throw new Error("Supabase returned an invalid conversation append result");
+      }
+      const result = data as Row;
+      if (!result.conversation || !result.message) {
+        throw new Error("Supabase returned an incomplete conversation append result");
+      }
+      return {
+        conversation: this.conversationFromRow(result.conversation as Row),
+        message: this.conversationMessageFromRow(result.message as Row),
+        inserted: result.inserted === true,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("conversation_idempotency_conflict"))
+        throw new ConversationIdempotencyConflictError();
+      if (message.includes("conversation_not_found")) throw new ConversationNotFoundError();
+      throw error;
+    }
+  }
+
+  async linkConversationUserMessage(
+    ownerId: string,
+    conversationId: string,
+    turnIndex: number,
+    jobId: string,
+    researchId: string,
+  ): Promise<boolean> {
+    const { data, error } = await this.research
+      .from("max_conversation_messages")
+      .update({ job_id: jobId, research_id: researchId })
+      .eq("owner_id", ownerId)
+      .eq("conversation_id", conversationId)
+      .eq("turn_index", turnIndex)
+      .eq("role", "user")
+      .is("job_id", null)
+      .select("id");
+    raiseIfError(error);
+    return Boolean(data?.length);
+  }
+
+  async completeConversationAssistantMessage(input: {
+    ownerId: string;
+    conversationId: string;
+    turnIndex: number;
+    messageId: string;
+    content: string;
+    createdAt: string;
+    jobId?: string;
+    researchId?: string;
+  }): Promise<boolean> {
+    const { data, error } = await this.research.rpc("max_complete_conversation_assistant_message", {
+      p_owner_id: input.ownerId,
+      p_conversation_id: input.conversationId,
+      p_turn_index: input.turnIndex,
+      p_message_id: input.messageId,
+      p_content: input.content.slice(0, 12000),
+      p_created_at: input.createdAt,
+      p_job_id: input.jobId ?? null,
+      p_research_id: input.researchId ?? null,
+    });
+    raiseIfError(error);
+    return data === true;
+  }
+
+  async getConversationContext(
+    ownerId: string,
+    conversationId: string,
+    beforeTurnIndex: number,
+    maxMessages: number,
+    maxChars: number,
+  ): Promise<string> {
+    const boundedMessages = Math.max(1, Math.min(20, Math.trunc(maxMessages)));
+    const { data, error } = await this.research
+      .from("max_conversation_messages")
+      .select("role,content")
+      .eq("owner_id", ownerId)
+      .eq("conversation_id", conversationId)
+      .lt("turn_index", beforeTurnIndex)
+      .order("position", { ascending: false })
+      .limit(boundedMessages);
+    raiseIfError(error);
+    return serializeBoundedConversationContext(
+      ((data ?? []) as Row[]).map((row) => ({
+        role: String(row.role),
+        content: String(row.content),
+      })),
+      maxChars,
+    );
   }
 
   async getTopicByUrl(url: string): Promise<TopicCandidate | undefined> {

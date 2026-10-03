@@ -3,6 +3,7 @@ import type {
   RequestedFactCoverage,
   RequestedFactKind,
   RequestedFactRequirements,
+  RequestedPredicateRequirement,
 } from "./requested-facts.js";
 
 export type ResearchMode = "quick" | "deep";
@@ -360,6 +361,7 @@ export interface QueryInterpretation {
   clarificationQuestion?: string;
   language?: LanguageProfile;
   formatPreference?: ResponseFormatPreference;
+  requestedPredicate?: RequestedPredicateRequirement;
   sourceRequirements?: {
     officialSources: OfficialSourceRequirement;
   };
@@ -425,6 +427,19 @@ export function isQueryInterpretation(value: unknown): value is QueryInterpretat
     }
   }
 
+  if (value.requestedPredicate !== undefined) {
+    const predicate = value.requestedPredicate;
+    if (
+      !isRecord(predicate) ||
+      typeof predicate.predicate !== "string" ||
+      typeof predicate.entity !== "string" ||
+      !Array.isArray(predicate.aliases) ||
+      !predicate.aliases.every((alias) => typeof alias === "string")
+    ) {
+      return false;
+    }
+  }
+
   const formats: ResponseFormatPreference[] = [
     "direct",
     "lookup",
@@ -467,6 +482,10 @@ export interface ResearchPlan {
 
 export interface ResearchRecoveryRequirements {
   comparison?: ComparisonCoverage;
+  requestedPredicate?: {
+    requirement: RequestedPredicateRequirement;
+    resolved: boolean;
+  };
   requestedFacts: RequestedFactKind[];
   resolvedFacts: RequestedFactKind[];
   unresolvedFacts: RequestedFactKind[];

@@ -9,6 +9,10 @@ import {
   DEFAULT_RESEARCH_SESSION_PAGE_SIZE,
   MAX_RESEARCH_SESSION_PAGE_SIZE,
   SqliteSessionStore,
+  ConversationIdempotencyConflictError,
+  ConversationNotFoundError,
+  type ConversationCursor,
+  type ConversationMessageCursor,
   type MaxStore,
   type SessionCursor,
 } from "./store.js";
@@ -23,7 +27,7 @@ import { searchDiagnosticTrace } from "./search-diagnostics.js";
 import type { SearchAttempt } from "./search.js";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { Readable } from "node:stream";
 import { ContentAgent } from "./content-agent.js";
 import { PostFollowUpService, ResearchPostNotFoundError } from "./post-followup.js";
@@ -163,6 +167,63 @@ function decodeResearchSessionCursor(token: string): SessionCursor | undefined {
 
 function encodeResearchSessionCursor(cursor: SessionCursor): string {
   return Buffer.from(JSON.stringify(cursor)).toString("base64url");
+}
+
+function decodeConversationCursor(token: string): ConversationCursor | undefined {
+  try {
+    const decoded = Buffer.from(token, "base64url");
+    if (decoded.toString("base64url") !== token) return undefined;
+    const value = JSON.parse(decoded.toString("utf8")) as Record<string, unknown>;
+    if (
+      Object.keys(value).length !== 2 ||
+      typeof value.updatedAt !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(
+        value.updatedAt,
+      ) ||
+      typeof value.id !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.id)
+    ) {
+      return undefined;
+    }
+    const date = new Date(value.updatedAt);
+    if (!Number.isFinite(date.getTime())) return undefined;
+    return { updatedAt: value.updatedAt, id: value.id };
+  } catch {
+    return undefined;
+  }
+}
+
+function encodeConversationCursor(cursor: ConversationCursor): string {
+  return Buffer.from(JSON.stringify(cursor)).toString("base64url");
+}
+
+function decodeConversationMessageCursor(token: string): ConversationMessageCursor | undefined {
+  try {
+    const decoded = Buffer.from(token, "base64url");
+    if (decoded.toString("base64url") !== token) return undefined;
+    const value = JSON.parse(decoded.toString("utf8")) as Record<string, unknown>;
+    if (
+      Object.keys(value).length !== 1 ||
+      typeof value.position !== "number" ||
+      !Number.isSafeInteger(value.position) ||
+      value.position < 0
+    ) {
+      return undefined;
+    }
+    return { position: value.position };
+  } catch {
+    return undefined;
+  }
+}
+
+function encodeConversationMessageCursor(cursor: ConversationMessageCursor): string {
+  return Buffer.from(JSON.stringify(cursor)).toString("base64url");
+}
+
+function conversationTitleFromMessage(message: string): string {
+  const normalized = message.replace(/\s+/g, " ").trim();
+  const characters = Array.from(normalized);
+  return characters.length <= 80 ? normalized : `${characters.slice(0, 79).join("")}…`;
 }
 
 export function getServerBackgroundServices(app: object) {
@@ -392,14 +453,34 @@ export async function createServer(dependencies: ServerDependencies = {}) {
         if (job.payload.task === "chat") {
           const execute = async () => {
             const sessionId = String(job.payload.sessionId);
+            const conversationId =
+              typeof job.payload.conversationId === "string"
+                ? job.payload.conversationId
+                : undefined;
+            const conversationTurnIndex =
+              typeof job.payload.conversationTurnIndex === "number" &&
+              Number.isSafeInteger(job.payload.conversationTurnIndex)
+                ? job.payload.conversationTurnIndex
+                : undefined;
+            const conversationContext =
+              job.ownerId && conversationId && conversationTurnIndex !== undefined
+                ? await store.getConversationContext(
+                    job.ownerId,
+                    conversationId,
+                    conversationTurnIndex,
+                    config.CHAT_CONTEXT_MAX_MESSAGES,
+                    config.CHAT_CONTEXT_MAX_CHARS,
+                  )
+                : undefined;
             const response = await agent.handle(
               String(job.payload.question),
               job.payload.mode === "deep",
               typeof job.payload.memoryContext === "string" ? job.payload.memoryContext : undefined,
-              async (question, mode, memoryContext, interpretation) => {
+              async (question, mode, memoryContext, interpretation, turnContext) => {
                 const session = await runner.runQueued(sessionId, question, mode, [], {
                   signal: context.signal,
                   memoryContext,
+                  conversationContext: turnContext,
                   interpretation,
                   researchChatOptimization: true,
                 });
@@ -409,6 +490,7 @@ export async function createServer(dependencies: ServerDependencies = {}) {
               isQueryInterpretation(job.payload.interpretation)
                 ? job.payload.interpretation
                 : undefined,
+              conversationContext,
             );
             if (response.route === "direct") {
               const now = new Date().toISOString();
@@ -445,6 +527,24 @@ export async function createServer(dependencies: ServerDependencies = {}) {
                   persisted.searchAttempts as SearchAttempt[],
                 ) as unknown as JobJsonValue,
               });
+            const assistantContent = response.answer?.trim() || persisted.answer?.trim();
+            if (
+              conversationId &&
+              conversationTurnIndex !== undefined &&
+              job.ownerId &&
+              assistantContent
+            ) {
+              await store.completeConversationAssistantMessage({
+                ownerId: job.ownerId,
+                conversationId,
+                turnIndex: conversationTurnIndex,
+                messageId: randomUUID(),
+                content: assistantContent,
+                createdAt: new Date().toISOString(),
+                jobId: job.id,
+                researchId: sessionId,
+              });
+            }
             if (persisted.status === "FAILED")
               throw new Error(persisted.error ?? "Chat research failed");
             const { session: _session, sources: _sources, ...compact } = response;
@@ -725,7 +825,19 @@ export async function createServer(dependencies: ServerDependencies = {}) {
   const chatSchema = z.object({
     message: z.string().trim().min(1).max(2000),
     deepResearch: z.boolean().default(false),
+    conversationId: z.string().uuid().optional(),
   });
+  const conversationListQuerySchema = z.object({
+    limit: z.coerce.number().int().min(1).max(50).default(20),
+    cursor: z.string().min(1).max(256).optional(),
+  });
+  const conversationMessagesQuerySchema = z.object({
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+    cursor: z.string().min(1).max(256).optional(),
+  });
+  const conversationCreateSchema = z
+    .object({ title: z.string().trim().min(1).max(120).optional() })
+    .strict();
 
   function queuedResearchSnapshot(job: DurableJob): ResearchSession {
     const payload = job.payload;
@@ -1052,6 +1164,116 @@ export async function createServer(dependencies: ServerDependencies = {}) {
   });
 
   app.post(
+    "/api/conversations",
+    requireUser(async (request, reply) => {
+      const parsed = conversationCreateSchema.safeParse(request.body ?? {});
+      if (!parsed.success) return reply.badRequest(JSON.stringify(parsed.error.flatten()));
+      const conversation = await store.createConversation(
+        request.authUser.id,
+        parsed.data.title ?? "New chat",
+      );
+      return reply.code(201).send({
+        conversation: {
+          id: conversation.id,
+          title: conversation.title,
+          createdAt: conversation.createdAt,
+          updatedAt: conversation.updatedAt,
+        },
+      });
+    }),
+  );
+
+  app.get(
+    "/api/conversations",
+    requireUser(async (request, reply) => {
+      const parsed = conversationListQuerySchema.safeParse(request.query);
+      if (!parsed.success) return reply.badRequest(JSON.stringify(parsed.error.flatten()));
+      const cursor = parsed.data.cursor ? decodeConversationCursor(parsed.data.cursor) : undefined;
+      if (parsed.data.cursor && !cursor) return reply.badRequest("Conversation cursor is invalid");
+      const rows = await store.listConversations(
+        request.authUser.id,
+        parsed.data.limit + 1,
+        cursor,
+      );
+      const hasMore = rows.length > parsed.data.limit;
+      const conversations = rows.slice(0, parsed.data.limit);
+      const last = conversations.at(-1);
+      return reply.send({
+        conversations: conversations.map(({ id, title, createdAt, updatedAt }) => ({
+          id,
+          title,
+          createdAt,
+          updatedAt,
+        })),
+        nextCursor:
+          hasMore && last
+            ? encodeConversationCursor({ updatedAt: last.updatedAt, id: last.id })
+            : undefined,
+      });
+    }),
+  );
+
+  app.get(
+    "/api/conversations/:id",
+    requireUser(async (request, reply) => {
+      const params = z.object({ id: z.string().uuid() }).safeParse(request.params);
+      if (!params.success) return reply.badRequest("Conversation id is invalid");
+      const parsed = conversationMessagesQuerySchema.safeParse(request.query);
+      if (!parsed.success) return reply.badRequest(JSON.stringify(parsed.error.flatten()));
+      const cursor = parsed.data.cursor
+        ? decodeConversationMessageCursor(parsed.data.cursor)
+        : undefined;
+      if (parsed.data.cursor && !cursor)
+        return reply.badRequest("Conversation message cursor is invalid");
+      const conversation = await store.getConversation(request.authUser.id, params.data.id);
+      if (!conversation) return reply.notFound("Conversation not found");
+      const rows = await store.listConversationMessages(
+        request.authUser.id,
+        conversation.id,
+        parsed.data.limit + 1,
+        cursor,
+      );
+      const hasMore = rows.length > parsed.data.limit;
+      const messages = rows.slice(0, parsed.data.limit);
+      const first = messages[0];
+      return reply.send({
+        conversation: {
+          id: conversation.id,
+          title: conversation.title,
+          createdAt: conversation.createdAt,
+          updatedAt: conversation.updatedAt,
+        },
+        messages: messages.map(
+          ({ id, role, content, createdAt, turnIndex, researchId, jobId }) => ({
+            id,
+            role,
+            content,
+            createdAt,
+            turnIndex,
+            researchId,
+            jobId,
+          }),
+        ),
+        nextCursor:
+          hasMore && first
+            ? encodeConversationMessageCursor({ position: first.position })
+            : undefined,
+      });
+    }),
+  );
+
+  app.delete(
+    "/api/conversations/:id",
+    requireUser(async (request, reply) => {
+      const params = z.object({ id: z.string().uuid() }).safeParse(request.params);
+      if (!params.success) return reply.badRequest("Conversation id is invalid");
+      const deleted = await store.deleteConversation(request.authUser.id, params.data.id);
+      if (!deleted) return reply.notFound("Conversation not found");
+      return reply.code(204).send();
+    }),
+  );
+
+  app.post(
     "/api/chat",
     requireUser(async (request, reply) => {
       const parsed = chatSchema.safeParse(request.body);
@@ -1070,9 +1292,21 @@ export async function createServer(dependencies: ServerDependencies = {}) {
             existingJob.kind !== "research" ||
             existingJob.payload.task !== "chat" ||
             existingJob.payload.question !== parsed.data.message ||
-            existingJob.payload.mode !== mode
+            existingJob.payload.mode !== mode ||
+            (parsed.data.conversationId !== undefined &&
+              existingJob.payload.conversationId !== parsed.data.conversationId)
           ) {
             return reply.conflict("Idempotency key was already used for a different request");
+          }
+          const conversationId =
+            typeof existingJob.payload.conversationId === "string"
+              ? existingJob.payload.conversationId
+              : undefined;
+          if (
+            conversationId &&
+            !(await store.getConversation(request.authUser.id, conversationId))
+          ) {
+            return reply.notFound("Conversation not found");
           }
           const sessionId =
             typeof existingJob.payload.sessionId === "string"
@@ -1083,14 +1317,20 @@ export async function createServer(dependencies: ServerDependencies = {}) {
           const session = await store.get(sessionId);
           if (existingJob.status === "completed" && existingJob.result?.response) {
             const response = existingJob.result.response as Record<string, JobJsonValue>;
-            return reply
-              .code(response.route === "direct" || response.answer ? 200 : 202)
-              .send({ ...response, session, sources: session?.sources });
+            return reply.code(response.route === "direct" || response.answer ? 200 : 202).send({
+              ...response,
+              session,
+              sources: session?.sources,
+              researchId: sessionId,
+              jobId: existingJob.id,
+              conversationId,
+            });
           }
           return reply.code(202).send({
             route: mode === "deep" ? "deep" : "web",
             researchId: sessionId,
             jobId: existingJob.id,
+            conversationId,
             session: await researchSnapshot(session, existingJob),
             toolEvents: [
               {
@@ -1105,6 +1345,32 @@ export async function createServer(dependencies: ServerDependencies = {}) {
         }
       }
 
+      const createdAt = new Date().toISOString();
+      let appendedMessage: Awaited<ReturnType<MaxStore["appendConversationUserMessage"]>>;
+      try {
+        appendedMessage = await store.appendConversationUserMessage({
+          ownerId: request.authUser.id,
+          conversationId: parsed.data.conversationId,
+          newConversationId: randomUUID(),
+          messageId: randomUUID(),
+          title: conversationTitleFromMessage(parsed.data.message),
+          content: parsed.data.message,
+          createdAt,
+          requestKeyHash: idempotencyKey
+            ? createHash("sha256")
+                .update(JSON.stringify([request.authUser.id, idempotencyKey]))
+                .digest("hex")
+            : undefined,
+        });
+      } catch (error) {
+        if (error instanceof ConversationNotFoundError)
+          return reply.notFound("Conversation not found");
+        if (error instanceof ConversationIdempotencyConflictError)
+          return reply.conflict("Idempotency key was already used for a different request");
+        throw error;
+      }
+      const conversationId = appendedMessage.conversation.id;
+      const conversationTurnIndex = appendedMessage.message.turnIndex;
       const explicitMemory = extractExplicitMemoryCandidate(parsed.data.message);
       if (explicitMemory) {
         if (!memoryService.enabled) {
@@ -1120,20 +1386,34 @@ export async function createServer(dependencies: ServerDependencies = {}) {
             },
             explicitMemory.category,
           );
-          return reply.send(
-            buildUserMemoryAcknowledgement(
-              "Saved this for future relevant conversations.",
-              "saved",
-            ),
+          const acknowledgement = buildUserMemoryAcknowledgement(
+            "Saved this for future relevant conversations.",
+            "saved",
           );
+          await store.completeConversationAssistantMessage({
+            ownerId: request.authUser.id,
+            conversationId,
+            turnIndex: conversationTurnIndex,
+            messageId: randomUUID(),
+            content: acknowledgement.answer,
+            createdAt: new Date().toISOString(),
+          });
+          return reply.send({ ...acknowledgement, conversationId });
         } catch (error) {
           if (error instanceof SensitiveMemoryError) {
-            return reply.send(
-              buildUserMemoryAcknowledgement(
-                "I can't store passwords, API keys, tokens, or other credentials as memory.",
-                "rejected",
-              ),
+            const acknowledgement = buildUserMemoryAcknowledgement(
+              "I can't store passwords, API keys, tokens, or other credentials as memory.",
+              "rejected",
             );
+            await store.completeConversationAssistantMessage({
+              ownerId: request.authUser.id,
+              conversationId,
+              turnIndex: conversationTurnIndex,
+              messageId: randomUUID(),
+              content: acknowledgement.answer,
+              createdAt: new Date().toISOString(),
+            });
+            return reply.send({ ...acknowledgement, conversationId });
           }
           if (error instanceof MemoryLimitError) {
             return reply.conflict(error.message);
@@ -1181,6 +1461,8 @@ export async function createServer(dependencies: ServerDependencies = {}) {
         chargeQuota: true,
         taskPayload: {
           task: "chat",
+          conversationId,
+          conversationTurnIndex,
           ...(memoryToolEvent
             ? { memoryToolEvent: memoryToolEvent as unknown as JobJsonValue }
             : {}),
@@ -1193,6 +1475,13 @@ export async function createServer(dependencies: ServerDependencies = {}) {
         return reply.serviceUnavailable("Account entitlements are temporarily unavailable");
       if (sendQuotaRejection(queued, quotaKey, reply)) return reply;
       if (!queued.job) return reply.internalServerError("Could not persist chat request");
+      await store.linkConversationUserMessage(
+        request.authUser.id,
+        conversationId,
+        conversationTurnIndex,
+        queued.job.id,
+        String(queued.job.payload.sessionId),
+      );
       // Fast responses still return inline. Slow work continues under a durable lease
       // and clients can follow the same research stream used by queued research.
       if (preview.decision.effort !== "high") {
@@ -1203,15 +1492,21 @@ export async function createServer(dependencies: ServerDependencies = {}) {
       const session = await store.get(String(queued.job.payload.sessionId));
       if (current?.status === "completed" && current.result?.response) {
         const response = current.result.response as Record<string, JobJsonValue>;
-        return reply
-          .code(response.route === "direct" || response.answer ? 200 : 202)
-          .send({ ...response, session, sources: session?.sources });
+        return reply.code(response.route === "direct" || response.answer ? 200 : 202).send({
+          ...response,
+          session,
+          sources: session?.sources,
+          researchId: String(queued.job.payload.sessionId),
+          jobId: queued.job.id,
+          conversationId,
+        });
       }
       return reply.code(202).send({
         route: parsed.data.deepResearch ? "deep" : "web",
         interpretation: preview.interpretation,
         researchId: queued.job.payload.sessionId,
         jobId: queued.job.id,
+        conversationId,
         session: await researchSnapshot(session, current ?? queued.job),
         toolEvents: memoryToolEvent ? [memoryToolEvent] : [],
       });

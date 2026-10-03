@@ -25,6 +25,8 @@ import { withOperationContext } from "../operation-context.js";
 import {
   buildRequestedFactRequirements,
   extractRequestedFacts,
+  extractRequestedPredicate,
+  hasCompleteRequestedFactCoverage,
   requestedFactCoverage,
 } from "../requested-facts.js";
 
@@ -32,6 +34,59 @@ type FastLookupLimits = Pick<
   ResearchBudget,
   "maxQueries" | "maxSources" | "maxPages" | "maxTimeMs"
 >;
+
+const nonEntityCapitalizedWords = new Set([
+  "who",
+  "what",
+  "where",
+  "when",
+  "which",
+  "how",
+  "many",
+  "much",
+  "does",
+  "do",
+  "did",
+  "is",
+  "are",
+  "was",
+  "were",
+  "the",
+  "this",
+  "that",
+  "company",
+  "corp",
+  "inc",
+  "ltd",
+]);
+
+function hasNamedEntity(question: string, known: string[]): boolean {
+  if (known.length > 0) return true;
+  const matches = question.matchAll(
+    /\b[\p{Lu}][\p{L}\p{N}&.'-]*(?:\s+[\p{Lu}][\p{L}\p{N}&.'-]*){0,3}\b/gu,
+  );
+  for (const match of matches) {
+    const words = match[0].split(/\s+/);
+    if (
+      words.some(
+        (word) => /[\p{Ll}]/u.test(word) && !nonEntityCapitalizedWords.has(word.toLowerCase()),
+      )
+    ) {
+      return true;
+    }
+  }
+  return /\bcompany\s+[A-Z]\b/i.test(question);
+}
+
+function isExternalFactualEntityLookup(interpretation: QueryInterpretation): boolean {
+  const question = interpretation.normalizedQuestion.trim();
+  if (/\b(?:explain|define|teach|how .*\bwork)\b/i.test(question)) return false;
+  const asksSpecificFact =
+    /^(?:who|where|when|which)\b/i.test(question) ||
+    /^how\s+(?:many|much|often|old|long)\b/i.test(question) ||
+    /^what\s+(?:does|do|did|is|are|was|were)\b/i.test(question);
+  return asksSpecificFact && hasNamedEntity(question, interpretation.entities);
+}
 
 export type AgentRoute = "direct" | "web" | "deep";
 type InternalEffort = "low" | "medium" | "high";
@@ -162,6 +217,19 @@ export class AutonomousAgent {
       };
     }
 
+    if (
+      !explicitlyFresh &&
+      !explicitEvidenceRequest &&
+      isExternalFactualEntityLookup(interpretation)
+    ) {
+      return {
+        route: "web",
+        effort: "medium",
+        reason:
+          "The question asks for a specific fact about a named entity, so the agent selected a bounded web lookup.",
+      };
+    }
+
     const isDeepInvestigation =
       /\b(deep|investigate|thorough|in-depth|comprehensive|evaluate|benchmark|analy[sz]e)\b/i.test(
         normalized,
@@ -193,7 +261,7 @@ export class AutonomousAgent {
       };
     }
 
-    // Medium effort for fast factual lookups, current status, release versions, or time-sensitive facts
+    // Medium effort for bounded factual lookups and current facts.
     if (
       interpretation.formatPreference === "lookup" ||
       /\b(latest|current|today|recent|news|this week|release date|when was|what version|status of)\b/i.test(
@@ -229,6 +297,7 @@ export class AutonomousAgent {
     toolEvents: AgentToolEvent[],
     startedAt: number,
     memoryContext?: string,
+    conversationContext?: string,
   ): Promise<ChatResponse> {
     const controller = new AbortController();
     const deadlineAt = startedAt + this.fastLookupLimits.maxTimeMs;
@@ -243,6 +312,7 @@ export class AutonomousAgent {
           toolEvents,
           startedAt,
           memoryContext,
+          conversationContext,
         ),
       );
     } finally {
@@ -256,9 +326,15 @@ export class AutonomousAgent {
     toolEvents: AgentToolEvent[],
     startedAt: number,
     memoryContext?: string,
+    conversationContext?: string,
   ): Promise<ChatResponse> {
     const now = new Date().toISOString();
-    const searchQuery = planFastLookupQuery(interpretation);
+    const requestedPredicate =
+      interpretation.requestedPredicate ?? extractRequestedPredicate(question);
+    const lookupInterpretation = requestedPredicate
+      ? { ...interpretation, requestedPredicate, formatPreference: "lookup" as const }
+      : interpretation;
+    const searchQuery = planFastLookupQuery(lookupInterpretation, question);
     const searchAttempts: SearchAttempt[] = [];
     const lookupText = `${question} ${interpretation.normalizedQuestion}`;
     const isReactVersionLookup =
@@ -294,7 +370,7 @@ export class AutonomousAgent {
           rawResults.find((result) => result.url === registryUrl) ?? registryResult,
         ]
       : rawResults;
-    const ranked = rankResults(interpretation.normalizedQuestion, searchResults);
+    const ranked = rankResults(lookupInterpretation.normalizedQuestion, searchResults);
     const relevantRanked = ranked.filter((source) => !source.subjectMismatchReason);
     let rankedForFetch = relevantRanked;
     if (isReactVersionLookup) {
@@ -321,16 +397,17 @@ export class AutonomousAgent {
       this.fastLookupLimits.maxSources,
       this.fastLookupLimits.maxPages,
     );
-    const officialSourceRequirement = interpretation.sourceRequirements?.officialSources ?? "none";
+    const officialSourceRequirement =
+      lookupInterpretation.sourceRequirements?.officialSources ?? "none";
     const topCandidates =
       officialSourceRequirement === "none"
         ? rankedForFetch.slice(0, sourceLimit)
         : selectResearchSources(
             rankedForFetch,
-            interpretation.entities,
+            lookupInterpretation.entities,
             sourceLimit,
             officialSourceRequirement,
-            interpretation.normalizedQuestion,
+            lookupInterpretation.normalizedQuestion,
           );
     toolEvents.push({
       tool: "source_triage",
@@ -344,10 +421,10 @@ export class AutonomousAgent {
     // 3. Fetch content with bounded concurrency for top candidates
     const fetchedSources: Source[] = [];
     const compactLookup =
-      interpretation.formatPreference === "lookup" &&
+      lookupInterpretation.formatPreference === "lookup" &&
       !isReactVersionLookup &&
       !/\b(compare|comparison|versus|\bvs\b|deep|comprehensive|in depth)\b/i.test(
-        interpretation.normalizedQuestion,
+        lookupInterpretation.normalizedQuestion,
       );
     for (const candidate of topCandidates) {
       let retrieved: Source;
@@ -371,7 +448,7 @@ export class AutonomousAgent {
           snippet: candidate.snippet,
           provider: candidate.provider,
           researchChatOptimization: true,
-          question: interpretation.normalizedQuestion,
+          question,
         });
         const extracted = await this.use<{
           title?: string;
@@ -475,7 +552,7 @@ export class AutonomousAgent {
         compactLookup &&
         retrieved.content?.trim() &&
         !retrieved.subjectMismatchReason &&
-        requestedFactCoverage(question, retrieved.content).missing.length === 0
+        hasCompleteRequestedFactCoverage(requestedFactCoverage(question, retrieved.content))
       )
         break;
     }
@@ -487,9 +564,9 @@ export class AutonomousAgent {
     const evidenceSources = fetchedSources.filter((source) => !source.subjectMismatchReason);
 
     // 4. Synthesize directly with citations
-    const requestedFacts = extractRequestedFacts(interpretation.normalizedQuestion);
+    const requestedFacts = extractRequestedFacts(question);
     const structuredObjectives = generateStructuredObjectives(
-      interpretation,
+      lookupInterpretation,
       "quick",
       requestedFacts,
     );
@@ -500,7 +577,7 @@ export class AutonomousAgent {
       requestedFactRequirements: buildRequestedFactRequirements(requestedFacts),
       queries: [searchQuery],
       queryGroups: [{ category: "DIRECT", queries: [searchQuery] }],
-      interpretation,
+      interpretation: lookupInterpretation,
     };
 
     let answer: string;
@@ -536,7 +613,9 @@ export class AutonomousAgent {
       answerSucceeded =
         validation.status === "VALIDATED" &&
         !validation.failure &&
-        requestedFactCoverage(question, [answer], { requestedFacts }).missing.length === 0;
+        hasCompleteRequestedFactCoverage(
+          requestedFactCoverage(question, [answer], { requestedFacts, requestedPredicate }),
+        );
     } else if (evidenceSources.every((source) => !source.content?.trim())) {
       answer =
         "I couldn't verify this current information from a retrieved source. Please try again later or narrow the question.";
@@ -572,6 +651,8 @@ export class AutonomousAgent {
           "quick",
           undefined,
           memoryContext,
+          false,
+          conversationContext,
         );
         const metrics = this.llm.metrics;
         answerSucceeded =
@@ -579,13 +660,21 @@ export class AutonomousAgent {
           metrics.citationEntailment?.status === "VALIDATED" &&
           !metrics.citationEntailment.failure &&
           metrics.synthesis?.finalAnswerSource !== "unavailable" &&
-          metrics.synthesis?.requiredFactCoverage.missing.length === 0 &&
-          metrics.synthesis?.evidenceFactCoverage.missing.length === 0 &&
+          Boolean(
+            metrics.synthesis?.requiredFactCoverage &&
+            hasCompleteRequestedFactCoverage(metrics.synthesis.requiredFactCoverage),
+          ) &&
+          Boolean(
+            metrics.synthesis?.evidenceFactCoverage &&
+            hasCompleteRequestedFactCoverage(metrics.synthesis.evidenceFactCoverage),
+          ) &&
           !/Insufficient evidence|couldn't verify|cannot present it as sufficiently verified/i.test(
             answer,
           );
         if (!answerSucceeded) {
-          answer = "I couldn't produce an answer grounded in the retrieved source content.";
+          answer = requestedPredicate
+            ? `Insufficient evidence to verify the requested ${requestedPredicate.predicate} fact for ${requestedPredicate.entity}.`
+            : "I couldn't produce an answer grounded in the retrieved source content.";
         }
         toolEvents[toolEvents.length - 1] = {
           tool: "synthesize",
@@ -710,8 +799,10 @@ export class AutonomousAgent {
       mode: ResearchMode,
       memoryContext?: string,
       interpretation?: QueryInterpretation,
+      conversationContext?: string,
     ) => Promise<{ session: ResearchSession; jobId: string }>,
     interpretationOverride?: QueryInterpretation,
+    conversationContext?: string,
   ): Promise<ChatResponse> {
     const startedAt = Date.now();
     const toolEvents: AgentToolEvent[] = [];
@@ -778,6 +869,7 @@ export class AutonomousAgent {
         question,
         interpretation,
         memoryContext,
+        conversationContext,
       });
       return {
         route: decision.route,
@@ -789,19 +881,49 @@ export class AutonomousAgent {
     }
 
     // 2. Fast web lookup
-    if (decision.effort === "medium" && !enqueueResearch) {
-      return this.fastWebLookup(question, interpretation, toolEvents, startedAt, memoryContext);
+    if (decision.effort === "medium") {
+      if (enqueueResearch) {
+        const mode = decision.route === "deep" ? "deep" : "quick";
+        const queued =
+          conversationContext === undefined
+            ? await enqueueResearch(question, mode, memoryContext, interpretation)
+            : await enqueueResearch(
+                question,
+                mode,
+                memoryContext,
+                interpretation,
+                conversationContext,
+              );
+        return {
+          route: decision.route,
+          interpretation,
+          researchId: queued.session.id,
+          jobId: queued.jobId,
+          toolEvents,
+          session: queued.session,
+          durationMs: Date.now() - startedAt,
+        };
+      }
+      return this.fastWebLookup(
+        question,
+        interpretation,
+        toolEvents,
+        startedAt,
+        memoryContext,
+        conversationContext,
+      );
     }
 
     // Durable normal Chat and Deep Research share the same evidence controller.
     const mode = decision.route === "deep" ? "deep" : "quick";
     const queued = enqueueResearch
-      ? await enqueueResearch(question, mode, memoryContext, interpretation)
+      ? await enqueueResearch(question, mode, memoryContext, interpretation, conversationContext)
       : undefined;
     const session =
       queued?.session ??
       (await this.runner.start(question, mode, [], {
         memoryContext,
+        conversationContext,
         interpretation,
         researchChatOptimization: true,
       }));

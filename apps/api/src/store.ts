@@ -91,6 +91,124 @@ export interface SessionCursor {
   id: string;
 }
 
+export interface ConversationRecord {
+  id: string;
+  ownerId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  nextTurnIndex: number;
+}
+
+export interface ConversationMessageRecord {
+  id: string;
+  conversationId: string;
+  ownerId: string;
+  turnIndex: number;
+  position: number;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: string;
+  researchId?: string;
+  jobId?: string;
+}
+
+export interface ConversationCursor {
+  updatedAt: string;
+  id: string;
+}
+
+export interface ConversationMessageCursor {
+  position: number;
+}
+
+export interface AppendConversationUserMessageInput {
+  ownerId: string;
+  conversationId?: string;
+  newConversationId: string;
+  messageId: string;
+  title: string;
+  content: string;
+  createdAt: string;
+  requestKeyHash?: string;
+}
+
+export interface ConversationStore {
+  createConversation(ownerId: string, title?: string, id?: string): Promise<ConversationRecord>;
+  listConversations(
+    ownerId: string,
+    limit?: number,
+    cursor?: ConversationCursor,
+  ): Promise<ConversationRecord[]>;
+  getConversation(ownerId: string, id: string): Promise<ConversationRecord | undefined>;
+  deleteConversation(ownerId: string, id: string): Promise<boolean>;
+  listConversationMessages(
+    ownerId: string,
+    conversationId: string,
+    limit?: number,
+    cursor?: ConversationMessageCursor,
+  ): Promise<ConversationMessageRecord[]>;
+  appendConversationUserMessage(input: AppendConversationUserMessageInput): Promise<{
+    conversation: ConversationRecord;
+    message: ConversationMessageRecord;
+    inserted: boolean;
+  }>;
+  linkConversationUserMessage(
+    ownerId: string,
+    conversationId: string,
+    turnIndex: number,
+    jobId: string,
+    researchId: string,
+  ): Promise<boolean>;
+  completeConversationAssistantMessage(input: {
+    ownerId: string;
+    conversationId: string;
+    turnIndex: number;
+    messageId: string;
+    content: string;
+    createdAt: string;
+    jobId?: string;
+    researchId?: string;
+  }): Promise<boolean>;
+  getConversationContext(
+    ownerId: string,
+    conversationId: string,
+    beforeTurnIndex: number,
+    maxMessages: number,
+    maxChars: number,
+  ): Promise<string>;
+}
+
+export function serializeBoundedConversationContext(
+  newestFirst: Array<{ role: string; content: string }>,
+  maxChars: number,
+): string {
+  const boundedChars = Math.max(256, Math.min(12000, Math.trunc(maxChars)));
+  const serialize = (messages: Array<{ role: string; content: string }>) =>
+    JSON.stringify(messages).replace(/</g, "\\u003c");
+  let selected: Array<{ role: string; content: string }> = [];
+  for (const message of newestFirst.slice(0, 20)) {
+    const candidate = [{ role: message.role, content: message.content }, ...selected];
+    if (serialize(candidate).length <= boundedChars) {
+      selected = candidate;
+      continue;
+    }
+    if (selected.length === 0) {
+      let low = 0;
+      let high = message.content.length;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        const trial = [{ role: message.role, content: message.content.slice(-middle) }];
+        if (serialize(trial).length <= boundedChars) low = middle;
+        else high = middle - 1;
+      }
+      if (low > 0) selected = [{ role: message.role, content: message.content.slice(-low) }];
+    }
+    break;
+  }
+  return selected.length ? serialize(selected) : "";
+}
+
 export const DEFAULT_RESEARCH_SESSION_PAGE_SIZE = 50;
 export const MAX_RESEARCH_SESSION_PAGE_SIZE = 100;
 
@@ -260,7 +378,8 @@ export interface MaxStore
     UserQuotaStore,
     UserMemoryStore,
     ShareStore,
-    ExportStore {
+    ExportStore,
+    ConversationStore {
   recoverInterrupted(): number | Promise<number>;
   recoverAutonomousRuns(): number | Promise<number>;
   close(): void | Promise<void>;
@@ -351,6 +470,20 @@ export class MemorySessionStore implements SessionStore {
   }
 }
 
+export class ConversationNotFoundError extends Error {
+  constructor() {
+    super("Conversation not found");
+    this.name = "ConversationNotFoundError";
+  }
+}
+
+export class ConversationIdempotencyConflictError extends Error {
+  constructor() {
+    super("Idempotency key was already used for a different conversation message");
+    this.name = "ConversationIdempotencyConflictError";
+  }
+}
+
 /** Durable embedded session store; callers retain the same SessionStore contract. */
 export class SqliteSessionStore implements MaxStore {
   private readonly database: DatabaseSync;
@@ -381,17 +514,30 @@ export class SqliteSessionStore implements MaxStore {
     if (!row) throw new Error("Job lease was lost");
   }
 
-  private async workerWrite(operation: () => void, allowCancellation = false): Promise<void> {
+  private async workerWrite<T>(operation: () => T, allowCancellation = false): Promise<T> {
     if (!currentWorkerContext()) {
-      operation();
-      return;
+      return operation();
     }
     await currentWorkerContext()!.assertLease(allowCancellation);
     this.database.exec("BEGIN IMMEDIATE");
     try {
       this.assertWorkerLease(allowCancellation);
-      operation();
+      const result = operation();
       this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private async conversationWrite<T>(operation: () => T): Promise<T> {
+    if (currentWorkerContext()) return this.workerWrite(operation);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.database.exec("COMMIT");
+      return result;
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -404,6 +550,41 @@ export class SqliteSessionStore implements MaxStore {
     this.database.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA busy_timeout = 5000;
+      CREATE TABLE IF NOT EXISTS conversations (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        next_turn_index INTEGER NOT NULL DEFAULT 0 CHECK (next_turn_index >= 0),
+        UNIQUE(id, owner_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_conversations_owner_updated
+        ON conversations(owner_id, updated_at DESC, id DESC);
+      CREATE TABLE IF NOT EXISTS conversation_messages (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        turn_index INTEGER NOT NULL CHECK (turn_index >= 0),
+        position INTEGER NOT NULL CHECK (position >= 0),
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+        content TEXT NOT NULL CHECK (length(content) BETWEEN 1 AND 12000),
+        created_at TEXT NOT NULL,
+        research_id TEXT,
+        job_id TEXT,
+        request_key_hash TEXT CHECK (request_key_hash IS NULL OR length(request_key_hash) = 64),
+        FOREIGN KEY(conversation_id, owner_id) REFERENCES conversations(id, owner_id) ON DELETE CASCADE,
+        UNIQUE(conversation_id, turn_index, role),
+        UNIQUE(conversation_id, position)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_message_request_key
+        ON conversation_messages(owner_id, request_key_hash)
+        WHERE role = 'user' AND request_key_hash IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_message_assistant_job
+        ON conversation_messages(job_id)
+        WHERE role = 'assistant' AND job_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_conversation_messages_history
+        ON conversation_messages(owner_id, conversation_id, position DESC);
       CREATE TABLE IF NOT EXISTS deleted_research_sessions (id TEXT PRIMARY KEY, owner_id TEXT);
       CREATE TABLE IF NOT EXISTS request_rate_limits (key TEXT PRIMARY KEY, window_end INTEGER NOT NULL, used INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS request_rate_limits_expiry ON request_rate_limits(window_end);
@@ -1734,6 +1915,320 @@ export class SqliteSessionStore implements MaxStore {
       update.run(session.updatedAt, JSON.stringify(session), row.id);
     }
     return rows.length;
+  }
+
+  private conversationFromRow(row: Record<string, string | number | null>): ConversationRecord {
+    return {
+      id: String(row.id),
+      ownerId: String(row.owner_id),
+      title: String(row.title),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+      nextTurnIndex: Number(row.next_turn_index),
+    };
+  }
+
+  private conversationMessageFromRow(
+    row: Record<string, string | number | null>,
+  ): ConversationMessageRecord {
+    return {
+      id: String(row.id),
+      conversationId: String(row.conversation_id),
+      ownerId: String(row.owner_id),
+      turnIndex: Number(row.turn_index),
+      position: Number(row.position),
+      role: String(row.role) as ConversationMessageRecord["role"],
+      content: String(row.content),
+      createdAt: String(row.created_at),
+      researchId: row.research_id ? String(row.research_id) : undefined,
+      jobId: row.job_id ? String(row.job_id) : undefined,
+    };
+  }
+
+  async createConversation(
+    ownerId: string,
+    title = "New chat",
+    id = randomUUID(),
+  ): Promise<ConversationRecord> {
+    const now = new Date().toISOString();
+    return this.conversationWrite(() => {
+      this.database
+        .prepare(
+          `INSERT INTO conversations (id, owner_id, title, created_at, updated_at, next_turn_index)
+           VALUES (?, ?, ?, ?, ?, 0)`,
+        )
+        .run(id, ownerId, title, now, now);
+      const row = this.database
+        .prepare("SELECT * FROM conversations WHERE id = ? AND owner_id = ?")
+        .get(id, ownerId) as Record<string, string | number | null> | undefined;
+      if (!row) throw new Error("Conversation could not be created");
+      return this.conversationFromRow(row);
+    });
+  }
+
+  async listConversations(
+    ownerId: string,
+    limit = 20,
+    cursor?: ConversationCursor,
+  ): Promise<ConversationRecord[]> {
+    const boundedLimit = Math.max(1, Math.min(51, Math.trunc(limit)));
+    const rows = (
+      cursor
+        ? this.database
+            .prepare(
+              `SELECT * FROM conversations
+             WHERE owner_id = ? AND (updated_at < ? OR (updated_at = ? AND id < ?))
+             ORDER BY updated_at DESC, id DESC LIMIT ?`,
+            )
+            .all(ownerId, cursor.updatedAt, cursor.updatedAt, cursor.id, boundedLimit)
+        : this.database
+            .prepare(
+              `SELECT * FROM conversations WHERE owner_id = ?
+             ORDER BY updated_at DESC, id DESC LIMIT ?`,
+            )
+            .all(ownerId, boundedLimit)
+    ) as Array<Record<string, string | number | null>>;
+    return rows.map((row) => this.conversationFromRow(row));
+  }
+
+  async getConversation(ownerId: string, id: string): Promise<ConversationRecord | undefined> {
+    const row = this.database
+      .prepare("SELECT * FROM conversations WHERE id = ? AND owner_id = ?")
+      .get(id, ownerId) as Record<string, string | number | null> | undefined;
+    return row ? this.conversationFromRow(row) : undefined;
+  }
+
+  async deleteConversation(ownerId: string, id: string): Promise<boolean> {
+    return this.conversationWrite(() => {
+      const exists = this.database
+        .prepare("SELECT id FROM conversations WHERE id = ? AND owner_id = ?")
+        .get(id, ownerId);
+      if (!exists) return false;
+      this.database
+        .prepare("DELETE FROM conversation_messages WHERE conversation_id = ? AND owner_id = ?")
+        .run(id, ownerId);
+      return (
+        Number(
+          this.database
+            .prepare("DELETE FROM conversations WHERE id = ? AND owner_id = ?")
+            .run(id, ownerId).changes,
+        ) > 0
+      );
+    });
+  }
+
+  async listConversationMessages(
+    ownerId: string,
+    conversationId: string,
+    limit = 50,
+    cursor?: ConversationMessageCursor,
+  ): Promise<ConversationMessageRecord[]> {
+    const boundedLimit = Math.max(1, Math.min(101, Math.trunc(limit)));
+    const rows = (
+      cursor
+        ? this.database
+            .prepare(
+              `SELECT * FROM conversation_messages
+             WHERE owner_id = ? AND conversation_id = ? AND position < ?
+             ORDER BY position DESC LIMIT ?`,
+            )
+            .all(ownerId, conversationId, cursor.position, boundedLimit)
+        : this.database
+            .prepare(
+              `SELECT * FROM conversation_messages WHERE owner_id = ? AND conversation_id = ?
+             ORDER BY position DESC LIMIT ?`,
+            )
+            .all(ownerId, conversationId, boundedLimit)
+    ) as Array<Record<string, string | number | null>>;
+    return rows.reverse().map((row) => this.conversationMessageFromRow(row));
+  }
+
+  async appendConversationUserMessage(input: AppendConversationUserMessageInput): Promise<{
+    conversation: ConversationRecord;
+    message: ConversationMessageRecord;
+    inserted: boolean;
+  }> {
+    if (input.requestKeyHash && !/^[a-f0-9]{64}$/i.test(input.requestKeyHash)) {
+      throw new Error("Invalid conversation request key hash");
+    }
+    return this.conversationWrite(() => {
+      if (input.requestKeyHash) {
+        const existing = this.database
+          .prepare(
+            `SELECT * FROM conversation_messages
+             WHERE owner_id = ? AND role = 'user' AND request_key_hash = ?`,
+          )
+          .get(input.ownerId, input.requestKeyHash) as
+          Record<string, string | number | null> | undefined;
+        if (existing) {
+          const message = this.conversationMessageFromRow(existing);
+          if (
+            message.content !== input.content ||
+            (input.conversationId && message.conversationId !== input.conversationId)
+          ) {
+            throw new ConversationIdempotencyConflictError();
+          }
+          const conversation = this.getConversationRow(message.conversationId, input.ownerId);
+          if (!conversation) throw new ConversationNotFoundError();
+          return { conversation, message, inserted: false };
+        }
+      }
+
+      const conversationId = input.conversationId ?? input.newConversationId;
+      let conversation = this.getConversationRow(conversationId, input.ownerId);
+      if (input.conversationId && !conversation) throw new ConversationNotFoundError();
+      if (!conversation) {
+        this.database
+          .prepare(
+            `INSERT INTO conversations (id, owner_id, title, created_at, updated_at, next_turn_index)
+             VALUES (?, ?, ?, ?, ?, 0)`,
+          )
+          .run(conversationId, input.ownerId, input.title, input.createdAt, input.createdAt);
+        conversation = this.getConversationRow(conversationId, input.ownerId);
+      }
+      if (!conversation) throw new Error("Conversation could not be created");
+
+      const turnIndex = conversation.nextTurnIndex;
+      this.database
+        .prepare(
+          `UPDATE conversations SET
+             title = CASE WHEN next_turn_index = 0 THEN ? ELSE title END,
+             updated_at = ?, next_turn_index = next_turn_index + 1
+           WHERE id = ? AND owner_id = ?`,
+        )
+        .run(input.title, input.createdAt, conversationId, input.ownerId);
+      this.database
+        .prepare(
+          `INSERT INTO conversation_messages (
+             id, conversation_id, owner_id, turn_index, position, role, content, created_at, request_key_hash
+           ) VALUES (?, ?, ?, ?, ?, 'user', ?, ?, ?)`,
+        )
+        .run(
+          input.messageId,
+          conversationId,
+          input.ownerId,
+          turnIndex,
+          turnIndex * 2,
+          input.content,
+          input.createdAt,
+          input.requestKeyHash ?? null,
+        );
+      const savedConversation = this.getConversationRow(conversationId, input.ownerId);
+      const savedMessage = this.database
+        .prepare(
+          `SELECT * FROM conversation_messages
+           WHERE conversation_id = ? AND owner_id = ? AND turn_index = ? AND role = 'user'`,
+        )
+        .get(conversationId, input.ownerId, turnIndex) as
+        Record<string, string | number | null> | undefined;
+      if (!savedConversation || !savedMessage)
+        throw new Error("Conversation message could not be saved");
+      return {
+        conversation: savedConversation,
+        message: this.conversationMessageFromRow(savedMessage),
+        inserted: true,
+      };
+    });
+  }
+
+  private getConversationRow(id: string, ownerId: string): ConversationRecord | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM conversations WHERE id = ? AND owner_id = ?")
+      .get(id, ownerId) as Record<string, string | number | null> | undefined;
+    return row ? this.conversationFromRow(row) : undefined;
+  }
+
+  async linkConversationUserMessage(
+    ownerId: string,
+    conversationId: string,
+    turnIndex: number,
+    jobId: string,
+    researchId: string,
+  ): Promise<boolean> {
+    return this.conversationWrite(() => {
+      const result = this.database
+        .prepare(
+          `UPDATE conversation_messages SET job_id = ?, research_id = ?
+           WHERE owner_id = ? AND conversation_id = ? AND turn_index = ? AND role = 'user'
+             AND (job_id IS NULL OR job_id = ?)`,
+        )
+        .run(jobId, researchId, ownerId, conversationId, turnIndex, jobId);
+      return Number(result.changes) > 0;
+    });
+  }
+
+  async completeConversationAssistantMessage(input: {
+    ownerId: string;
+    conversationId: string;
+    turnIndex: number;
+    messageId: string;
+    content: string;
+    createdAt: string;
+    jobId?: string;
+    researchId?: string;
+  }): Promise<boolean> {
+    if (!input.content.trim()) return false;
+    return this.conversationWrite(() => {
+      if (!this.getConversationRow(input.conversationId, input.ownerId)) return false;
+      const existing = this.database
+        .prepare(
+          `SELECT * FROM conversation_messages
+           WHERE conversation_id = ? AND owner_id = ? AND turn_index = ? AND role = 'assistant'`,
+        )
+        .get(input.conversationId, input.ownerId, input.turnIndex) as
+        Record<string, string | number | null> | undefined;
+      if (existing) {
+        const message = this.conversationMessageFromRow(existing);
+        if (message.jobId !== input.jobId)
+          throw new Error("Conversation turn already has a different answer");
+        return true;
+      }
+      this.database
+        .prepare(
+          `INSERT INTO conversation_messages (
+             id, conversation_id, owner_id, turn_index, position, role, content, created_at, research_id, job_id
+           ) VALUES (?, ?, ?, ?, ?, 'assistant', ?, ?, ?, ?)`,
+        )
+        .run(
+          input.messageId,
+          input.conversationId,
+          input.ownerId,
+          input.turnIndex,
+          input.turnIndex * 2 + 1,
+          input.content.slice(0, 12000),
+          input.createdAt,
+          input.researchId ?? null,
+          input.jobId ?? null,
+        );
+      this.database
+        .prepare(
+          `UPDATE conversations SET updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END
+           WHERE id = ? AND owner_id = ?`,
+        )
+        .run(input.createdAt, input.createdAt, input.conversationId, input.ownerId);
+      return true;
+    });
+  }
+
+  async getConversationContext(
+    ownerId: string,
+    conversationId: string,
+    beforeTurnIndex: number,
+    maxMessages: number,
+    maxChars: number,
+  ): Promise<string> {
+    const boundedMessages = Math.max(1, Math.min(20, Math.trunc(maxMessages)));
+    const rows = this.database
+      .prepare(
+        `SELECT role, content FROM conversation_messages
+         WHERE owner_id = ? AND conversation_id = ? AND turn_index < ?
+         ORDER BY position DESC LIMIT ?`,
+      )
+      .all(ownerId, conversationId, beforeTurnIndex, boundedMessages) as Array<{
+      role: string;
+      content: string;
+    }>;
+    return serializeBoundedConversationContext(rows, maxChars);
   }
 
   close(): void {

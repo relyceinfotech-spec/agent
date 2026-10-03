@@ -223,6 +223,29 @@ describe("shared source retrieval ladder", () => {
     ).toBe(true);
   });
 
+  it("does not treat a company profile or generic leadership snippet as CEO evidence", () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const profile = {
+      title: "Relyce Infotech CEO and leadership profile",
+      snippet: "Relyce Infotech provides IT consulting and software development services.",
+    };
+    const genericLeadership = {
+      title: "Relyce Infotech leadership",
+      snippet: "Relyce Infotech is led by an experienced team of technology professionals.",
+    };
+    const supportedPredicate = {
+      title: "Relyce Infotech executive team",
+      snippet: "Jane Doe is the chief executive officer of Relyce Infotech.",
+    };
+
+    expect(assessSerperSnippet(profile, question)).toMatchObject({
+      sufficient: false,
+      reason: "The snippet does not state the requested CEO fact.",
+    });
+    expect(isSerperSnippetSufficient(genericLeadership, question)).toBe(false);
+    expect(isSerperSnippetSufficient(supportedPredicate, question)).toBe(true);
+  });
+
   it("requires a snippet to support the requested entity/version lifecycle date", () => {
     const question =
       "According to the official Node.js release schedule, when does Node.js 22 reach end of life?";

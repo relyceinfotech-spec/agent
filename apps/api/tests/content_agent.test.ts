@@ -650,6 +650,99 @@ describe("autonomous content agent", () => {
     }
   });
 
+  it("enqueues scheduled Post Agent work through the durable queue and skips active jobs", async () => {
+    const store = makeStore();
+    const jobs = new InMemoryDurableJobStore();
+    const enqueue = vi.fn(async (run: AutonomousRun) => {
+      const result = await jobs.enqueueJob({
+        id: run.id,
+        kind: "post_agent",
+        ownerScope: "system",
+        payload: { runId: run.id },
+        maxAttempts: 3,
+      });
+      if (!result.job) throw new Error("Scheduled job was not queued");
+    });
+    const hasActive = vi.fn(() => jobs.hasRunnableOrRunningJobs("post_agent"));
+    const agent = new ContentAgent(
+      store,
+      { start: vi.fn(), cancel: vi.fn() } as never,
+      ["empty-feed"],
+      async () => [],
+      undefined,
+      enqueue,
+      hasActive,
+    );
+    vi.useFakeTimers();
+    try {
+      agent.startScheduler({ enabled: true, intervalMs: 1000 });
+      await vi.advanceTimersByTimeAsync(1000);
+      for (let index = 0; index < 10; index += 1) await Promise.resolve();
+      expect(enqueue).toHaveBeenCalledOnce();
+      const scheduledRun = enqueue.mock.calls[0]?.[0];
+      expect(scheduledRun?.trigger).toBe("schedule");
+      expect(await jobs.getJob(scheduledRun!.id)).toMatchObject({
+        kind: "post_agent",
+        status: "queued",
+        ownerScope: "system",
+        payload: { runId: scheduledRun!.id },
+      });
+
+      await vi.advanceTimersByTimeAsync(5000);
+      for (let index = 0; index < 10; index += 1) await Promise.resolve();
+      expect(hasActive).toHaveBeenCalled();
+      expect(enqueue).toHaveBeenCalledOnce();
+      agent.stopScheduler();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(enqueue).toHaveBeenCalledOnce();
+    } finally {
+      agent.stopScheduler();
+      vi.useRealTimers();
+      store.close();
+    }
+  });
+
+  it("does not invoke disabled scheduling and prevents overlapping scheduler checks", async () => {
+    const store = makeStore();
+    let releaseCheck: ((active: boolean) => void) | undefined;
+    const pendingCheck = new Promise<boolean>((resolve) => {
+      releaseCheck = resolve;
+    });
+    const hasActive = vi.fn(() => pendingCheck);
+    const enqueue = vi.fn(async () => undefined);
+    const research = { start: vi.fn(), cancel: vi.fn() } as never;
+    const disabled = new ContentAgent(store, research, [], async () => [], undefined, enqueue);
+    const agent = new ContentAgent(
+      store,
+      research,
+      [],
+      async () => [],
+      undefined,
+      enqueue,
+      hasActive,
+    );
+    vi.useFakeTimers();
+    try {
+      disabled.startScheduler({ enabled: false, intervalMs: 1000 });
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(enqueue).not.toHaveBeenCalled();
+
+      agent.startScheduler({ enabled: true, intervalMs: 1000 });
+      await vi.advanceTimersByTimeAsync(1000);
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(hasActive).toHaveBeenCalledOnce();
+      releaseCheck?.(false);
+      for (let index = 0; index < 20; index += 1) await Promise.resolve();
+      expect(enqueue).toHaveBeenCalledOnce();
+    } finally {
+      agent.stopScheduler();
+      disabled.stopScheduler();
+      vi.useRealTimers();
+      store.close();
+    }
+  });
+
   it("continues topic discovery when one feed fails and avoids near-duplicate topics", async () => {
     const store = makeStore();
     const now = new Date().toISOString();

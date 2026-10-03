@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   classifyEvidenceStatus,
   extractRequestedFacts,
+  extractRequestedPredicate,
   missingRequestedFactSupport,
   requestedFactCoverage,
+  requestedPredicatePresent,
 } from "../src/requested-facts.js";
 
 const releaseQuestion =
@@ -247,5 +249,85 @@ describe("task-specific requested-fact evidence", () => {
         "The official React release history links to detailed release documentation.",
       ]),
     ).toBe("SUPPORTED_EVIDENCE");
+  });
+
+  it("extracts precise entity predicates across role, founder, and location wording", () => {
+    expect(extractRequestedPredicate("Who is the CEO of Relyce Infotech?")).toMatchObject({
+      predicate: "CEO",
+      entity: "Relyce Infotech",
+      aliases: expect.arrayContaining(["CEO", "chief executive officer"]),
+    });
+    expect(extractRequestedPredicate("Who founded OpenAI?")).toMatchObject({
+      predicate: "founded",
+      entity: "OpenAI",
+      aliases: expect.arrayContaining(["founded", "found", "founder"]),
+    });
+    expect(extractRequestedPredicate("Who is the CTO of Acme Systems?")).toMatchObject({
+      predicate: "CTO",
+      aliases: expect.arrayContaining(["CTO", "chief technology officer"]),
+    });
+    expect(extractRequestedPredicate("Where is Tesla headquartered?")).toMatchObject({
+      predicate: "headquartered",
+      entity: "Tesla",
+      aliases: expect.arrayContaining(["headquartered", "headquarters"]),
+    });
+  });
+
+  it("does not mistake entity relevance or generic leadership for requested CEO evidence", () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const profile = "Relyce Infotech is an IT services and software development company.";
+    const genericLeadership = "Relyce Infotech is led by a team of experienced professionals.";
+    const explicitRole = "Relyce Infotech lists Jane Doe as its chief executive officer.";
+
+    expect(requestedFactCoverage(question, profile).requestedPredicate).toEqual({
+      predicate: "CEO",
+      present: false,
+    });
+    expect(requestedFactCoverage(question, genericLeadership).requestedPredicate?.present).toBe(
+      false,
+    );
+    expect(classifyEvidenceStatus(question, [profile])).toBe("GENERIC_SUPPORT");
+    expect(classifyEvidenceStatus(question, [explicitRole])).toBe("SUPPORTED_EVIDENCE");
+  });
+
+  it("requires the requested entity and predicate in the same evidence statement", () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const requirement = extractRequestedPredicate(question)!;
+    const unrelatedCeo = "Sudip Singh is the CEO and MD of ITC Infotech.";
+
+    expect(requestedPredicatePresent(unrelatedCeo, requirement)).toBe(false);
+    expect(
+      requestedPredicatePresent(
+        ["Relyce Infotech provides software services.", unrelatedCeo],
+        requirement,
+      ),
+    ).toBe(false);
+    expect(
+      requestedPredicatePresent(
+        "Relyce Infotech is a software company. Sudip Singh is its CEO at ITC Infotech.",
+        requirement,
+      ),
+    ).toBe(false);
+    expect(
+      requestedPredicatePresent(
+        "Jane Doe is the chief executive officer of Relyce Infotech.",
+        requirement,
+      ),
+    ).toBe(true);
+  });
+
+  it("does not combine entity relevance from one source with a predicate from another", () => {
+    const coverage = requestedFactCoverage("Who is the CEO of Relyce Infotech?", [
+      "Relyce Infotech is an IT services company.",
+      "Sudip Singh is the CEO and MD of ITC Infotech.",
+    ]);
+
+    expect(coverage.requestedPredicate).toEqual({ predicate: "CEO", present: false });
+    expect(
+      classifyEvidenceStatus("Who is the CEO of Relyce Infotech?", [
+        "Relyce Infotech is an IT services company.",
+        "Sudip Singh is the CEO and MD of ITC Infotech.",
+      ]),
+    ).toBe("GENERIC_SUPPORT");
   });
 });

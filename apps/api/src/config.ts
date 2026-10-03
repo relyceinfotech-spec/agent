@@ -85,6 +85,8 @@ const schema = z.object({
   MAX_USER_RESEARCH_PER_WINDOW: z.coerce.number().int().positive().max(10000).default(20),
   MAX_USER_DEEP_RESEARCH_PER_WINDOW: z.coerce.number().int().positive().max(10000).default(3),
   MAX_USER_FOLLOWUPS_PER_WINDOW: z.coerce.number().int().positive().max(10000).default(5),
+  CHAT_CONTEXT_MAX_MESSAGES: z.coerce.number().int().positive().max(20).default(12),
+  CHAT_CONTEXT_MAX_CHARS: z.coerce.number().int().positive().max(12000).default(8000),
   USER_QUOTA_WINDOW_SECONDS: z.coerce.number().int().min(60).max(604800).default(86400),
   MAX_DEFAULT_QUOTA_PLAN: z.string().min(1).default("default"),
   MAX_QUOTA_PLANS_JSON: z.string().default(""),
@@ -96,9 +98,9 @@ const schema = z.object({
   MAX_TOPIC_MAX_AGE_DAYS: z.coerce.number().int().positive().default(14),
   AUTONOMOUS_SCHEDULER_ENABLED: z
     .enum(["true", "false"])
-    .default("false")
+    .default("true")
     .transform((value) => value === "true"),
-  AUTONOMOUS_INTERVAL_MINUTES: z.coerce.number().int().positive().default(720),
+  AUTONOMOUS_INTERVAL_MINUTES: z.coerce.number().int().positive().default(60),
   MAX_ADMIN_TOKEN: z.string().optional(),
   OPENROUTER_API_KEY: z.string().optional(),
   OPENROUTER_MODEL: z.string().default("qwen/qwen3.7-flash"),

@@ -4,7 +4,7 @@ import type { Claim, Source } from "./domain.js";
 import type { QualityGateResult, ResearchPost, TopicCandidate } from "./content-domain.js";
 import { extractKnownEntities, subjectEntityMismatchReason } from "./entities.js";
 import { bindVerifiedEndOfLifeClaimToSource } from "./research-chat-fact-gate.js";
-import { requestedFactCoverage } from "./requested-facts.js";
+import { hasCompleteRequestedFactCoverage, requestedFactCoverage } from "./requested-facts.js";
 import { canonicalizeUrl } from "./security.js";
 
 interface PublishableClaim {
@@ -170,7 +170,7 @@ function sourceSupportsPublishableClaim(
     latestnessVersion: latestnessAssessment?.latestVersion,
     officialSourcesRequired,
   });
-  return coverage.missing.length === 0;
+  return hasCompleteRequestedFactCoverage(coverage);
 }
 
 function usefulSources(session: ResearchSession): Source[] {

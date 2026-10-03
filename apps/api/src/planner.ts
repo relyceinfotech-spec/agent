@@ -18,6 +18,8 @@ import { containsExactEntity, knownEntities, subjectEntityMismatchReason } from 
 import {
   buildRequestedFactRequirements,
   extractRequestedFacts,
+  extractRequestedPredicate,
+  requestedPredicatePresent,
   requestedFactCoverage,
   type RequestedFactKind,
 } from "./requested-facts.js";
@@ -170,7 +172,7 @@ function heuristicUnderstanding(
   }
   normalizedQuestion = normalizedQuestion.replace(/\s+/g, " ").trim();
   const lower = normalizedQuestion.toLowerCase();
-  const entities = unique(
+  let entities = unique(
     knownEntities.filter((entity) => {
       const pattern = new RegExp(
         `(^|[^a-zA-Z0-9])${entity.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-zA-Z0-9]|$)`,
@@ -187,15 +189,23 @@ function heuristicUnderstanding(
   }
   const compare = /\b(vs|versus|compare|comparison|difference|better|faster|best)\b/i.test(lower);
   const requestedFacts = extractRequestedFacts(normalizedQuestion, options);
+  const requestedPredicate = extractRequestedPredicate(question);
+  if (
+    requestedPredicate?.entity &&
+    !entities.some((entity) => containsExactEntity(requestedPredicate.entity, entity))
+  ) {
+    entities = unique([...entities, requestedPredicate.entity]);
+  }
   const focusedLifecycleLookup =
     options.includeSupportLifecycle === true &&
     requestedFacts.length === 1 &&
     requestedFacts[0] === "end-of-life date" &&
     !compare;
-  const formatPreference = focusedLifecycleLookup
-    ? "lookup"
-    : detectFormatPreference(question, mode);
-  const preciseFactRequest = requestedFacts.length > 0 && !compare;
+  const formatPreference =
+    focusedLifecycleLookup || requestedPredicate
+      ? "lookup"
+      : detectFormatPreference(question, mode);
+  const preciseFactRequest = (requestedFacts.length > 0 || !!requestedPredicate) && !compare;
   const inferredIntent = compare
     ? lower.includes("best")
       ? "Evaluate options against decision criteria"
@@ -302,6 +312,7 @@ function heuristicUnderstanding(
     sourceRequirements: {
       officialSources: officialSourceRequirement(normalizedQuestion),
     },
+    ...(requestedPredicate ? { requestedPredicate } : {}),
   };
 }
 
@@ -370,6 +381,8 @@ export async function understandQuery(
             : undefined,
         language: parsed.language ?? fallback.language,
         formatPreference: parsed.formatPreference ?? fallback.formatPreference,
+        // The model may normalize wording, but cannot broaden a precise fact relation.
+        requestedPredicate: fallback.requestedPredicate,
         // Source authority is derived from the user's wording, not delegated to the model.
         sourceRequirements: fallback.sourceRequirements,
       };
@@ -397,6 +410,21 @@ function buildHeuristicGroups(
           : interpretation.normalizedQuestion;
   const comparison =
     interpretation.formatPreference === "comparison" || interpretation.entities.length >= 2;
+  if (interpretation.requestedPredicate && !comparison) {
+    const requirement = interpretation.requestedPredicate;
+    const sourceTerms =
+      interpretation.sourceRequirements?.officialSources === "required"
+        ? "official primary source"
+        : interpretation.sourceRequirements?.officialSources === "preferred"
+          ? "primary source"
+          : "source";
+    return [
+      {
+        category: "DIRECT",
+        queries: [`${requirement.entity} ${requirement.predicate} ${sourceTerms}`],
+      },
+    ];
+  }
   if (requestedFacts.includes("end-of-life date") && !comparison) {
     const versionedSubject = requestedLifecycleSubject(interpretation);
     return [
@@ -495,11 +523,17 @@ export function preserveQueryRequirements(
 ): string {
   const question = interpretation.normalizedQuestion;
   const qualifiers = queryQualifiers(question);
+  const requestedPredicate = interpretation.requestedPredicate;
   const dimensions =
     question.match(
       /\b(?:pricing|price|cost|performance|latency|throughput|memory|release date|end.of.life|support lifecycle)\b/gi,
     ) ?? [];
-  const missing = [...qualifiers, ...(includeDimensions ? dimensions : [])].filter(
+  const requiredTerms = [
+    ...(requestedPredicate ? [requestedPredicate.entity, requestedPredicate.predicate] : []),
+    ...qualifiers,
+    ...(includeDimensions ? dimensions : []),
+  ];
+  const missing = requiredTerms.filter(
     (term) => !candidate.toLowerCase().includes(term.toLowerCase()),
   );
   return unique([candidate, ...missing]).join(" ");
@@ -542,6 +576,13 @@ const genericQueryWords = new Set([
 ]);
 
 function queryMatchesTopic(queryText: string, interpretation: QueryInterpretation): boolean {
+  if (
+    interpretation.requestedPredicate &&
+    (!containsExactEntity(queryText, interpretation.requestedPredicate.entity) ||
+      !requestedPredicatePresent(queryText, interpretation.requestedPredicate))
+  ) {
+    return false;
+  }
   if (interpretation.entities.some((entity) => !containsExactEntity(queryText, entity)))
     return false;
   if (querySubjectMismatchReason(interpretation.normalizedQuestion, queryText)) return false;
@@ -554,7 +595,17 @@ function queryMatchesTopic(queryText: string, interpretation: QueryInterpretatio
 }
 
 /** A small planned query for fast current-information lookups, never the raw prompt. */
-export function planFastLookupQuery(interpretation: QueryInterpretation): string {
+export function planFastLookupQuery(
+  interpretation: QueryInterpretation,
+  originalQuestion = interpretation.normalizedQuestion,
+): string {
+  const requestedPredicate =
+    interpretation.requestedPredicate ?? extractRequestedPredicate(originalQuestion);
+  if (requestedPredicate) {
+    const official =
+      interpretation.sourceRequirements?.officialSources === "required" ? " official source" : "";
+    return `${requestedPredicate.entity} ${requestedPredicate.predicate}${official} evidence`.trim();
+  }
   const subject = interpretation.normalizedQuestion
     .replace(/^(?:what(?:'s| is)?|which|when|who|how|tell me|find out)\s+/i, "")
     .replace(/\b(?:the|is|are)\b/gi, " ")
@@ -590,6 +641,17 @@ export async function buildPlan(
     ? await understandQuery(question, llm, mode, { includeSupportLifecycle: true })
     : (existingInterpretation ??
       (await understandQuery(question, llm, mode, { allowModel: !comparison })));
+  const requestedPredicate = extractRequestedPredicate(question);
+  if (requestedPredicate) {
+    interpretation = {
+      ...interpretation,
+      requestedPredicate,
+      entities: unique([...interpretation.entities, requestedPredicate.entity]),
+      topic:
+        interpretation.topic === "general topic" ? requestedPredicate.entity : interpretation.topic,
+      formatPreference: comparison ? interpretation.formatPreference : "lookup",
+    };
+  }
   const requestedFactRequirements = buildRequestedFactRequirements(requestedFacts);
   if (comparison)
     interpretation = {
@@ -919,6 +981,22 @@ export function generateStructuredObjectives(
     return objectives;
   }
 
+  if (interpretation.requestedPredicate && !isComparison) {
+    const { entity, predicate } = interpretation.requestedPredicate;
+    return [
+      {
+        id: "obj-requested-predicate",
+        label: `Verify the requested ${predicate} fact for ${entity}`,
+        category: "requested_predicate",
+        importance: "critical",
+        status: "pending",
+        evidenceIds: [],
+        sourceIds: [],
+        coverage: 0,
+      },
+    ];
+  }
+
   if (isLookup) {
     return [
       {
@@ -1031,6 +1109,30 @@ export async function rewriteQueries(
         : "technical sources";
     const candidate = preserveQueryRequirements(
       `${comparison.targets.join(" vs ")} ${dimensions.join(" ")} comparative measurements evidence ${sourceConstraint}`,
+      plan.interpretation,
+      false,
+    );
+    return !existing.has(candidate.toLowerCase()) ? [candidate] : [];
+  }
+  if (
+    recoveryRequirements?.requestedPredicate &&
+    !recoveryRequirements.requestedPredicate.resolved
+  ) {
+    const requirement = recoveryRequirements.requestedPredicate.requirement;
+    const alternate = requirement.aliases.find(
+      (alias) =>
+        !plan.queries.some((queryText) =>
+          requestedPredicatePresent(queryText, { ...requirement, aliases: [alias] }),
+        ),
+    );
+    const sourceCue =
+      plan.interpretation.sourceRequirements?.officialSources === "required"
+        ? "official primary source"
+        : plan.interpretation.sourceRequirements?.officialSources === "preferred"
+          ? "primary source"
+          : "source";
+    const candidate = preserveQueryRequirements(
+      `${requirement.entity} ${alternate ?? requirement.predicate} ${sourceCue} evidence`,
       plan.interpretation,
       false,
     );
@@ -1301,6 +1403,15 @@ export function validateRecoveryQuery(
       reasons.push(`recovery query omitted requested entity: ${entity}`);
     }
   }
+  const requestedPredicate = plan.interpretation.requestedPredicate;
+  if (requestedPredicate) {
+    if (!containsExactEntity(query, requestedPredicate.entity)) {
+      reasons.push("recovery query omitted the requested fact entity");
+    }
+    if (!requestedPredicatePresent(query, requestedPredicate)) {
+      reasons.push("recovery query omitted the requested factual predicate");
+    }
+  }
   if (plan.requestedFacts.includes("end-of-life date")) {
     const lifecycleSubject = requestedLifecycleSubject(plan.interpretation);
     const entity = plan.interpretation.entities[0] ?? "";
@@ -1366,7 +1477,13 @@ export function validateRecoveryQuery(
     reasons.push("recovery query omitted the required official/primary-source constraint");
   }
 
-  if ((requirements?.unresolvedFacts.length ?? 0) === 0 && missingObjectives.length > 0) {
+  const unresolvedPredicate =
+    requirements?.requestedPredicate && !requirements.requestedPredicate.resolved;
+  if (
+    (requirements?.unresolvedFacts.length ?? 0) === 0 &&
+    !unresolvedPredicate &&
+    missingObjectives.length > 0
+  ) {
     const objective = prioritizeObjectives(missingObjectives)[0]!;
     const categoryTerms = objectiveRecoveryTerms[objective.category]
       ?.split(/\s+/)

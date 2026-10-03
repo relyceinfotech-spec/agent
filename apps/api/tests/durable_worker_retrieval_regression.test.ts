@@ -396,7 +396,7 @@ describe("durable worker version/date retrieval regression", () => {
     ).toContain("latestness remains unresolved");
     expect(session.searchRecoveries).toEqual([
       expect.objectContaining({
-        missingRequestedFacts: ["latestness"],
+        missingRequestedFacts: [expect.stringContaining("requested latest/stable status")],
         officialSourceRequirement: "required",
         queries: [searchQueries[1]],
         requirements: expect.objectContaining({
