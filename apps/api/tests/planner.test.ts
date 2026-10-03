@@ -119,8 +119,8 @@ describe("query understanding and planning", () => {
     ).toBe(true);
     expect(plan.queries.slice(0, 3)).toEqual([
       expect.stringContaining("React Native vs Flutter"),
-      "React Native official performance documentation",
-      "Flutter official performance documentation",
+      "React Native official performance documentation 2026",
+      "Flutter official performance documentation 2026",
     ]);
   });
 

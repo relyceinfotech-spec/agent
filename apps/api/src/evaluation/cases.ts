@@ -70,12 +70,12 @@ export const agentEvaluationCases: AgentEvaluationCase[] = [
   {
     name: "supabase_firebase_comparison",
     prompt: "Compare Supabase and Firebase for my startup.",
-    expect: { route: "web" },
+    expect: { route: "direct" },
   },
   {
     name: "react_native_flutter_comparison",
     prompt: "Compare React Native vs Flutter for a startup.",
-    expect: { route: "web" },
+    expect: { route: "direct" },
   },
   {
     name: "best_backend_language",
@@ -122,7 +122,7 @@ export const agentEvaluationCases: AgentEvaluationCase[] = [
   {
     name: "messy_javascript_python_ai_input",
     prompt: "is java script faster than pyton for ai",
-    expect: { route: "web" },
+    expect: { route: "direct" },
   },
   {
     name: "performance_benchmark_request",

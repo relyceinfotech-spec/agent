@@ -1,5 +1,64 @@
 import { z } from "zod";
 
+export const DEFAULT_TOPIC_FEEDS = [
+  "https://github.blog/feed/",
+  "https://blog.cloudflare.com/rss/",
+  "https://techcrunch.com/feed/",
+  "https://www.theverge.com/rss/index.xml",
+  "https://www.engadget.com/rss.xml",
+  "https://feeds.arstechnica.com/arstechnica/index",
+  "https://feeds.venturebeat.com/VentureBeat",
+  "https://feeds.arstechnica.com/arstechnica/technology-lab",
+  "https://feeds.arstechnica.com/arstechnica/gadgets",
+  "https://electrek.co/feed/",
+  "https://feeds.arstechnica.com/arstechnica/cars",
+  "https://www.supplychaindive.com/feeds/news/",
+  "https://www.freightwaves.com/feed",
+  "https://www.retaildive.com/feeds/news/",
+  "https://www.marketingdive.com/feeds/news/",
+  "https://www.bleepingcomputer.com/feed/",
+  "https://krebsonsecurity.com/feed/",
+  "https://www.cybersecuritydive.com/feeds/news/",
+  "https://www.utilitydive.com/feeds/news/",
+  "https://www.energy.gov/listings/energy-news?view=rss",
+  "https://www.sebi.gov.in/sebirss.xml",
+  "https://rbi.org.in/pressreleases_rss.xml",
+  "https://rbi.org.in/notifications_rss.xml",
+  "https://www.sec.gov/news/pressreleases.rss",
+  "https://www.ftc.gov/feeds/press-release.xml",
+  "https://www.ftc.gov/feeds/press-release-competition.xml",
+  "https://www.cpsc.gov/Newsroom/CPSC-RSS-Feed/Recalls-RSS",
+  "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/medwatch/rss.xml",
+];
+
+export const DEFAULT_TOPIC_ALLOWED_DOMAINS = [
+  "github.blog",
+  "blog.cloudflare.com",
+  "react.dev",
+  "nodejs.org",
+  "techcrunch.com",
+  "theverge.com",
+  "engadget.com",
+  "arstechnica.com",
+  "venturebeat.com",
+  "electrek.co",
+  "supplychaindive.com",
+  "freightwaves.com",
+  "retaildive.com",
+  "marketingdive.com",
+  "bleepingcomputer.com",
+  "krebsonsecurity.com",
+  "cybersecuritydive.com",
+  "utilitydive.com",
+  "energy.gov",
+  "sebi.gov.in",
+  "rbi.org.in",
+  "sec.gov",
+  "ftc.gov",
+  "cpsc.gov",
+  "fda.gov",
+];
+
 const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().int().positive().default(8000),
@@ -32,10 +91,8 @@ const schema = z.object({
   MAX_USER_PLAN_OVERRIDES_JSON: z.string().default(""),
   BROWSER_EXECUTABLE_PATH: z.string().optional(),
   BROWSER_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
-  MAX_TOPIC_FEEDS: z.string().default("https://github.blog/feed/,https://blog.cloudflare.com/rss/"),
-  MAX_TOPIC_ALLOWED_DOMAINS: z
-    .string()
-    .default("github.blog,blog.cloudflare.com,react.dev,nodejs.org"),
+  MAX_TOPIC_FEEDS: z.string().default(DEFAULT_TOPIC_FEEDS.join(",")),
+  MAX_TOPIC_ALLOWED_DOMAINS: z.string().default(DEFAULT_TOPIC_ALLOWED_DOMAINS.join(",")),
   MAX_TOPIC_MAX_AGE_DAYS: z.coerce.number().int().positive().default(14),
   AUTONOMOUS_SCHEDULER_ENABLED: z
     .enum(["true", "false"])

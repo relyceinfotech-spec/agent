@@ -92,7 +92,9 @@ function extractStatements(answer: string): AnswerStatement[] {
     for (const fragment of fragments) {
       const text = stripMarkdown(fragment);
       if (!text || text.length < 8) continue;
-      const citationNumbers = [...fragment.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1]));
+      const citationNumbers = [
+        ...new Set([...fragment.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1]))),
+      ];
       statements.push({
         id: `answer-${statements.length + 1}`,
         text,

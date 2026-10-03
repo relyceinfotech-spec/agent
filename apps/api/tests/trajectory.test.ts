@@ -75,7 +75,7 @@ function createResearchRegistry(options: HarnessOptions) {
     execute: async (input) => ({
       title: "Extracted source",
       content:
-        "This sufficiently long evidence sentence describes the source findings for the requested comparison and provides enough context for verification.",
+        "React Native and Flutter performance benchmarks describe the source findings for the requested comparison and provide enough context for verification.",
       url: (input as { url: string }).url,
     }),
   });

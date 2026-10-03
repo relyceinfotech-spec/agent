@@ -70,6 +70,64 @@ describe("autonomous publication quality gate", () => {
     expect(result.status).toBe("REQUIRES_RESEARCH");
   });
 
+  it("does not treat a metadata-only source as publishable article evidence", () => {
+    const session = research("A fully written answer with enough length for review purposes.");
+    session.sources[0]!.contentOrigin = "metadata";
+
+    const result = evaluatePostQuality(topic, session, []);
+
+    expect(result.usefulSources).toBe(1);
+    expect(result.status).toBe("REQUIRES_RESEARCH");
+    expect(postFromResearch(topic, session).claims.map((claim) => claim.id)).not.toContain(
+      "claim-1",
+    );
+  });
+
+  it("rejects a topic with a malformed publication date at the quality gate", () => {
+    const malformedTopic = { ...topic, publishedAt: "not-a-real-date" };
+
+    const result = evaluatePostQuality(
+      malformedTopic,
+      research("A complete and supported research answer."),
+      [],
+    );
+
+    expect(result.status).toBe("REQUIRES_RESEARCH");
+    expect(result.reasons).toContain("Topic is no longer fresh enough for autonomous publication");
+  });
+
+  it("omits superseded current claims while retaining supported historical claims", () => {
+    const session = research("A verified release history with current and historical details.");
+    const oldRelease =
+      "React 18.2.0 is the latest stable release. This historical passage preserves the old release assertion as provenance for the research record.";
+    const historical =
+      "React 18.2.0 introduced the documented rendering behavior in the earlier release. This passage describes a historical change without presenting it as current.";
+    session.sources[0]!.content = oldRelease;
+    session.sources[1]!.content = historical;
+    session.claims[0] = {
+      ...session.claims[0]!,
+      text: "React 18.2.0 is the latest stable release.",
+      evidence: oldRelease,
+      latestnessDisposition: {
+        status: "superseded",
+        entity: "React",
+        acceptedVersion: "19.3.0",
+      },
+    };
+    session.claims[1] = {
+      ...session.claims[1]!,
+      text: "React 18.2.0 introduced the documented rendering behavior in the earlier release.",
+      evidence: historical,
+    };
+
+    const result = evaluatePostQuality(topic, session, []);
+    const publishedClaims = postFromResearch(topic, session).claims;
+
+    expect(result.status).not.toBe("READY_TO_PUBLISH");
+    expect(publishedClaims.map((claim) => claim.id)).toEqual(["claim-2"]);
+    expect(publishedClaims[0]?.text).toContain("earlier release");
+  });
+
   it.each([
     "Research collected evidence but cannot present it as sufficiently verified: objective coverage is low.",
     "OpenRouter is not configured, so automated synthesis is unavailable. MAX collected claims and sources.",

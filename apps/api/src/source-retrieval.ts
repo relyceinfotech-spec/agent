@@ -18,6 +18,12 @@ import {
   subjectEntityMismatchReason,
 } from "./entities.js";
 import { requestedFactCoverage } from "./requested-facts.js";
+import { querySubjectMismatchReason } from "./query-relevance.js";
+import {
+  comparisonObjective,
+  comparisonEvidencePassages,
+  comparisonClaimHasTargetFinding,
+} from "./comparison-evidence.js";
 import { classifyFirstPartyGitHubSource } from "./rank.js";
 import { parseOfficialReleaseHistorySource } from "./release-history.js";
 import {
@@ -146,6 +152,7 @@ export function assessSerperSnippet(
   result: Pick<SearchResult, "title" | "snippet">,
   question: string,
   requestedFacts?: RequestedFactKind[],
+  options: { fullDocument?: boolean } = {},
 ): SnippetSufficiencyAssessment {
   const snippet = result.snippet.trim();
   if (snippet.length < 40) {
@@ -153,7 +160,10 @@ export function assessSerperSnippet(
   }
   const entityMismatch = subjectEntityMismatchReason(question, `${result.title} ${snippet}`);
   if (entityMismatch) return { sufficient: false, reason: entityMismatch };
+  const subjectMismatch = querySubjectMismatchReason(question, snippet);
+  if (subjectMismatch) return { sufficient: false, reason: subjectMismatch };
   if (
+    !options.fullDocument &&
     /\b(compare|comparison|versus|\bvs\b|deep research|comprehensive|in depth)\b/i.test(question)
   ) {
     return {
@@ -267,9 +277,22 @@ function missingRequestedFactsForDocument(
   document: ExtractedDocument,
   requestedFacts?: RequestedFactKind[],
   researchChatOptimization = false,
-): RequestedFactKind[] {
-  if (!researchChatOptimization || !requestedFacts?.length) return [];
-  return requestedFactCoverage(question, document.content, { requestedFacts }).missing;
+): string[] {
+  if (!researchChatOptimization) return [];
+  const missing = requestedFacts?.length
+    ? requestedFactCoverage(question, document.content, { requestedFacts }).missing
+    : [];
+  const comparison = comparisonObjective(question);
+  if (
+    comparison &&
+    !comparisonEvidencePassages(comparison, document.content).some(
+      (passage) =>
+        !querySubjectMismatchReason(question, passage) &&
+        comparisonClaimHasTargetFinding(comparison, passage),
+    )
+  )
+    return [...missing, "a source-linked comparison finding"];
+  return missing;
 }
 
 function appendLifecycleTableEvidence(
@@ -490,6 +513,7 @@ function structuredDocumentFromHtml(raw: string, url: URL): ExtractedDocument | 
       content: description,
       headings: [],
       contentType: "structured",
+      contentOrigin: "metadata",
     };
   }
   const author =
@@ -511,6 +535,7 @@ function structuredDocumentFromHtml(raw: string, url: URL): ExtractedDocument | 
     content,
     headings: [],
     contentType: "structured",
+    ...(articleBody ? {} : { contentOrigin: "metadata" as const }),
   };
   try {
     validateExtraction(document);

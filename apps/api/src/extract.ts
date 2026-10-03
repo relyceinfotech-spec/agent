@@ -11,6 +11,7 @@ export interface ExtractedDocument {
   content: string;
   headings: string[];
   contentType?: "html" | "rss" | "pdf" | "structured";
+  contentOrigin?: "metadata";
 }
 
 export function extractRetrievedDocument(
@@ -49,13 +50,43 @@ export function extractHtml(html: string, url: URL): ExtractedDocument {
     .get()
     .filter(Boolean)
     .slice(0, 50);
-  const paragraphSelector = "p,h1,h2,h3,h4,blockquote";
+  const paragraphSelector = "p,h1,h2,h3,h4,h5,h6,blockquote,li,table";
   const paragraphsIn = (element: typeof $ extends (input: infer T) => unknown ? T : never) =>
     $(element)
       .find(paragraphSelector)
       .toArray()
-      .map((paragraph) => $(paragraph).text().replace(/\s+/g, " ").trim())
-      .filter((paragraph) => paragraph.length >= 30 && paragraph.length <= 3000);
+      .filter((paragraph) => !$(paragraph).parents("table").length)
+      .flatMap((paragraph) => {
+        const tag = paragraph.tagName.toLowerCase();
+        const text = $(paragraph).text().replace(/\s+/g, " ").trim();
+        if (/^h[1-6]$/.test(tag))
+          return text && text.length <= 300 ? [`${"#".repeat(Number(tag[1]))} ${text}`] : [];
+        if (tag === "table") {
+          const rows = $(paragraph).find("tr").toArray();
+          const header = rows[0];
+          if (!header || !$(header).children("th").length) return [];
+          if ($(paragraph).find('[rowspan]:not([rowspan="1"]),[colspan]:not([colspan="1"])').length)
+            return [];
+          const headers = $(header)
+            .children("th,td")
+            .toArray()
+            .map((cell) => $(cell).text().replace(/\s+/g, " ").trim());
+          if (headers.length < 2 || headers.some((label) => !label)) return [];
+          return rows.slice(1).flatMap((row) => {
+            const cells = $(row)
+              .children("th,td")
+              .toArray()
+              .map((cell) => $(cell).text().replace(/\s+/g, " ").trim());
+            if (cells.length !== headers.length || cells.some((cell) => !cell)) return [];
+            const record = `Table row: ${headers.map((label, index) => `${label}: ${cells[index]}`).join("; ")}`;
+            return record.length <= 3000 ? [record] : [];
+          });
+        }
+        // Leaf list items retain their own text without duplicating nested lists
+        // or a paragraph that is separately selected from the same item.
+        if (tag === "li" && $(paragraph).find("li,p").length) return [];
+        return text.length >= 30 && text.length <= 3000 ? [tag === "li" ? `- ${text}` : text] : [];
+      });
   const contentScore = (element: typeof $ extends (input: infer T) => unknown ? T : never) =>
     paragraphsIn(element).reduce((total, paragraph) => total + paragraph.length, 0);
   const explicitRoots = $(
@@ -72,7 +103,9 @@ export function extractHtml(html: string, url: URL): ExtractedDocument {
   const articleRoot = articleRoots.find((element) => contentScore(element) >= 120);
   const root = explicitRoot ?? articleRoot ?? mainRoot ?? bodyRoot;
   const paragraphs = root ? paragraphsIn(root) : [];
-  const distinctParagraphs = [...new Set(paragraphs)];
+  // Identical findings may belong to different sections; global deduplication
+  // would discard the second section's source context.
+  const distinctParagraphs = paragraphs;
   const content =
     distinctParagraphs.join("\n\n").length >= 120
       ? distinctParagraphs.join("\n\n")

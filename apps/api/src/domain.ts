@@ -63,6 +63,7 @@ export interface Source extends SearchResult {
   releaseHistoryComplete?: boolean;
   retrievalSourceUrl?: string;
   content?: string;
+  contentOrigin?: "metadata";
   fetchedAt?: string;
   quality: {
     relevance: number;
@@ -106,6 +107,19 @@ export interface SourceSelectionDecision {
   subjectMismatchReason?: string;
   taskEvidence?: Source["taskEvidence"];
   quality: Source["quality"];
+  acquisition?: {
+    score: number;
+    targetLeads: string[];
+    targetMentions: string[];
+    independentDomain: boolean;
+  };
+  retrieval?: {
+    status: "success" | "failed" | "unusable";
+    category?: string;
+    httpStatus?: number;
+    message?: string;
+    replacementUrl?: string;
+  };
 }
 
 export type ObjectiveStatus = "pending" | "investigating" | "fulfilled" | "partial" | "blocked";
@@ -131,6 +145,9 @@ export interface ResearchObjective {
 }
 
 export interface ResearchState {
+  comparisonCoverage?: ComparisonCoverage;
+  comparisonOutcome?: "sufficient" | "relevant_but_insufficient" | "no_relevant_evidence";
+  providerMetrics?: Record<string, import("./llm.js").LLMMetrics>;
   objectives: ResearchObjective[];
   completedObjectives: string[];
   missingObjectives: string[];
@@ -291,6 +308,7 @@ export interface LatestnessAssessment {
 
 export interface Claim {
   id: string;
+  provenance?: { sessionId: string; jobId?: string; question: string };
   text: string;
   sourceIds: string[];
   evidence: string;
@@ -298,6 +316,15 @@ export interface Claim {
   importance?: ClaimImportance;
   objectiveId?: string;
   requestedFacts?: RequestedFactKind[];
+  /**
+   * Cross-source latestness reconciliation, separate from whether this source
+   * supports the claim. Superseded claims remain in the ledger for provenance.
+   */
+  latestnessDisposition?: {
+    status: "superseded";
+    entity: string;
+    acceptedVersion: string;
+  };
   verification?: {
     verdict: "supported" | "contradicted" | "uncertain" | "unavailable";
     rationale?: string;
@@ -319,6 +346,7 @@ export interface LanguageProfile {
 export type ResponseFormatPreference = "direct" | "lookup" | "comparison" | "research" | "code";
 
 export interface QueryInterpretation {
+  comparison?: ComparisonObjective;
   normalizedQuestion: string;
   intent: string;
   entities: string[];
@@ -335,6 +363,17 @@ export interface QueryInterpretation {
   sourceRequirements?: {
     officialSources: OfficialSourceRequirement;
   };
+}
+
+export interface ComparisonObjective {
+  targets: string[];
+  dimensions: string[];
+}
+export interface ComparisonCoverage extends ComparisonObjective {
+  performanceDimensions?: { observed: string[]; shared: string[] };
+  cells: Array<{ target: string; dimension: string; claimIds: string[]; sourceIds: string[] }>;
+  missing: Array<{ target: string; dimension: string }>;
+  sufficient: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -427,6 +466,7 @@ export interface ResearchPlan {
 }
 
 export interface ResearchRecoveryRequirements {
+  comparison?: ComparisonCoverage;
   requestedFacts: RequestedFactKind[];
   resolvedFacts: RequestedFactKind[];
   unresolvedFacts: RequestedFactKind[];
@@ -489,6 +529,13 @@ export interface ResearchSession {
     durationMs: number;
     error?: string;
     errorCode?: string;
+    stage?: "SEARCH_PROVIDER";
+    attemptNumber?: number;
+    startedAt?: string;
+    httpStatus?: number;
+    failureType?:
+      "timeout" | "network" | "http" | "malformed_response" | "configuration" | "provider";
+    transportCode?: string;
   }>;
 }
 export interface ResearchStep {

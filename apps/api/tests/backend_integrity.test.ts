@@ -38,6 +38,19 @@ async function waitFor(predicate: () => Promise<boolean>) {
 }
 
 describe("backend integrity regressions", () => {
+  it("honors the Post Agent durable-attempt cap supplied by an isolated acceptance harness", async () => {
+    const store = new SqliteSessionStore(":memory:");
+    const app = await createServer({ store, postAgentMaxAttempts: 1 });
+    try {
+      const run = await getServerBackgroundServices(app).contentAgent.trigger();
+      const job = await getServerBackgroundServices(app).jobStore.getJob(run.id);
+
+      expect(job).toMatchObject({ kind: "post_agent", attempts: 0, maxAttempts: 1 });
+    } finally {
+      await app.close();
+    }
+  });
+
   it("fences session writes after another worker takes the lease", async () => {
     const store = new SqliteSessionStore(":memory:");
     let now = Date.now();

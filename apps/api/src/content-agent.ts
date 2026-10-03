@@ -241,6 +241,7 @@ export class ContentAgent {
           this.feedUrls,
           this.fetchFeed,
           this.fallbackSearch,
+          signal,
         );
         run.events.push(
           ...discovery.failures.map((failure) => ({

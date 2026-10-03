@@ -2,6 +2,13 @@ import type { SearchResult } from "./domain.js";
 import { config } from "./config.js";
 import { canonicalizeUrl, readBoundedText, safeFetchWithRetry } from "./security.js";
 import type { KnowledgeStore } from "./store.js";
+import { querySubjectMismatchReason } from "./query-relevance.js";
+import {
+  failedSearchAttempt,
+  safeSearchMessage,
+  searchFailureDetails,
+  searchDiagnosticTrace,
+} from "./search-diagnostics.js";
 
 export type SearchFailureCode =
   | "MISSING_CREDENTIALS"
@@ -14,6 +21,7 @@ export type SearchFailureCode =
   | "CAPTCHA"
   | "UNSUPPORTED"
   | "NETWORK_ERROR"
+  | "MALFORMED_RESPONSE"
   | "SEARCH_PROVIDER_FAILURE";
 
 export interface SearchAttempt {
@@ -24,6 +32,13 @@ export interface SearchAttempt {
   durationMs: number;
   error?: string;
   errorCode?: SearchFailureCode;
+  stage?: "SEARCH_PROVIDER";
+  attemptNumber?: number;
+  startedAt?: string;
+  httpStatus?: number;
+  failureType?:
+    "timeout" | "network" | "http" | "malformed_response" | "configuration" | "provider";
+  transportCode?: string;
 }
 
 export interface SearchBatch {
@@ -41,26 +56,12 @@ export class SearchProviderError extends Error {
     readonly provider: string,
     readonly reason: string,
     readonly code?: SearchFailureCode,
+    readonly httpStatus?: number,
+    readonly cause?: unknown,
   ) {
     super(`${provider}: ${reason}`);
     this.name = "SearchProviderError";
   }
-}
-
-function classifySearchFailure(error: unknown): SearchFailureCode {
-  if (error instanceof SearchProviderError && error.code) return error.code;
-  const message = error instanceof Error ? error.message : String(error);
-  if (/SERPER_API_KEY.*not configured/i.test(message)) return "MISSING_CREDENTIALS";
-  if (/credits? exhausted|insufficient credits/i.test(message)) return "CREDITS_EXHAUSTED";
-  if (/401|invalid.*api.?key|unauthorized/i.test(message)) return "INVALID_CREDENTIALS";
-  if (/429|rate.?limit|too many requests/i.test(message)) return "RATE_LIMITED";
-  if (/abort|timed?\s*out|timeout/i.test(message)) return "PROVIDER_TIMEOUT";
-  if (/403|blocked|forbidden/i.test(message)) return "PROVIDER_BLOCKED";
-  if (/captcha|challenge/i.test(message)) return "CAPTCHA";
-  if (/unsupported/i.test(message)) return "UNSUPPORTED";
-  if (/fetch failed|network|ECONN|ENOTFOUND|EAI_AGAIN/i.test(message)) return "NETWORK_ERROR";
-  if (/HTTP 5\d\d|provider unavailable/i.test(message)) return "PROVIDER_UNAVAILABLE";
-  return "SEARCH_PROVIDER_FAILURE";
 }
 
 /** Google web discovery through Serper; MAX fetches and evaluates result pages itself. */
@@ -79,26 +80,39 @@ export class SerperProvider implements SearchProvider {
       );
     }
 
-    const { response, dispose } = await this.request(
-      "https://google.serper.dev/search",
-      {
-        method: "POST",
-        signal,
-        headers: {
-          accept: "application/json",
-          "content-type": "application/json",
-          "x-api-key": this.apiKey,
+    let fetched: Awaited<ReturnType<typeof this.request>>;
+    try {
+      fetched = await this.request(
+        "https://google.serper.dev/search",
+        {
+          method: "POST",
+          signal,
+          headers: {
+            accept: "application/json",
+            "content-type": "application/json",
+            "x-api-key": this.apiKey,
+          },
+          body: JSON.stringify({
+            q: query,
+            num: 10,
+            gl: config.SERPER_GL,
+            hl: config.SERPER_HL,
+          }),
         },
-        body: JSON.stringify({
-          q: query,
-          num: 10,
-          gl: config.SERPER_GL,
-          hl: config.SERPER_HL,
-        }),
-      },
-      0,
-      config.FETCH_TIMEOUT_MS,
-    );
+        0,
+        config.FETCH_TIMEOUT_MS,
+      );
+    } catch (error) {
+      const details = searchFailureDetails(error);
+      throw new SearchProviderError(
+        "serper",
+        safeSearchMessage(error, [this.apiKey]),
+        details.errorCode,
+        details.httpStatus,
+        error,
+      );
+    }
+    const { response, dispose } = fetched;
 
     try {
       if (!response.ok) {
@@ -112,12 +126,40 @@ export class SerperProvider implements SearchProvider {
                 : response.status >= 500
                   ? "PROVIDER_UNAVAILABLE"
                   : "SEARCH_PROVIDER_FAILURE";
-        throw new SearchProviderError("serper", `Serper returned HTTP ${response.status}`, code);
+        throw new SearchProviderError(
+          "serper",
+          `Serper returned HTTP ${response.status}`,
+          code,
+          response.status,
+        );
       }
 
-      const payload = JSON.parse(
-        await readBoundedText(response, 2_000_000, config.FETCH_TIMEOUT_MS),
-      ) as {
+      const body = await readBoundedText(response, 2_000_000, config.FETCH_TIMEOUT_MS);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        throw new SearchProviderError(
+          "serper",
+          "Serper returned malformed JSON",
+          "MALFORMED_RESPONSE",
+          response.status,
+        );
+      }
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        ("organic" in parsed && !Array.isArray(parsed.organic))
+      ) {
+        throw new SearchProviderError(
+          "serper",
+          "Serper returned a malformed search response",
+          "MALFORMED_RESPONSE",
+          response.status,
+        );
+      }
+      const payload = parsed as {
         organic?: Array<{
           title?: string;
           link?: string;
@@ -128,6 +170,20 @@ export class SerperProvider implements SearchProvider {
       };
       const discoveredAt = new Date().toISOString();
       return (payload.organic ?? []).slice(0, 10).flatMap((item) => {
+        if (
+          !item ||
+          typeof item !== "object" ||
+          (item.title !== undefined && typeof item.title !== "string") ||
+          (item.link !== undefined && typeof item.link !== "string") ||
+          (item.snippet !== undefined && typeof item.snippet !== "string")
+        ) {
+          throw new SearchProviderError(
+            "serper",
+            "Serper returned a malformed search result",
+            "MALFORMED_RESPONSE",
+            response.status,
+          );
+        }
         const title = item.title?.trim();
         if (!title || !item.link) return [];
         try {
@@ -158,7 +214,10 @@ export class SerperProvider implements SearchProvider {
       if (error instanceof SearchProviderError) throw error;
       throw new SearchProviderError(
         "serper",
-        error instanceof Error ? error.message : String(error),
+        safeSearchMessage(error, [this.apiKey]),
+        searchFailureDetails(error).errorCode,
+        response.status,
+        error,
       );
     } finally {
       await dispose();
@@ -175,15 +234,20 @@ export class InternalKnowledgeProvider implements SearchProvider {
 
   async search(query: string): Promise<SearchResult[]> {
     const documents = await this.knowledge.searchDocuments(query, this.maxAgeMs, 10);
-    return documents.map((document) => ({
-      title: document.title,
-      url: document.url,
-      snippet: document.content.slice(0, 800),
-      publishedAt: document.publishedAt,
-      provider: "internal-knowledge",
-      query,
-      discoveredAt: document.lastVerifiedAt,
-    }));
+    return documents
+      .filter(
+        (document) =>
+          !querySubjectMismatchReason(query, `${document.title} ${document.content.slice(0, 800)}`),
+      )
+      .map((document) => ({
+        title: document.title,
+        url: document.url,
+        snippet: document.content.slice(0, 800),
+        publishedAt: document.publishedAt,
+        provider: "internal-knowledge",
+        query,
+        discoveredAt: document.lastVerifiedAt,
+      }));
   }
 }
 
@@ -199,6 +263,7 @@ export class ResilientSearchProvider implements SearchProvider {
     for (const { name, provider } of this.providers) {
       if (signal?.aborted) break;
       const started = performance.now();
+      const startedAt = new Date().toISOString();
       try {
         const results = await provider.search(query, signal);
         let discardedResults = 0;
@@ -259,6 +324,8 @@ export class ResilientSearchProvider implements SearchProvider {
         }
         attempts.push({
           provider: name,
+          stage: "SEARCH_PROVIDER",
+          startedAt,
           query,
           status: unique.length ? "success" : "empty",
           resultCount: unique.length,
@@ -269,18 +336,10 @@ export class ResilientSearchProvider implements SearchProvider {
         });
         if (merged.size >= 8) break;
       } catch (error) {
-        attempts.push({
-          provider: name,
-          query,
-          status: "failed",
-          resultCount: 0,
-          durationMs: Math.round(performance.now() - started),
-          error: error instanceof Error ? error.message : String(error),
-          errorCode: classifySearchFailure(error),
-        });
+        attempts.push(failedSearchAttempt(name, query, error, started, startedAt));
       }
     }
-    return { results: [...merged.values()], attempts };
+    return { results: [...merged.values()], attempts: searchDiagnosticTrace(attempts) };
   }
 
   async search(query: string, signal?: AbortSignal): Promise<SearchResult[]> {

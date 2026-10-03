@@ -6,7 +6,12 @@ import { performance } from "node:perf_hooks";
 const PER_RESEARCH_TIMEOUT_MS = 120_000;
 const MODEL_REQUEST_TIMEOUT_MS = 60_000;
 const MAX_MODEL_DECISIONS = 3;
-const MAX_RESEARCH_STEPS = 12;
+const MAX_RESEARCH_STEPS = 8;
+const POST_AGENT_MAX_ATTEMPTS = 1;
+const RESEARCH_MAX_ATTEMPTS = 1;
+const TEST_USER_ID = "post-agent-e2e-user";
+const TEST_ACCESS_TOKEN = "post-agent-e2e-local-token";
+const TEST_AUTH_HEADERS = { authorization: `Bearer ${TEST_ACCESS_TOKEN}` };
 const QUESTION = "Discover one fresh GitHub blog topic, then research and publish it.";
 
 function message(error: unknown): string {
@@ -42,23 +47,43 @@ async function main() {
   process.env.POST_AGENT_MODEL_TIMEOUT_MS = String(MODEL_REQUEST_TIMEOUT_MS);
 
   const [
-    { createServer, app: moduleApp },
+    { createServer, app: moduleApp, getServerBackgroundServices },
     { createPostAgentLLMProviders, OpenRouterProvider },
     { ResilientSearchProvider, SerperProvider },
     { SqliteSessionStore },
+    { QuotaPolicy },
   ] = await Promise.all([
     import("../server.js"),
     import("../llm.js"),
     import("../search.js"),
     import("../store.js"),
+    import("../quota-policy.js"),
   ]);
 
   const llm = new OpenRouterProvider(MODEL_REQUEST_TIMEOUT_MS);
   const postAgentLLMProviders = createPostAgentLLMProviders();
   const search = new ResilientSearchProvider([{ name: "serper", provider: new SerperProvider() }]);
   const store = new SqliteSessionStore(":memory:");
+  const quotaPolicy = new QuotaPolicy(
+    JSON.stringify({
+      "post-agent-e2e": {
+        quotas: {
+          research: { limit: 1, windowSeconds: 3600 },
+          deep_research: { limit: 1, windowSeconds: 3600 },
+          followup: { limit: 1, windowSeconds: 3600 },
+        },
+        features: { research: true, deepResearch: true, postFollowUps: true },
+      },
+    }),
+    JSON.stringify({ [TEST_USER_ID]: "post-agent-e2e" }),
+  );
   const server = await createServer({
     store,
+    authVerifier: {
+      verifyAccessToken: async (token) =>
+        token === TEST_ACCESS_TOKEN ? { id: TEST_USER_ID } : undefined,
+    },
+    quotaPolicy,
     searchProvider: search,
     llmProvider: llm,
     postAgentLLMProviders,
@@ -72,6 +97,8 @@ async function main() {
       maxTimeMs: PER_RESEARCH_TIMEOUT_MS,
       maxModelDecisions: MAX_MODEL_DECISIONS,
     },
+    postAgentMaxAttempts: POST_AGENT_MAX_ATTEMPTS,
+    researchMaxAttempts: RESEARCH_MAX_ATTEMPTS,
     researchBudget: {
       maxSteps: MAX_RESEARCH_STEPS,
       maxQueries: 2,
@@ -83,10 +110,12 @@ async function main() {
       maxModelDecisions: MAX_MODEL_DECISIONS,
     },
   });
+  getServerBackgroundServices(server).worker.start();
   const startedAt = performance.now();
   const failures: Array<{ stage: string; reason: string }> = [];
   let run: import("../content-domain.js").AutonomousRun | undefined;
   let research: import("../domain.js").ResearchSession | undefined;
+  let followUpResearch: import("../domain.js").ResearchSession | undefined;
   let post: import("../content-domain.js").ResearchPost | undefined;
   let followUp: import("../content-domain.js").ResearchFollowUp | undefined;
   let discoverContainsPost = false;
@@ -95,6 +124,9 @@ async function main() {
   let followUpDurationMs = 0;
   let runId: string | undefined;
   let followUpId: string | undefined;
+  let postJob: import("../jobs.js").DurableJob | undefined;
+  let followUpJob: import("../jobs.js").DurableJob | undefined;
+  let currentStage = "post_run_enqueue";
 
   try {
     const runStart = performance.now();
@@ -109,6 +141,8 @@ async function main() {
     }
     const queuedRun = queued.json() as { id: string };
     runId = queuedRun.id;
+    const durableJobs = getServerBackgroundServices(server).jobStore;
+    currentStage = "post_run_wait";
     const runDeadline = Date.now() + PER_RESEARCH_TIMEOUT_MS + 35_000;
     while (Date.now() < runDeadline) {
       run = await store.getRun(queuedRun.id);
@@ -138,16 +172,34 @@ async function main() {
       }
       throw new Error("Post run exceeded the 155-second controller/evaluator deadline");
     }
+    currentStage = "post_run_api_readback";
     const runStatus = await server.inject({
       method: "GET",
       url: `/api/autonomous/runs/${run.id}`,
+      headers: { authorization: `Bearer ${process.env.MAX_ADMIN_TOKEN}` },
     });
     if (runStatus.statusCode !== 200)
       throw new Error("Terminal run was not visible through its API route");
+    const apiRun = runStatus.json() as import("../content-domain.js").AutonomousRun;
+    if (apiRun.id !== run.id || apiRun.status !== run.status)
+      throw new Error("Autonomous run API readback disagreed with persisted run state");
     if (run.researchId) {
-      const result = await server.inject({ method: "GET", url: `/api/research/${run.researchId}` });
-      if (result.statusCode === 200) research = result.json() as typeof research;
+      currentStage = "research_session_readback";
+      research = await store.get(run.researchId);
+      if (!research) throw new Error("Post Agent research session was not persisted");
     }
+    currentStage = "post_job_readback";
+    const jobDeadline = Date.now() + 10_000;
+    while (Date.now() < jobDeadline) {
+      postJob = await durableJobs.getJob(run.id);
+      if (postJob && ["completed", "failed", "cancelled"].includes(postJob.status)) break;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    }
+    if (!postJob || postJob.status !== "completed")
+      throw new Error(`Post Agent durable job ended in ${postJob?.status ?? "missing"}`);
+    if (postJob.attempts !== 1 || postJob.maxAttempts !== POST_AGENT_MAX_ATTEMPTS)
+      throw new Error("Post Agent live acceptance used more than one durable attempt");
+    currentStage = "post_terminal_validation";
     if (run.status !== "PUBLISHED" || !run.postId) {
       throw new Error(`Post run ended in ${run.status}: ${run.error ?? "no publication"}`);
     }
@@ -162,19 +214,29 @@ async function main() {
     if (detail.statusCode !== 200) throw new Error(`/api/posts/:id returned ${detail.statusCode}`);
     post = detail.json() as import("../content-domain.js").ResearchPost;
     detailVisible = true;
+    const publishedForTopic = (await store.listPublishedPosts(100)).filter(
+      (candidate) => candidate.topicId === run!.topicId,
+    );
+    if (publishedForTopic.length !== 1)
+      throw new Error(
+        `Expected one publication for the selected topic; found ${publishedForTopic.length}`,
+      );
     if (!discoverContainsPost) throw new Error("Published post did not appear in Discover API");
 
+    currentStage = "follow_up_enqueue";
     const followUpStart = performance.now();
     const question = `What are the most recent updates about ${post.title} in 2026?`;
     const asked = await server.inject({
       method: "POST",
       url: `/api/posts/${post.id}/ask`,
+      headers: { ...TEST_AUTH_HEADERS, "idempotency-key": randomUUID() },
       payload: { question },
     });
     if (asked.statusCode !== 202)
       throw new Error(`Post follow-up returned HTTP ${asked.statusCode}`);
     const queuedFollowUp = asked.json() as { id: string };
     followUpId = queuedFollowUp.id;
+    currentStage = "follow_up_wait";
     const followUpDeadline = Date.now() + PER_RESEARCH_TIMEOUT_MS + 35_000;
     while (Date.now() < followUpDeadline) {
       followUp = await store.getFollowUp(queuedFollowUp.id);
@@ -187,28 +249,46 @@ async function main() {
         `Post follow-up ended in ${followUp?.status ?? "timeout"}: ${followUp?.error ?? "no detail"}`,
       );
     }
+    currentStage = "follow_up_job_readback";
+    const followUpJobDeadline = Date.now() + 10_000;
+    while (Date.now() < followUpJobDeadline) {
+      followUpJob = await durableJobs.getJob(queuedFollowUp.id);
+      if (followUpJob && ["completed", "failed", "cancelled"].includes(followUpJob.status)) break;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    }
+    if (!followUpJob || followUpJob.status !== "completed")
+      throw new Error(`Follow-up durable job ended in ${followUpJob?.status ?? "missing"}`);
+    if (followUpJob.attempts !== 1 || followUpJob.maxAttempts !== RESEARCH_MAX_ATTEMPTS)
+      throw new Error("Post follow-up acceptance used more than one durable attempt");
     if (!followUp.usedLiveResearch || !followUp.liveResearchId) {
       throw new Error("Follow-up answered from saved evidence without continuing live research");
     }
     const liveResult = await server.inject({
       method: "GET",
       url: `/api/research/${followUp.liveResearchId}`,
+      headers: TEST_AUTH_HEADERS,
     });
     if (liveResult.statusCode !== 200)
       throw new Error("Follow-up live research session was not retrievable");
-    const liveSession = liveResult.json() as import("../domain.js").ResearchSession;
-    if (!liveSession.searchAttempts?.some((attempt) => attempt.status === "success")) {
+    followUpResearch = liveResult.json() as import("../domain.js").ResearchSession;
+    if (!followUpResearch.searchAttempts?.some((attempt) => attempt.status === "success")) {
       throw new Error("Follow-up did not complete a successful live search");
     }
+    currentStage = "follow_up_api_readback";
     const followUpStatus = await server.inject({
       method: "GET",
       url: `/api/posts/${post.id}/ask/${followUp.id}`,
+      headers: TEST_AUTH_HEADERS,
     });
     if (followUpStatus.statusCode !== 200)
       throw new Error("Completed follow-up was not visible through its API route");
   } catch (error) {
     failures.push({
-      stage: run?.status === "PUBLISHED" ? "post_follow_up" : "post_run",
+      stage:
+        run?.events
+          .slice()
+          .reverse()
+          .find((event) => event.status === "failed")?.stage ?? currentStage,
       reason: message(error),
     });
   } finally {
@@ -263,6 +343,8 @@ async function main() {
       researchTimeoutMs: PER_RESEARCH_TIMEOUT_MS,
       openRouterRequestTimeoutMs: MODEL_REQUEST_TIMEOUT_MS,
       maxModelDecisionsPerResearch: MAX_MODEL_DECISIONS,
+      postAgentMaxAttempts: POST_AGENT_MAX_ATTEMPTS,
+      followUpMaxAttempts: RESEARCH_MAX_ATTEMPTS,
       schedulerEnabled: false,
       persistence: "isolated in-memory SQLite",
     },
@@ -286,16 +368,26 @@ async function main() {
             title: source.title,
             url: source.url,
             domain: source.domain,
+            retrievalMethod: source.retrievalMethod,
+            retrievalAttempts: source.retrievalAttempts,
+            retrievalReasons: source.retrievalReasons,
+            contentOrigin: source.contentOrigin,
             hasContent: Boolean(source.content),
+            contentLength: source.content?.length ?? 0,
             fetchError: source.fetchError,
             fetchFailureCategory: source.fetchFailureCategory,
             quality: source.quality,
           })),
           claims: research.claims.map((claim) => ({
             text: claim.text,
+            evidence: claim.evidence,
             sourceIds: claim.sourceIds,
             verdict: claim.verification?.verdict,
+            verificationRationale: claim.verification?.rationale,
+            latestnessDisposition: claim.latestnessDisposition,
           })),
+          citationValidation: postAgentLLMProviders.research.metrics.citationEntailment,
+          synthesis: postAgentLLMProviders.research.metrics.synthesis,
           conflicts: research.conflicts ?? [],
         }
       : undefined,
@@ -303,8 +395,18 @@ async function main() {
       postId: post?.id,
       title: post?.title,
       findingCount: post?.findings.length,
+      findings: post?.findings,
+      claimCount: post?.claims.length,
+      claimIds: post?.claims.map((claim) => claim.id),
+      sourceCount: post?.sources.length,
+      sourceIds: post?.sources.map((source) => source.id),
       discoverContainsPost,
       detailVisible,
+      uniquePublicationCountForTopic: post?.topicId
+        ? (await store.listPublishedPosts(100)).filter(
+            (candidate) => candidate.topicId === post!.topicId,
+          ).length
+        : 0,
     },
     followUp: {
       status: followUp?.status,
@@ -312,7 +414,51 @@ async function main() {
       liveResearchId: followUp?.liveResearchId,
       answer: followUp?.answer,
       sourceIds: followUp?.sourceIds ?? [],
+      sources: followUp?.sources?.map((source) => ({
+        id: source.id,
+        title: source.title,
+        url: source.url,
+      })),
+      research: followUpResearch
+        ? {
+            id: followUpResearch.id,
+            status: followUpResearch.status,
+            searchAttempts: followUpResearch.searchAttempts ?? [],
+            sources: followUpResearch.sources.map((source) => ({
+              title: source.title,
+              url: source.url,
+              retrievalMethod: source.retrievalMethod,
+              fetchError: source.fetchError,
+            })),
+            claims: followUpResearch.claims.map((claim) => ({
+              text: claim.text,
+              evidence: claim.evidence,
+              sourceIds: claim.sourceIds,
+              verdict: claim.verification?.verdict,
+            })),
+          }
+        : undefined,
       durationMs: followUpDurationMs,
+    },
+    durableJobs: {
+      postAgent: postJob
+        ? {
+            status: postJob.status,
+            attempts: postJob.attempts,
+            maxAttempts: postJob.maxAttempts,
+            result: postJob.result,
+            errorSummary: postJob.errorSummary,
+          }
+        : undefined,
+      followUp: followUpJob
+        ? {
+            status: followUpJob.status,
+            attempts: followUpJob.attempts,
+            maxAttempts: followUpJob.maxAttempts,
+            result: followUpJob.result,
+            errorSummary: followUpJob.errorSummary,
+          }
+        : undefined,
     },
     model: process.env.OPENROUTER_MODEL,
     llm: llm.metrics,

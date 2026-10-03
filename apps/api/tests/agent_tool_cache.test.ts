@@ -66,6 +66,30 @@ function createKnowledgeStore(document: StoredDocument): KnowledgeStore {
 describe("question-aware retrieval cache", () => {
   beforeEach(() => retrieval.retrieveSource.mockReset());
 
+  it("revalidates cached latest-release discovery before using it as normal Chat evidence", async () => {
+    const cached = storedDocument(
+      "React 18.2.0 is the latest stable release, released on June 14, 2022. Official release details document the version and date.",
+    );
+    retrieval.retrieveSource.mockResolvedValue(retrievedSource());
+    const registry = createToolRegistry(
+      { search: async () => [] },
+      new OpenRouterProvider(),
+      createKnowledgeStore(cached),
+    );
+    const result = await registry.execute("fetch_url", {
+      url: sourceUrl,
+      title: "React releases",
+      snippet: cached.content,
+      provider: "internal-knowledge",
+      question: versionDateQuestion,
+      researchChatOptimization: true,
+      requestedFacts: ["version", "release date", "stable status", "latestness"],
+    });
+    expect(retrieval.retrieveSource).toHaveBeenCalledOnce();
+    expect(retrieval.retrieveSource.mock.calls[0][0].result.snippet).toBe("");
+    expect(result).toMatchObject({ cached: false, retrievalMethod: "http" });
+  });
+
   it("rejects a fresh but factually insufficient cache entry and continues retrieval", async () => {
     const cached = storedDocument(
       "The React releases page lists stable versions and recent release information for developers.",
@@ -120,5 +144,56 @@ describe("question-aware retrieval cache", () => {
     expect(retrieval.retrieveSource).not.toHaveBeenCalled();
     expect(result.cached).toBe(true);
     expect(result.retrievalMethod).toBe("cache");
+  });
+
+  it("preserves metadata-only provenance when a validated cache entry is reused", async () => {
+    const cached = storedDocument(
+      "React 19.2.0 is the latest stable release, released on September 15, 2026. Official release details document the version and date.",
+    );
+    cached.metadata!.contentOrigin = "metadata";
+    const registry = createToolRegistry(
+      { search: async () => [] },
+      new OpenRouterProvider(),
+      createKnowledgeStore(cached),
+    );
+
+    const result = (await registry.execute("fetch_url", {
+      url: sourceUrl,
+      title: "React releases",
+      snippet: "Official React release page.",
+      question: versionDateQuestion,
+      requestedFacts: ["version", "release date", "stable status", "latestness"],
+    })) as RetrievedSource & { cached: boolean };
+
+    expect(result.cached).toBe(true);
+    expect(result.document.contentOrigin).toBe("metadata");
+  });
+
+  it("recognizes legacy structured cache entries that contain only the page description", async () => {
+    const description =
+      "React 19.2.0 is the latest stable release, released on September 15, 2026. Official release details document the version and date.";
+    const cached = storedDocument(description);
+    cached.metadata = {
+      contentType: "structured",
+      retrievalMethod: "structured",
+      description,
+      domain: "react.dev",
+    };
+    const registry = createToolRegistry(
+      { search: async () => [] },
+      new OpenRouterProvider(),
+      createKnowledgeStore(cached),
+    );
+
+    const result = (await registry.execute("fetch_url", {
+      url: sourceUrl,
+      title: "React releases",
+      snippet: "Official React release page.",
+      question: versionDateQuestion,
+      requestedFacts: ["version", "release date", "stable status", "latestness"],
+    })) as RetrievedSource & { cached: boolean };
+
+    expect(result.cached).toBe(true);
+    expect(result.document.contentOrigin).toBe("metadata");
   });
 });

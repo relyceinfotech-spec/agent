@@ -4,11 +4,21 @@ import type {
   ResearchRecoveryRequirements,
   Source,
   SourceSelectionDecision,
+  ComparisonObjective,
 } from "./domain.js";
 import { createHash } from "node:crypto";
 import { canonicalizeUrl } from "./security.js";
 import { containsExactEntity, subjectEntityMismatchReason } from "./entities.js";
 import { requestedFactCoverage } from "./requested-facts.js";
+import { querySubjectMismatchReason } from "./query-relevance.js";
+import { comparisonClaimHasTargetFinding } from "./comparison-evidence.js";
+
+export interface SourceAcquisitionContext {
+  comparison: ComparisonObjective;
+  neededTargets: string[];
+  usedDomains: string[];
+  unavailableUrls: string[];
+}
 
 const authoritativeDomains = [
   "who.int",
@@ -273,10 +283,9 @@ export function rankResults(question: string, results: SearchResult[]): Source[]
     const textBlob = `${item.title} ${item.snippet}`.toLowerCase();
     const matchedTerms = [...terms].filter((term) => textBlob.includes(term)).length;
     const termRatio = matchedTerms / Math.max(1, Math.min(terms.size, 6));
-    const subjectMismatchReason = subjectEntityMismatchReason(
-      question,
-      `${item.title} ${item.snippet} ${normalizedUrl}`,
-    );
+    const subjectMismatchReason =
+      subjectEntityMismatchReason(question, `${item.title} ${item.snippet} ${normalizedUrl}`) ??
+      querySubjectMismatchReason(question, `${item.title} ${item.snippet}`);
     const relevance = subjectMismatchReason ? 0 : Math.min(1, termRatio + 0.15);
     const factCoverage = requestedFactCoverage(question, `${item.title} ${item.snippet}`);
     const factSpecificityBonus = factCoverage.required.length
@@ -409,6 +418,8 @@ export function selectResearchSourcesWithDecisions(
     ResearchRecoveryRequirements,
     "unresolvedFacts" | "factInsufficientSources"
   >,
+  preferReadableText = false,
+  acquisition?: SourceAcquisitionContext,
 ): { selected: Source[]; decisions: Array<Omit<SourceSelectionDecision, "query">> } {
   const recoveryFacts = recoveryRequirements?.unresolvedFacts ?? [];
   const factInsufficientUrls = new Map<string, Set<string>>();
@@ -441,6 +452,7 @@ export function selectResearchSourcesWithDecisions(
     );
   const relevanceEligible = ranked.filter(
     (source) =>
+      !acquisition?.unavailableUrls.includes(source.url) &&
       !source.subjectMismatchReason &&
       !excludedForMissingFact(source) &&
       (recoveryFacts.length === 0 || metadataSignalsMissingFact(source)) &&
@@ -481,7 +493,7 @@ export function selectResearchSourcesWithDecisions(
             b.quality.overall - a.quality.overall,
         )
       : officialEligible;
-  const eligible =
+  const policyEligible =
     officialSourceRequirement === "required"
       ? prioritizedOfficial
       : officialSourceRequirement === "preferred" && officialEligible.length > 0
@@ -490,10 +502,62 @@ export function selectResearchSourcesWithDecisions(
             ...relevanceEligible.filter((source) => !prioritizedOfficial.includes(source)),
           ]
         : relevanceEligible;
+  const mediaPage = (source: Source) =>
+    /(^|\.)(?:youtube\.com|youtu\.be|vimeo\.com|tiktok\.com|instagram\.com)$/.test(source.domain);
+  const textEligible = policyEligible.filter((source) => !mediaPage(source));
+  const eligible =
+    preferReadableText &&
+    textEligible.length > 0 &&
+    !/\b(?:videos?|transcripts?|youtube|vimeo)\b/i.test(taskQuestion ?? "")
+      ? textEligible
+      : policyEligible;
   const selected: Source[] = [];
   const selectedUrls = new Set<string>();
+  const domains = new Set(acquisition?.usedDomains ?? []);
+  const needed = new Set(acquisition?.neededTargets ?? []);
+  // Search metadata guides discovery only; it never establishes verified
+  // comparison coverage or supplies publication evidence.
+  const discovery = (source: Source) => {
+    const targetLeads = acquisition
+      ? [...needed].filter((target) =>
+          comparisonClaimHasTargetFinding(
+            { ...acquisition.comparison, targets: [target] },
+            source.snippet,
+          ),
+        )
+      : [];
+    const targetMentions = acquisition
+      ? [...needed].filter((target) => containsExactEntity(source.snippet, target))
+      : [];
+    const independentDomain = !domains.has(source.domain);
+    return {
+      targetLeads,
+      targetMentions,
+      independentDomain,
+      score: Number(
+        (
+          source.quality.overall +
+          targetLeads.length * 4 +
+          targetMentions.length * 2 +
+          (independentDomain ? 0.5 : 0)
+        ).toFixed(3),
+      ),
+    };
+  };
+  const selectionSignals = new Map<string, ReturnType<typeof discovery>>();
+  const select = (source: Source) => {
+    const signal = discovery(source);
+    selectionSignals.set(source.id, signal);
+    selected.push(source);
+    selectedUrls.add(source.url);
+    if (acquisition) {
+      domains.add(source.domain);
+      signal.targetLeads.forEach((target) => needed.delete(target));
+    }
+  };
   const authoritativeLimit = Math.min(2, Math.max(1, Math.floor(limit / 2)));
   for (const entity of entities.slice(0, authoritativeLimit)) {
+    if (selected.length >= limit) break;
     const match = eligible.find(
       (source) =>
         isOfficialSourceForEntities(source, entities) &&
@@ -502,32 +566,31 @@ export function selectResearchSourcesWithDecisions(
         containsExactEntity(`${source.title} ${source.snippet} ${source.url}`, entity),
     );
     if (match) {
-      selected.push(match);
-      selectedUrls.add(match.url);
+      select(match);
     }
   }
-  if (selected.length === 0) {
+  if (selected.length === 0 && limit > 0) {
     const bestOfficial = eligible.find(
       (source) => isOfficialSourceForEntities(source, entities) && entityEligible(source),
     );
     if (bestOfficial) {
-      selected.push(bestOfficial);
-      selectedUrls.add(bestOfficial.url);
+      select(bestOfficial);
     }
   }
-  for (const source of eligible) {
-    if (selected.length >= limit) break;
-    if (!selectedUrls.has(source.url)) {
-      selected.push(source);
-      selectedUrls.add(source.url);
-    }
+  while (selected.length < limit) {
+    const remaining = eligible.filter((source) => !selectedUrls.has(source.url));
+    if (acquisition) remaining.sort((a, b) => discovery(b).score - discovery(a).score);
+    if (!remaining[0]) break;
+    select(remaining[0]);
   }
 
   const selectedIds = new Set(selected.map((source) => source.id));
   const decisions = ranked.map((source) => {
     const officialSource = isOfficialSourceForEntities(source, entities);
     let reason = "Eligible result fell outside the selected-source limit.";
-    if (excludedForMissingFact(source)) {
+    if (acquisition?.unavailableUrls.includes(source.url)) {
+      reason = "Source is unavailable for this run after an unsuccessful retrieval; skipped.";
+    } else if (excludedForMissingFact(source)) {
       const excludedFacts = recoveryRequirements?.factInsufficientSources
         ?.filter((excluded) =>
           [excluded.url, excluded.canonicalUrl]
@@ -542,6 +605,9 @@ export function selectResearchSourcesWithDecisions(
         "Search metadata does not indicate an unresolved requested fact; skipped during bounded recovery.";
     } else if (source.subjectMismatchReason) {
       reason = source.subjectMismatchReason;
+    } else if (policyEligible.includes(source) && !eligible.includes(source)) {
+      reason =
+        "Readable text sources were preferred for this bounded comparison; media-page metadata does not establish a usable transcript.";
     } else if (source.quality.relevance < 0.3) {
       reason = "Relevance score was below the source-selection threshold.";
     } else if (source.quality.overall < 0.4) {
@@ -564,6 +630,12 @@ export function selectResearchSourcesWithDecisions(
             : "Selected as an eligible source under the task's source policy.";
     }
 
+    const acquisitionSignal = acquisition
+      ? (selectionSignals.get(source.id) ?? discovery(source))
+      : undefined;
+    if (selectedIds.has(source.id) && acquisitionSignal)
+      reason += ` Discovery priority ${acquisitionSignal.score}; missing-target finding leads: ${acquisitionSignal.targetLeads.join(", ") || "none"}; ${acquisitionSignal.independentDomain ? "independent" : "already used"} domain. Metadata remains unverified.`;
+
     return {
       sourceId: source.id,
       title: source.title,
@@ -578,6 +650,7 @@ export function selectResearchSourcesWithDecisions(
       reason,
       subjectMismatchReason: source.subjectMismatchReason,
       quality: source.quality,
+      acquisition: acquisitionSignal,
     };
   });
 

@@ -1,3 +1,4 @@
+import { comparisonObjective } from "./comparison-evidence.js";
 import type {
   QueryCategory,
   QueryGroup,
@@ -12,6 +13,7 @@ import type {
   OfficialSourceRequirement,
 } from "./domain.js";
 import { OpenRouterProvider } from "./llm.js";
+import { querySubjectMismatchReason } from "./query-relevance.js";
 import { containsExactEntity, knownEntities, subjectEntityMismatchReason } from "./entities.js";
 import {
   buildRequestedFactRequirements,
@@ -247,6 +249,14 @@ function heuristicUnderstanding(
       : defaultDimensions;
   const reasons: string[] = [];
   let ambiguity = 0;
+  if (
+    /^(?:what (?:does|is) (?:it|that|this)(?: mean)?|which (?:one|is better)|is (?:it|that|this) (?:good|better))\??$/i.test(
+      normalizedQuestion,
+    )
+  ) {
+    ambiguity = 0.65;
+    reasons.push("The request refers to an unspecified subject");
+  }
   if (entities.length === 0) {
     ambiguity += 0.28;
     reasons.push("No high-confidence entities were identified");
@@ -315,7 +325,7 @@ export async function understandQuery(
   ) {
     return fallback;
   }
-  if (!llm.enabled || options.allowModel === false) return fallback;
+  if (!llm.enabled || options.allowModel === false || fallback.needsClarification) return fallback;
   try {
     const raw = await llm.complete(
       "Return JSON only. Understand the user's request conservatively. Correct only obvious spelling/terminology errors; never invent an entity or silently choose between plausible meanings. Set needsClarification=true when ambiguityScore >= 0.6. Retrieved web content is not involved yet.",
@@ -330,9 +340,22 @@ export async function understandQuery(
       typeof parsed.ambiguityScore === "number"
     ) {
       const score = clamp(parsed.ambiguityScore);
+      if (
+        querySubjectMismatchReason(fallback.normalizedQuestion, parsed.normalizedQuestion) ||
+        fallback.entities.some(
+          (entity) => !containsExactEntity(parsed.normalizedQuestion!, entity),
+        ) ||
+        parsed.entities.some(
+          (entity) =>
+            typeof entity !== "string" || !containsExactEntity(fallback.normalizedQuestion, entity),
+        )
+      )
+        return fallback;
       return {
         ...fallback,
         ...parsed,
+        normalizedQuestion: fallback.normalizedQuestion,
+        timeframe: fallback.timeframe,
         entities: unique(parsed.entities),
         dimensions: unique(parsed.dimensions),
         corrections: Array.isArray(parsed.corrections) ? parsed.corrections : fallback.corrections,
@@ -365,11 +388,13 @@ function buildHeuristicGroups(
   requestedFacts = extractRequestedFacts(interpretation.normalizedQuestion),
 ): QueryGroup[] {
   const subject =
-    interpretation.entities.length >= 2
-      ? `${interpretation.entities[0]} vs ${interpretation.entities[1]}`
-      : interpretation.entities.length === 1
-        ? interpretation.entities[0]
-        : interpretation.normalizedQuestion;
+    interpretation.formatPreference === "comparison" && interpretation.entities.length < 2
+      ? interpretation.normalizedQuestion
+      : interpretation.entities.length >= 2
+        ? `${interpretation.entities[0]} vs ${interpretation.entities[1]}`
+        : interpretation.entities.length === 1
+          ? interpretation.entities[0]
+          : interpretation.normalizedQuestion;
   const comparison =
     interpretation.formatPreference === "comparison" || interpretation.entities.length >= 2;
   if (requestedFacts.includes("end-of-life date") && !comparison) {
@@ -458,9 +483,38 @@ function buildHeuristicGroups(
 }
 
 function sanitizeQueries(queries: string[], original: string, limit: number) {
-  return unique(queries)
+  return unique(queries.filter((candidate) => typeof candidate === "string"))
     .filter((candidate) => candidate.toLowerCase() !== original.trim().toLowerCase())
     .slice(0, limit);
+}
+
+export function preserveQueryRequirements(
+  candidate: string,
+  interpretation: QueryInterpretation,
+  includeDimensions = true,
+): string {
+  const question = interpretation.normalizedQuestion;
+  const qualifiers = queryQualifiers(question);
+  const dimensions =
+    question.match(
+      /\b(?:pricing|price|cost|performance|latency|throughput|memory|release date|end.of.life|support lifecycle)\b/gi,
+    ) ?? [];
+  const missing = [...qualifiers, ...(includeDimensions ? dimensions : [])].filter(
+    (term) => !candidate.toLowerCase().includes(term.toLowerCase()),
+  );
+  return unique([candidate, ...missing]).join(" ");
+}
+
+function queryQualifiers(question: string): string[] {
+  return unique([
+    ...(question.match(
+      /\b(?:latest|current|newest|stable|LTS|today|historical|20\d{2}|v?\d+(?:\.\d+){1,3})\b/gi,
+    ) ?? []),
+    ...(question.match(
+      /\b(?:as of|before|after|during|in)\s+(?:(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+(?:\d{1,2},?\s+)?\d{4}|\d{4}-\d{2}-\d{2})\b/gi,
+    ) ?? []),
+    ...(question.match(/\b(?:this|last|past)\s+(?:week|month|year)\b/gi) ?? []),
+  ]);
 }
 
 const genericQueryWords = new Set([
@@ -488,7 +542,9 @@ const genericQueryWords = new Set([
 ]);
 
 function queryMatchesTopic(queryText: string, interpretation: QueryInterpretation): boolean {
-  if (interpretation.entities.length > 0) return true;
+  if (interpretation.entities.some((entity) => !containsExactEntity(queryText, entity)))
+    return false;
+  if (querySubjectMismatchReason(interpretation.normalizedQuestion, queryText)) return false;
   const topicTerms = (
     interpretation.normalizedQuestion.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []
   ).filter((term) => !genericQueryWords.has(term));
@@ -499,20 +555,14 @@ function queryMatchesTopic(queryText: string, interpretation: QueryInterpretatio
 
 /** A small planned query for fast current-information lookups, never the raw prompt. */
 export function planFastLookupQuery(interpretation: QueryInterpretation): string {
-  const subject =
-    interpretation.entities[0] ??
-    interpretation.normalizedQuestion
-      .replace(/^(?:what(?:'s| is)?|which|when|who|how|tell me|find out)\s+/i, "")
-      .replace(/\b(?:the|latest|current|most recent|version|release|today)\b/gi, " ")
-      .replace(/[^\p{L}\p{N}\s.-]/gu, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+  const subject = interpretation.normalizedQuestion
+    .replace(/^(?:what(?:'s| is)?|which|when|who|how|tell me|find out)\s+/i, "")
+    .replace(/\b(?:the|is|are)\b/gi, " ")
+    .replace(/[^\p{L}\p{N}\s.-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   const focus = subject || interpretation.topic;
-  const timeframe =
-    interpretation.timeframe && interpretation.timeframe !== "latest"
-      ? ` ${interpretation.timeframe}`
-      : "";
-  return `${focus} latest official release documentation${timeframe}`.trim();
+  return `${focus} official evidence`.trim();
 }
 
 export async function buildPlan(
@@ -523,25 +573,64 @@ export async function buildPlan(
   options: { researchChatOptimization?: boolean } = {},
 ): Promise<ResearchPlan> {
   const includeSupportLifecycle = options.researchChatOptimization === true;
-  const requestedFacts = extractRequestedFacts(question, { includeSupportLifecycle });
+  const comparison = options.researchChatOptimization ? comparisonObjective(question) : undefined;
+  const factQuestion = comparison?.dimensions.includes("build/indexing cost")
+    ? question.replace(
+        /\b(?:build(?:\/indexing)?|indexing|training) cost\b/gi,
+        "computational work",
+      )
+    : question;
+  const requestedFacts = extractRequestedFacts(factQuestion, { includeSupportLifecycle });
   const focusedLifecycleLookup =
     includeSupportLifecycle &&
     requestedFacts.length === 1 &&
     requestedFacts[0] === "end-of-life date" &&
     !/\b(?:compare|comparison|versus|\bvs\b|between)\b/i.test(question);
-  const interpretation = focusedLifecycleLookup
+  let interpretation = focusedLifecycleLookup
     ? await understandQuery(question, llm, mode, { includeSupportLifecycle: true })
-    : (existingInterpretation ?? (await understandQuery(question, llm, mode)));
+    : (existingInterpretation ??
+      (await understandQuery(question, llm, mode, { allowModel: !comparison })));
   const requestedFactRequirements = buildRequestedFactRequirements(requestedFacts);
-  const structuredObjectives = generateStructuredObjectives(interpretation, mode, requestedFacts);
+  if (comparison)
+    interpretation = {
+      ...interpretation,
+      comparison,
+      dimensions: comparison.dimensions,
+      entities: comparison.targets,
+    };
+  const structuredObjectives = comparison
+    ? comparison.dimensions.map((dimension, index): ResearchObjective => ({
+        id: `obj-comparison-${index}`,
+        label: `Compare ${comparison.targets.join(" vs ")} on ${dimension}`,
+        category: dimension,
+        importance: "critical",
+        status: "pending",
+        evidenceIds: [],
+        sourceIds: [],
+        coverage: 0,
+      }))
+    : generateStructuredObjectives(interpretation, mode, requestedFacts);
   let queryGroups = buildHeuristicGroups(interpretation, requestedFacts);
+  if (comparison)
+    queryGroups = [
+      {
+        category: "DIRECT",
+        queries: [
+          `${comparison.targets.join(" vs ")} ${comparison.dimensions.join(" ")} technical evidence`,
+        ],
+      },
+    ];
+  queryGroups = queryGroups.map((group) => ({
+    ...group,
+    queries: group.queries.map((candidate) => preserveQueryRequirements(candidate, interpretation)),
+  }));
 
   // When entities are clear, or a deep-research topic has enough concrete
   // title words to build contextual heuristic queries, save the extra planning
   // call for evidence verification and synthesis. Entity-light titles have
   // previously produced generic model queries despite a usable heuristic plan.
   if (
-    interpretation.ambiguityScore < 0.4 &&
+    (interpretation.ambiguityScore < 0.4 || !!comparison) &&
     (interpretation.entities.length > 0 || mode === "deep") &&
     !interpretation.needsClarification
   ) {
@@ -579,9 +668,9 @@ export async function buildPlan(
           )
           .map((group) => ({
             category: group.category as QueryCategory,
-            queries: sanitizeQueries(group.queries!, question, 4).filter((candidate) =>
-              queryMatchesTopic(candidate, interpretation),
-            ),
+            queries: sanitizeQueries(group.queries!, question, 4)
+              .filter((candidate) => queryMatchesTopic(candidate, interpretation))
+              .map((candidate) => preserveQueryRequirements(candidate, interpretation)),
           }))
           .filter((group) => group.queries.length > 0);
         if (modelQueryGroups.length > 0) queryGroups = modelQueryGroups;
@@ -927,6 +1016,26 @@ export async function rewriteQueries(
     .join("\n");
 
   const unresolvedFacts = recoveryRequirements?.unresolvedFacts ?? [];
+  if (recoveryRequirements?.comparison?.missing.length) {
+    const comparison = recoveryRequirements.comparison;
+    const dimensions = unique(
+      comparison.missing.flatMap((gap) =>
+        gap.dimension === "performance"
+          ? ["performance", ...(comparison.performanceDimensions?.observed ?? [])]
+          : [gap.dimension],
+      ),
+    );
+    const sourceConstraint =
+      recoveryRequirements.officialSourceRequirement === "required"
+        ? "official primary sources"
+        : "technical sources";
+    const candidate = preserveQueryRequirements(
+      `${comparison.targets.join(" vs ")} ${dimensions.join(" ")} comparative measurements evidence ${sourceConstraint}`,
+      plan.interpretation,
+      false,
+    );
+    return !existing.has(candidate.toLowerCase()) ? [candidate] : [];
+  }
   if (unresolvedFacts.length > 0) {
     const candidate = buildFactRecoveryQuery(plan, recoveryRequirements!, question);
     return !existing.has(candidate.toLowerCase()) ? [candidate] : [];
@@ -955,7 +1064,6 @@ export async function rewriteQueries(
           validateRecoveryQuery(candidate, question, plan, recoveryRequirements).accepted,
       );
       if (accepted) return [accepted];
-      if (candidates[0]) return [candidates[0]];
     } catch {
       /* Use the deterministic one-query fallback below. */
     }
@@ -967,7 +1075,10 @@ export async function rewriteQueries(
       plan.interpretation.sourceRequirements?.officialSources ??
       "none",
   );
-  const candidate = `${subject} ${plan.interpretation.dimensions[0] ?? "evidence"} ${sourceTerms}`;
+  const candidate = preserveQueryRequirements(
+    `${subject} ${plan.interpretation.dimensions[0] ?? "evidence"} ${sourceTerms}`,
+    plan.interpretation,
+  );
   return !existing.has(candidate.toLowerCase()) ? [candidate] : [];
 }
 
@@ -989,8 +1100,8 @@ function recoverySubject(plan: ResearchPlan, question?: string): string {
   if (plan.interpretation.entities.length >= 2) {
     return plan.interpretation.entities.join(" vs ");
   }
-  if (plan.interpretation.entities[0]) return plan.interpretation.entities[0];
-  if (plan.interpretation.topic !== "general topic") return plan.interpretation.topic;
+  if (plan.interpretation.entities[0] && plan.interpretation.formatPreference !== "comparison")
+    return plan.interpretation.entities[0];
 
   const subjectNoise = new Set([
     ...genericQueryWords,
@@ -1013,7 +1124,7 @@ function recoverySubject(plan: ResearchPlan, question?: string): string {
   return (
     terms
       .filter((term) => !subjectNoise.has(term.toLowerCase()))
-      .slice(0, 3)
+      .slice(0, 12)
       .join(" ") || plan.interpretation.topic
   );
 }
@@ -1080,13 +1191,17 @@ function buildFactRecoveryQuery(
     terms.push("release status");
   }
 
-  return [
-    recoverySubject(plan, question),
-    ...unique(terms),
-    sourceConstraintTerms(requirements.officialSourceRequirement),
-  ]
-    .filter(Boolean)
-    .join(" ");
+  return preserveQueryRequirements(
+    [
+      recoverySubject(plan, question),
+      ...unique(terms),
+      sourceConstraintTerms(requirements.officialSourceRequirement),
+    ]
+      .filter(Boolean)
+      .join(" "),
+    plan.interpretation,
+    false,
+  );
 }
 
 const objectiveRecoveryTerms: Record<string, string> = {
@@ -1116,7 +1231,10 @@ function prioritizeObjectives(objectives: ResearchObjective[]): ResearchObjectiv
 
 function buildObjectiveRecoveryQuery(plan: ResearchPlan, objective: ResearchObjective): string {
   const requirement = plan.interpretation.sourceRequirements?.officialSources ?? "none";
-  return `${recoverySubject(plan)} ${objectiveRecoveryTerms[objective.category] ?? `${objective.category} evidence`} ${sourceConstraintTerms(requirement)}`;
+  return preserveQueryRequirements(
+    `${recoverySubject(plan)} ${objectiveRecoveryTerms[objective.category] ?? `${objective.category} evidence`} ${sourceConstraintTerms(requirement)}`,
+    plan.interpretation,
+  );
 }
 
 function queryCoversFact(query: string, fact: RequestedFactKind): boolean {
@@ -1163,6 +1281,16 @@ export function validateRecoveryQuery(
 ): { accepted: boolean; reasons: string[] } {
   const reasons: string[] = [];
   const query = candidate.trim();
+  if (requirements?.comparison?.missing.length) {
+    for (const target of requirements.comparison.targets) {
+      if (!containsExactEntity(query, target))
+        reasons.push(`recovery query omitted comparison target: ${target}`);
+    }
+    for (const dimension of unique(requirements.comparison.missing.map((gap) => gap.dimension))) {
+      if (!query.toLowerCase().includes(dimension.toLowerCase()))
+        reasons.push(`recovery query omitted missing comparison dimension: ${dimension}`);
+    }
+  }
   if (!query) return { accepted: false, reasons: ["recovery query is empty"] };
 
   const siblingMismatch = subjectEntityMismatchReason(question, query);
@@ -1183,6 +1311,14 @@ export function validateRecoveryQuery(
   }
   if (!queryMatchesTopic(query, plan.interpretation)) {
     reasons.push("recovery query does not preserve the requested topic");
+  }
+  const originalQualifiers = queryQualifiers(question);
+  for (const qualifier of originalQualifiers) {
+    const temporalAlias =
+      /^(latest|current|newest)$/i.test(qualifier) &&
+      /\b(?:latest|current|newest|most recent)\b/i.test(query);
+    if (!temporalAlias && !query.toLowerCase().includes(qualifier.toLowerCase()))
+      reasons.push(`recovery query omitted requested qualifier: ${qualifier}`);
   }
 
   if (requirements?.latestnessRequired) {

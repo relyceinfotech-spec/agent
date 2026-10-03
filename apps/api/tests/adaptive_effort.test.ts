@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ResearchSession } from "../src/domain.js";
 import { AutonomousAgent } from "../src/agent/autonomous.js";
 import { createToolRegistry, ToolRegistry } from "../src/agent/tools.js";
@@ -128,7 +128,7 @@ describe("Single-Chat Autonomous Agent (Zero User Modes)", () => {
     expect(stored?.status).toBe("COMPLETED");
   });
 
-  it("complex question → autonomous deeper research", async () => {
+  it("answers a stable comparison directly without fresh evidence", async () => {
     const llm = new OpenRouterProvider();
     const registry = createToolRegistry(
       {
@@ -136,14 +136,10 @@ describe("Single-Chat Autonomous Agent (Zero User Modes)", () => {
       },
       llm,
     );
-    let runnerCalled = false;
-    let runnerMode: string | undefined;
     const runner = {
-      start: async (question: string, mode: ResearchSession["mode"]) => {
-        runnerCalled = true;
-        runnerMode = mode;
-        return mockSession(question, mode);
-      },
+      start: vi.fn(async (question: string, mode: ResearchSession["mode"]) =>
+        mockSession(question, mode),
+      ),
     } as unknown as ResearchRunner;
     const store = new MemorySessionStore();
     const agent = new AutonomousAgent(registry, runner, llm, store);
@@ -151,10 +147,9 @@ describe("Single-Chat Autonomous Agent (Zero User Modes)", () => {
     // User asks a comparative question in the same normal chat
     const res = await agent.handle("Compare React Native vs Flutter for a startup.", false);
 
-    expect(res.route).toBe("web");
-    expect(runnerCalled).toBe(true);
-    expect(runnerMode).toBe("quick");
-    expect(res.researchId).toBe("mock-session-id");
+    expect(res.route).toBe("direct");
+    expect(res.answer).toBeDefined();
+    expect(runner.start).not.toHaveBeenCalled();
   });
 
   it("Deep Research button → same autonomous agent with larger budget", async () => {

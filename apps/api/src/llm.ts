@@ -10,7 +10,10 @@ import {
 } from "./citation-entailment.js";
 import {
   buildDeterministicResearchAnswer,
+  filterLatestnessClaims,
+  isLatestnessConsistentText,
   parseStructuredResearchAnswer,
+  preservesCanonicalLatestnessFacts,
   renderStructuredResearchAnswer,
 } from "./research-answer.js";
 import {
@@ -499,6 +502,10 @@ export class OpenRouterProvider {
     memoryContext?: string,
     researchChatOptimization = false,
   ): Promise<string> {
+    const requestedFacts =
+      plan.requestedFacts.length > 0
+        ? plan.requestedFacts
+        : (researchState?.requestedFactCoverage?.required ?? extractRequestedFacts(question));
     // Keep quick answers limited to verified claims; deep answers may label uncertainty.
     const dimensionAliases: Record<string, string[]> = {
       performance: [
@@ -544,7 +551,12 @@ export class OpenRouterProvider {
         (score, term) => score + (claim.text.toLowerCase().includes(term) ? 1 : 0),
         0,
       );
-    const sortedClaims = claims
+    const latestnessEligibleClaims = filterLatestnessClaims(
+      claims,
+      requestedFacts.includes("latestness"),
+      researchState?.latestnessAssessment,
+    );
+    const sortedClaims = latestnessEligibleClaims
       .filter(
         (claim) =>
           claim.verification?.verdict === "supported" ||
@@ -684,7 +696,7 @@ export class OpenRouterProvider {
 
     const objectivesText =
       researchState && researchState.objectives.length > 0
-        ? `Research objectives & coverage (${Math.round(researchState.coverage * 100)}% verified):\n` +
+        ? `Research objectives & coverage (${Math.round(researchState.coverage * 100)}% objective progress; only supported claims are verified):\n` +
           researchState.objectives
             .slice(0, mode === "deep" ? 8 : 3)
             .map(
@@ -693,10 +705,6 @@ export class OpenRouterProvider {
             )
             .join("\n")
         : `Plan objectives: ${plan.objectives.slice(0, mode === "deep" ? 8 : 3).join("; ")}`;
-    const requestedFacts =
-      plan.requestedFacts.length > 0
-        ? plan.requestedFacts
-        : (researchState?.requestedFactCoverage?.required ?? extractRequestedFacts(question));
     const deterministic = buildDeterministicResearchAnswer({
       question,
       plan,
@@ -778,6 +786,20 @@ export class OpenRouterProvider {
           officialSourceIds,
           requiresOfficial,
         );
+        if (
+          statements.some(
+            (statement) =>
+              !isLatestnessConsistentText(statement.text, researchState?.latestnessAssessment),
+          ) ||
+          !preservesCanonicalLatestnessFacts(
+            statements,
+            deterministic.statements,
+            researchState?.latestnessAssessment,
+            requestedFacts.includes("release date"),
+          )
+        ) {
+          throw new Error("Synthesis conflicts with controller-proven latest release facts");
+        }
         if (researchChatFactContext) {
           requestedFactBindings = buildResearchChatFactBindings(
             researchChatFactContext,

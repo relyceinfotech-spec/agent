@@ -20,6 +20,8 @@ import { runWithResearchExecutionContext } from "../execution-context.js";
 import type { ResearchBudget } from "../research.js";
 import { SourceRetrievalError } from "../source-retrieval.js";
 import { subjectEntityMismatchReason } from "../entities.js";
+import { querySubjectMismatchReason, relevantSourceContent } from "../query-relevance.js";
+import { withOperationContext } from "../operation-context.js";
 import {
   buildRequestedFactRequirements,
   extractRequestedFacts,
@@ -122,41 +124,79 @@ export class AutonomousAgent {
       };
     }
 
+    const explicitlyFresh =
+      /\b(?:latest|current|today|recent|newest|most recent|news|this week|pricing|price|cost|release date|when was|what version|status of)\b|\b(?:19|20)\d{2}\b/i.test(
+        normalized,
+      );
+    const stableConcept =
+      /\b(?:closure|closures|scope|scoping|syntax|hoisting|let and const|let.*const|version control|algorithm complexity|big o)\b/i.test(
+        normalized,
+      );
     const isComparison =
       interpretation.formatPreference === "comparison" ||
-      /\b(compare|comparison|versus|\bvs\b|better|difference between|differences)\b/i.test(
+      /\b(compare|comparison|versus|\bvs\b|better|best|difference between|differences)\b/i.test(
+        normalized,
+      );
+
+    const explicitlyRequiresSources =
+      interpretation.sourceRequirements?.officialSources === "required" ||
+      interpretation.sourceRequirements?.officialSources === "preferred";
+    const explicitEvidenceRequest =
+      /\b(?:measured|measurements?|benchmark(?:s|ed)?|empirical|according to|stud(?:y|ies)|sources?|citations?|cite|references?|external evidence|research)\b/i.test(
         normalized,
       ) ||
-      interpretation.entities.length >= 2;
+      explicitlyRequiresSources ||
+      interpretation.formatPreference === "research";
+
+    if (
+      !explicitlyFresh &&
+      !explicitEvidenceRequest &&
+      stableConcept &&
+      !explicitlyRequiresSources
+    ) {
+      return {
+        route: "direct",
+        effort: "low",
+        reason:
+          "The request asks for a stable concept that does not require fresh external evidence.",
+      };
+    }
 
     const isDeepInvestigation =
       /\b(deep|investigate|thorough|in-depth|comprehensive|evaluate|benchmark|analy[sz]e)\b/i.test(
         normalized,
       );
 
-    // High effort for complex comparisons or deep investigations
-    if (isDeepInvestigation || (isComparison && interpretation.entities.length >= 2)) {
+    if (isDeepInvestigation) {
       return {
         route: "web",
         effort: "high",
-        reason:
-          "The question requires comparative or deep evidence analysis from multiple perspectives.",
+        reason: "The request asks for a detailed investigation that requires external research.",
       };
     }
 
-    if (interpretation.sourceRequirements?.officialSources === "required") {
+    if (isComparison && (explicitlyFresh || explicitEvidenceRequest)) {
       return {
         route: "web",
         effort: "high",
         reason:
-          "The request requires official sources, so the agent selected the bounded research loop for source triage, verification, and fact-specific recovery.",
+          "The comparison requests current or external evidence, so the agent selected the bounded research path.",
+      };
+    }
+
+    if (explicitEvidenceRequest) {
+      return {
+        route: "web",
+        effort: "high",
+        reason:
+          "The request requires external or official evidence, so the agent selected the bounded research path.",
       };
     }
 
     // Medium effort for fast factual lookups, current status, release versions, or time-sensitive facts
     if (
       interpretation.formatPreference === "lookup" ||
-      /\b(latest|current|today|recent|news|2026|this week|version|release date|when was|what version|status of)\b/i.test(
+      /\b(latest|current|today|recent|news|this week|release date|when was|what version|status of)\b/i.test(
         normalized,
       )
     ) {
@@ -169,9 +209,9 @@ export class AutonomousAgent {
 
     if (isComparison) {
       return {
-        route: "web",
-        effort: "high",
-        reason: "The question needs comparison or evidence from multiple perspectives.",
+        route: "direct",
+        effort: "low",
+        reason: "The comparison asks about stable concepts and does not request fresh evidence.",
       };
     }
 
@@ -329,6 +369,8 @@ export class AutonomousAgent {
           url: candidate.url,
           title: candidate.title,
           snippet: candidate.snippet,
+          provider: candidate.provider,
+          researchChatOptimization: true,
           question: interpretation.normalizedQuestion,
         });
         const extracted = await this.use<{
@@ -366,13 +408,23 @@ export class AutonomousAgent {
             ? (fetched.document as { title?: string; canonicalUrl?: string })
             : undefined;
         const extractedTitle = extracted.title || fetchedDocument?.title;
-        const subjectMismatchReason = extractedTitle
-          ? subjectEntityMismatchReason(interpretation.normalizedQuestion, extractedTitle)
-          : undefined;
+        const subjectMismatchReason =
+          (extractedTitle ? subjectEntityMismatchReason(question, extractedTitle) : undefined) ??
+          querySubjectMismatchReason(
+            question,
+            extracted.content,
+            `${candidate.title} ${candidate.snippet}`,
+          );
         retrieved = {
           ...candidate,
           title: extractedTitle || candidate.title,
-          content: extracted.content.slice(0, 4000),
+          content: subjectMismatchReason
+            ? ""
+            : relevantSourceContent(
+                question,
+                extracted.content,
+                `${extractedTitle || candidate.title} ${candidate.snippet}`,
+              ).slice(0, 4000),
           fetchedAt: new Date().toISOString(),
           canonicalUrl:
             fetched.document && typeof fetched.document === "object"
@@ -419,7 +471,13 @@ export class AutonomousAgent {
       }
       fetchedSources.push(retrieved);
       // Verify the first useful lookup source before spending a page budget on weaker results.
-      if (compactLookup && retrieved.content?.trim()) break;
+      if (
+        compactLookup &&
+        retrieved.content?.trim() &&
+        !retrieved.subjectMismatchReason &&
+        requestedFactCoverage(question, retrieved.content).missing.length === 0
+      )
+        break;
     }
 
     fetchedSources.sort(
@@ -639,7 +697,11 @@ export class AutonomousAgent {
     };
   }
 
-  async handle(
+  async handle(...args: Parameters<AutonomousAgent["handleWithinContext"]>): Promise<ChatResponse> {
+    return withOperationContext(() => this.handleWithinContext(...args));
+  }
+
+  private async handleWithinContext(
     question: string,
     deepResearch: boolean,
     memoryContext?: string,
@@ -657,6 +719,7 @@ export class AutonomousAgent {
       interpretationOverride ??
       (await this.use<QueryInterpretation>(toolEvents, "understand_query", {
         question,
+        allowModel: false,
       }));
     if (interpretationOverride)
       toolEvents.push({
@@ -673,6 +736,40 @@ export class AutonomousAgent {
       phase: "decision",
       reason: decision.reason,
     });
+
+    if (interpretation.needsClarification || interpretation.ambiguityScore >= 0.6) {
+      const now = new Date().toISOString();
+      const session: ResearchSession = {
+        id:
+          typeof currentWorkerContext()?.lease.job.payload.sessionId === "string"
+            ? String(currentWorkerContext()!.lease.job.payload.sessionId)
+            : randomUUID(),
+        question,
+        mode: deepResearch ? "deep" : "quick",
+        status: "NEEDS_CLARIFICATION",
+        createdAt: now,
+        updatedAt: now,
+        sources: [],
+        claims: [],
+        steps: [],
+        answer:
+          interpretation.clarificationQuestion ??
+          "Please specify the subject and what you want to know.",
+      };
+      if (this.store) {
+        if (await this.store.get(session.id)) await this.store.update(session);
+        else await this.store.create(session);
+      }
+      return {
+        route: decision.route,
+        interpretation,
+        answer: session.answer,
+        session,
+        researchId: session.id,
+        toolEvents,
+        durationMs: Date.now() - startedAt,
+      };
+    }
 
     // 1. Direct answer without external web search
     if (decision.effort === "low") {
@@ -692,11 +789,11 @@ export class AutonomousAgent {
     }
 
     // 2. Fast web lookup
-    if (decision.effort === "medium") {
+    if (decision.effort === "medium" && !enqueueResearch) {
       return this.fastWebLookup(question, interpretation, toolEvents, startedAt, memoryContext);
     }
 
-    // 3. Deep research loop
+    // Durable normal Chat and Deep Research share the same evidence controller.
     const mode = decision.route === "deep" ? "deep" : "quick";
     const queued = enqueueResearch
       ? await enqueueResearch(question, mode, memoryContext, interpretation)

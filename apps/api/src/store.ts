@@ -38,6 +38,7 @@ export interface StoredDocument {
     language?: string;
     headings?: string[];
     contentType?: "html" | "rss" | "pdf" | "structured";
+    contentOrigin?: "metadata";
     retrievalMethod?: string;
     provider?: string;
     providers?: string[];

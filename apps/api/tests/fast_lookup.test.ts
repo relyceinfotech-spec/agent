@@ -575,7 +575,7 @@ describe("evidence-first fast lookup", () => {
       description: "extract",
       execute: async () => ({
         content:
-          "React Router is a routing library. Consult the official release history for current package versions and compatibility details.",
+          "React Router 7.0.0 is the current release version in this offline fixture. Consult the official release history for current package versions and compatibility details.",
       }),
     });
     const store = new MemorySessionStore();

@@ -22,6 +22,25 @@ export interface TopicDiscoveryResult {
   successfulSearches: number;
 }
 
+export function normalizeTopicFeedUrls(feedUrls: string[]): string[] {
+  const uniqueFeeds: string[] = [];
+  const seen = new Set<string>();
+  for (const rawFeedUrl of feedUrls) {
+    const feedUrl = rawFeedUrl.trim();
+    if (!feedUrl) continue;
+    let normalizedKey = feedUrl;
+    try {
+      normalizedKey = canonicalizeUrl(new URL(feedUrl).toString());
+    } catch {
+      // Keep invalid configured values for the existing per-feed failure reporting path.
+    }
+    if (seen.has(normalizedKey)) continue;
+    seen.add(normalizedKey);
+    uniqueFeeds.push(feedUrl);
+  }
+  return uniqueFeeds;
+}
+
 export function parseTopicFeed(xml: string, feedUrl: string): FeedEntry[] {
   const $ = load(xml, { xmlMode: true });
   return $("item,entry")
@@ -51,10 +70,11 @@ export function parseTopicFeed(xml: string, feedUrl: string): FeedEntry[] {
     });
 }
 
-export async function fetchTopicFeed(feedUrl: string): Promise<FeedEntry[]> {
+export async function fetchTopicFeed(feedUrl: string, signal?: AbortSignal): Promise<FeedEntry[]> {
   const { response, dispose } = await safeFetchWithRetry(
     feedUrl,
     {
+      signal,
       headers: { accept: "application/rss+xml,application/atom+xml,application/xml,text/xml" },
     },
     2,
@@ -80,7 +100,9 @@ function titleSimilarity(a: string, b: string): number {
 
 function topicScore(entry: FeedEntry, now: number): number {
   if (!entry.publishedAt) return 0.35;
-  const ageDays = Math.max(0, (now - Date.parse(entry.publishedAt)) / 86_400_000);
+  const publishedAt = Date.parse(entry.publishedAt);
+  if (!Number.isFinite(publishedAt)) return 0;
+  const ageDays = Math.max(0, (now - publishedAt) / 86_400_000);
   if (ageDays > config.MAX_TOPIC_MAX_AGE_DAYS) return 0;
   const freshness = 1 - ageDays / config.MAX_TOPIC_MAX_AGE_DAYS;
   const substance = Math.min(1, entry.summary.length / 180);
@@ -94,13 +116,20 @@ function topicScore(entry: FeedEntry, now: number): number {
 
 export async function discoverTopics(
   store: ContentStore,
-  feedUrls = config.MAX_TOPIC_FEEDS.split(",")
-    .map((feed) => feed.trim())
-    .filter(Boolean),
-  fetcher: (url: string) => Promise<FeedEntry[]> = fetchTopicFeed,
+  feedUrls = config.MAX_TOPIC_FEEDS.split(","),
+  fetcher: (url: string, signal?: AbortSignal) => Promise<FeedEntry[]> = fetchTopicFeed,
   fallbackSearch?: SearchProvider,
+  signal?: AbortSignal,
 ): Promise<TopicDiscoveryResult> {
-  const settled = await Promise.allSettled(feedUrls.map((feed) => fetcher(feed)));
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : new Error("Topic discovery cancelled");
+    }
+  };
+  throwIfAborted();
+  const normalizedFeedUrls = normalizeTopicFeedUrls(feedUrls);
+  const settled = await Promise.allSettled(normalizedFeedUrls.map((feed) => fetcher(feed, signal)));
+  throwIfAborted();
   const failures: TopicDiscoveryResult["failures"] = [];
   const entries: FeedEntry[] = [];
   let successfulFeeds = 0;
@@ -110,7 +139,7 @@ export async function discoverTopics(
       entries.push(...result.value);
     } else {
       failures.push({
-        feed: feedUrls[index],
+        feed: normalizedFeedUrls[index],
         error: result.reason instanceof Error ? result.reason.message : String(result.reason),
       });
     }
@@ -146,7 +175,7 @@ export async function discoverTopics(
       if (candidates.some((candidate) => titleSimilarity(candidate.title, entry.title) >= 0.82))
         continue;
       const score = topicScore(entry, now);
-      if (score < 0.5) continue;
+      if (!Number.isFinite(score) || score < 0.5) continue;
       candidates.push({
         id: randomUUID(),
         title: entry.title,
@@ -171,11 +200,13 @@ export async function discoverTopics(
       .slice(0, 4);
     const year = new Date().getUTCFullYear();
     for (const domain of domains) {
+      throwIfAborted();
       const query = `site:${domain} new release research announcement ${year}`;
       try {
         const batch = fallbackSearch.searchDetailed
-          ? await fallbackSearch.searchDetailed(query)
-          : { results: await fallbackSearch.search(query), attempts: [] };
+          ? await fallbackSearch.searchDetailed(query, signal)
+          : { results: await fallbackSearch.search(query, signal), attempts: [] };
+        throwIfAborted();
         searchAttempts.push(...batch.attempts);
         if (
           batch.attempts.length === 0 ||
@@ -205,6 +236,7 @@ export async function discoverTopics(
           }));
         await collectCandidates(fallbackEntries);
       } catch (error) {
+        if (signal?.aborted) throwIfAborted();
         failures.push({
           feed: `search:${domain}`,
           error: error instanceof Error ? error.message : String(error),

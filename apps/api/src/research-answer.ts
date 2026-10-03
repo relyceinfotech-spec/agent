@@ -1,10 +1,12 @@
 import type {
   Claim,
+  LatestnessAssessment,
   ReleaseEvidenceRecord,
   ResearchPlan,
   ResearchState,
   Source,
 } from "./domain.js";
+import { containsExactEntity, extractKnownEntities } from "./entities.js";
 import {
   extractRequestedFacts,
   requestedFactCoverage,
@@ -17,6 +19,7 @@ import {
   bindVerifiedEndOfLifeClaimToSource,
   enforceResearchChatBoundedFactCoverage,
 } from "./research-chat-fact-gate.js";
+import { compareVersions } from "./version-evidence.js";
 
 export interface StructuredAnswerStatement {
   text: string;
@@ -35,6 +38,208 @@ export interface DeterministicResearchAnswer {
 const MAX_STATEMENTS = 10;
 const MAX_TEXT_CHARS = 500;
 const MAX_SOURCES_PER_STATEMENT = 3;
+const currentReleaseAssertionPattern =
+  /\b(?:latest|newest|most recent|current)\b[^.!?\n]{0,100}\b(?:release|version)\b|\b(?:release|version)\b[^.!?\n]{0,100}\b(?:latest|newest|most recent|current)\b/i;
+const versionMentionPattern =
+  /\bv?(\d+(?:\.\d+){1,3}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\b/gi;
+
+function sentenceSegments(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+(?=[A-Z0-9“"'`(])|\n+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function isHistoricalLatestAssertion(sentence: string): boolean {
+  return (
+    /\b(?:previously|formerly|historically)\b[^.!?\n]{0,80}\b(?:latest|newest|most recent|current)\b/i.test(
+      sentence,
+    ) ||
+    /\b(?:was|were|had been|used to be)\b[^.!?\n]{0,80}\b(?:latest|newest|most recent|current)\b[^.!?\n]{0,80}\b(?:as of|in 19\d{2}|in 20\d{2}|during|until|at the time|back then)\b/i.test(
+      sentence,
+    ) ||
+    /\b(?:as of|in|during)\s+(?:19|20)\d{2}\b[^.!?\n]{0,80}\b(?:latest|newest|most recent|current)\b/i.test(
+      sentence,
+    ) ||
+    /\b(?:latest|newest|most recent|current)\b[^.!?\n]{0,80}\b(?:as of|in|during)\s+(?:19|20)\d{2}\b/i.test(
+      sentence,
+    )
+  );
+}
+
+function isExplicitHistoricalRelease(
+  sentence: string,
+  versionIndex: number,
+  versionLength: number,
+) {
+  const context = sentence.slice(Math.max(0, versionIndex - 70), versionIndex + versionLength + 90);
+  return /\b(?:previous|previously|prior|older|historical|historically|former(?:ly)?|no longer current|was released|were released|released\s+(?:on|in)|release(?:d)?\s+in|at that time|back then)\b/i.test(
+    context,
+  );
+}
+
+/**
+ * A proven controller latest version is the canonical current version for its
+ * requested entity. Keep explicit historical statements, but reject another
+ * version presented as current or an older version with no historical framing.
+ */
+export function isLatestnessConsistentText(
+  text: string,
+  assessment: LatestnessAssessment | undefined,
+): boolean {
+  if (
+    !assessment?.required ||
+    assessment?.conclusion !== "PROVEN" ||
+    !assessment.latestVersion ||
+    !assessment.requestedEntity
+  ) {
+    return true;
+  }
+
+  const knownEntities = extractKnownEntities(text);
+  if (!containsExactEntity(text, assessment.requestedEntity) && knownEntities.length > 0) {
+    return true;
+  }
+
+  for (const sentence of sentenceSegments(text)) {
+    const sentenceEntities = extractKnownEntities(sentence);
+    if (sentenceEntities.length > 0 && !containsExactEntity(sentence, assessment.requestedEntity)) {
+      continue;
+    }
+    const versions = [...sentence.matchAll(versionMentionPattern)];
+    if (versions.length === 0) continue;
+
+    const historicalLatest = isHistoricalLatestAssertion(sentence);
+    const assertsCurrent = currentReleaseAssertionPattern.test(sentence);
+    for (const version of versions) {
+      const mentionedVersion = version[1];
+      const versionIndex = version.index ?? 0;
+      if (!mentionedVersion) continue;
+      const comparison = compareVersions(mentionedVersion, assessment.latestVersion);
+      const differsFromCurrent = comparison !== 0;
+      if (differsFromCurrent && assertsCurrent && !historicalLatest) return false;
+
+      if (
+        comparison === -1 &&
+        !isExplicitHistoricalRelease(sentence, versionIndex, version[0].length) &&
+        !(assertsCurrent && historicalLatest)
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/** Remove claims that could present a superseded release as current during synthesis. */
+export function filterLatestnessClaims(
+  claims: Claim[],
+  latestnessRequested: boolean,
+  assessment: LatestnessAssessment | undefined,
+): Claim[] {
+  if (!latestnessRequested) return claims;
+  return claims.filter((claim) => {
+    const text = `${claim.text}\n${claim.evidence}`;
+    if (assessment?.conclusion === "PROVEN") return isLatestnessConsistentText(text, assessment);
+    return !sentenceSegments(text).some(
+      (sentence) =>
+        currentReleaseAssertionPattern.test(sentence) && !isHistoricalLatestAssertion(sentence),
+    );
+  });
+}
+
+/** Keep source support intact while making superseded current-version claims explicit in the ledger. */
+export function reconcileLatestnessClaimDisposition(
+  claims: Claim[],
+  latestnessRequested: boolean,
+  assessment: LatestnessAssessment | undefined,
+): Claim[] {
+  const canReconcile = Boolean(
+    latestnessRequested &&
+    assessment?.required &&
+    assessment.conclusion === "PROVEN" &&
+    assessment.requestedEntity &&
+    assessment.latestVersion,
+  );
+  const synthesisEligibleIds = new Set(
+    canReconcile
+      ? filterLatestnessClaims(claims, true, assessment).map((claim) => claim.id)
+      : claims.map((claim) => claim.id),
+  );
+
+  // Keep the array and claim objects stable. The controller can reconcile
+  // claims while another step still holds references to them (for example,
+  // the verifier mutates the selected claim after state computation).
+  for (const claim of claims) {
+    delete claim.latestnessDisposition;
+    if (canReconcile && !synthesisEligibleIds.has(claim.id)) {
+      claim.latestnessDisposition = {
+        status: "superseded",
+        entity: assessment!.requestedEntity!,
+        acceptedVersion: assessment!.latestVersion!,
+      };
+    }
+  }
+  return claims;
+}
+
+/** Require model synthesis to retain controller-issued current version/date facts exactly. */
+export function preservesCanonicalLatestnessFacts(
+  candidate: Array<{ text: string }>,
+  canonicalStatements: Array<{ text: string }>,
+  assessment: LatestnessAssessment | undefined,
+  releaseDateRequired: boolean,
+): boolean {
+  if (
+    !assessment?.required ||
+    assessment?.conclusion !== "PROVEN" ||
+    !assessment.latestVersion ||
+    !assessment.requestedEntity
+  ) {
+    return true;
+  }
+
+  const canonicalFacts = canonicalStatements.filter((statement) => {
+    if (!containsExactEntity(statement.text, assessment.requestedEntity!)) return false;
+    const versionMatches = [...statement.text.matchAll(versionMentionPattern)].some(
+      (match) => compareVersions(match[1] ?? "", assessment.latestVersion!) === 0,
+    );
+    if (!versionMatches) return false;
+    return (
+      currentReleaseAssertionPattern.test(statement.text) ||
+      (releaseDateRequired && /\b(?:released|release date)\b/i.test(statement.text))
+    );
+  });
+  if (!canonicalFacts.length) return true;
+
+  const normalize = (value: string) => value.toLowerCase().replace(/\s+/g, " ").trim();
+  if (
+    !canonicalFacts.every((expected) =>
+      candidate.some((actual) => normalize(actual.text) === normalize(expected.text)),
+    )
+  )
+    return false;
+
+  const canonicalDateFacts = canonicalFacts.filter((statement) =>
+    /\b(?:released|release date)\b/i.test(statement.text),
+  );
+  if (!releaseDateRequired || !canonicalDateFacts.length) return true;
+  return !candidate.some((statement) => {
+    if (
+      !containsExactEntity(statement.text, assessment.requestedEntity!) ||
+      !/\b(?:released|release date)\b/i.test(statement.text)
+    ) {
+      return false;
+    }
+    const matchesCurrentVersion = [...statement.text.matchAll(versionMentionPattern)].some(
+      (match) => compareVersions(match[1] ?? "", assessment.latestVersion!) === 0,
+    );
+    return (
+      matchesCurrentVersion &&
+      canonicalDateFacts.every((expected) => normalize(statement.text) !== normalize(expected.text))
+    );
+  });
+}
 
 function normalizeStatement(text: string): string {
   return text
@@ -58,11 +263,17 @@ export function renderStructuredResearchAnswer(
       const numbers = statement.sourceIds
         .map((id) => numberById.get(id))
         .filter((number): number is number => number !== undefined);
+      const citations = numbers.map((number) => `[${number}]`).join("");
+      // A verified statement may retain several sentences of adjacent context.
+      // Attach its source binding to every sentence so the structural audit does
+      // not reject the earlier context in both model and deterministic answers.
       const text = statement.text
         .replace(/\s+/g, " ")
         .trim()
-        .replace(/[.!?]+$/, "");
-      return `- ${text}. ${numbers.map((number) => `[${number}]`).join("")}`;
+        .split(/(?<=[.!?])\s+/)
+        .map((sentence) => `${sentence.replace(/[.!?]+$/, "")}. ${citations}`)
+        .join(" ");
+      return `- ${text}`;
     })
     .join("\n");
 }
@@ -309,16 +520,15 @@ export function buildDeterministicResearchAnswer(args: {
   const latestnessProven =
     assessment?.conclusion === "PROVEN" &&
     (!requestedFacts.includes("latestness") || Boolean(latestnessRecord));
-  const supportedClaims = claims
+  const supportedClaims = filterLatestnessClaims(
+    claims,
+    requestedFacts.includes("latestness"),
+    assessment,
+  )
     .filter(
       (claim) =>
         claim.verification?.verdict === "supported" &&
         claim.sourceIds.some((id) => sourceIds.has(id)) &&
-        (!requestedFacts.includes("latestness") ||
-          latestnessProven ||
-          !/\b(?:latest|newest|most recent|current)\b.{0,60}\b(?:release|version)\b|\b(?:release|version)\b.{0,60}\b(?:latest|newest|most recent|current)\b/i.test(
-            claim.text,
-          )) &&
         (!officialSourcesRequired ||
           claim.sourceIds.some((id) => officialSource(sources.find((source) => source.id === id)))),
     )

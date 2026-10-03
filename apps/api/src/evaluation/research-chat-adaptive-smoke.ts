@@ -7,6 +7,8 @@ import type { InMemoryDurableJobStore } from "../jobs.js";
 import type { SqliteSessionStore } from "../store.js";
 import type { FastifyInstance } from "fastify";
 import { researchActionsUsed, researchChatRetrievalMetrics } from "./research-chat-metrics.js";
+import { searchDiagnosticTrace } from "../search-diagnostics.js";
+import type { SearchAttempt } from "../search.js";
 import {
   enqueueOnceThenPoll,
   parseRetryAfterMs,
@@ -470,7 +472,9 @@ async function main(): Promise<void> {
   });
 
   const diagnostics = lifecycle.diagnostics;
-  const llmMetrics = resources.llm?.metrics;
+  // The worker owns a separate AsyncLocalStorage scope. Read its persisted
+  // snapshot, not the provider's empty metrics in this evaluator's scope.
+  const llmMetrics = session?.state?.providerMetrics?.writer ?? resources.llm?.metrics;
   const retrievalMetrics = session ? researchChatRetrievalMetrics(session.sources) : undefined;
   const actionsUsed = researchActionsUsed(session?.decisions ?? []);
   const polling = summarizePollingTelemetry(
@@ -576,6 +580,7 @@ async function main(): Promise<void> {
       queries: recovery.queries,
       queryValidation: recovery.queryValidation,
     })),
+    searchAttempts: searchDiagnosticTrace(session?.searchAttempts as SearchAttempt[] | undefined),
     unusedBudget: {
       queries: Math.max(0, MAX_SEARCH_QUERIES - (resources.queries?.length ?? 0)),
       sources: Math.max(0, MAX_SOURCES - (session?.sources.length ?? 0)),

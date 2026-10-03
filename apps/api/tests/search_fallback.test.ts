@@ -210,7 +210,8 @@ describe("Serper search provider", () => {
         {
           url: "https://example.org/current?utm_source=cache",
           title: "Cached current result",
-          content: "The cached article has longer, previously verified supporting detail.",
+          content:
+            "The cached React version article has longer, previously verified supporting detail.",
           rawHtml: "",
           fetchedAt: new Date().toISOString(),
           lastVerifiedAt: new Date().toISOString(),
@@ -220,7 +221,7 @@ describe("Serper search provider", () => {
         {
           url: "https://react.dev/versions",
           title: "Cached official version history",
-          content: "A recently fetched official version history.",
+          content: "A recently fetched official React version history.",
           rawHtml: "",
           fetchedAt: new Date().toISOString(),
           lastVerifiedAt: new Date().toISOString(),
@@ -259,7 +260,7 @@ describe("Serper search provider", () => {
     expect(results.find((result) => result.url === "https://example.org/current")).toMatchObject({
       provider: "serper",
       providers: ["serper", "internal-knowledge"],
-      snippet: "The cached article has longer, previously verified supporting detail.",
+      snippet: "A live search result.",
     });
     expect(results.map((result) => result.url)).toContain("https://react.dev/versions");
     expect(attempts).toMatchObject([

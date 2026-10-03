@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { config } from "../src/config.js";
 import { OpenRouterProvider } from "../src/llm.js";
+import { withOperationContext } from "../src/operation-context.js";
 import { ResearchRunner } from "../src/research.js";
 import {
   remainingResearchTimeMs,
@@ -189,19 +190,21 @@ describe("research execution deadline and cancellation", () => {
       maxTimeMs: 250,
     });
 
-    const started = await runner.start(
-      "Summarize recent discoveries in quantum computing and fusion energy",
-      "quick",
-    );
-    const completed = await waitForTerminal(store, started.id);
+    await withOperationContext(async () => {
+      const started = await runner.start(
+        "Summarize recent discoveries in quantum computing and fusion energy",
+        "quick",
+      );
+      const completed = await waitForTerminal(store, started.id);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
-    expect(llm.metrics.failures).toBe(1);
-    expect(completed.status).toBe("FAILED");
-    expect(completed.error).toMatch(/^INSUFFICIENT_EVIDENCE:/);
-    expect(completed.answer).toMatch(/insufficient evidence|time limit/i);
-    expect(completed.steps.some((step) => step.label.includes("budget exhausted"))).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
+      expect(llm.metrics.failures).toBe(1);
+      expect(completed.status).toBe("FAILED");
+      expect(completed.error).toMatch(/^INSUFFICIENT_EVIDENCE:/);
+      expect(completed.answer).toMatch(/insufficient evidence|time limit/i);
+      expect(completed.steps.some((step) => step.label.includes("budget exhausted"))).toBe(true);
+    });
   });
 
   it("bounds an uncooperative search and records one failed terminal state", async () => {

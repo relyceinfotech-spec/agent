@@ -5,10 +5,11 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ResearchSession, Source } from "../src/domain.js";
 import type { AutonomousRun, TopicCandidate } from "../src/content-domain.js";
+import { DEFAULT_TOPIC_ALLOWED_DOMAINS, DEFAULT_TOPIC_FEEDS } from "../src/config.js";
 import { ContentAgent } from "../src/content-agent.js";
 import { DurableQueueWorker, InMemoryDurableJobStore } from "../src/jobs.js";
 import { SqliteSessionStore } from "../src/store.js";
-import { discoverTopics } from "../src/topic-discovery.js";
+import { discoverTopics, normalizeTopicFeedUrls } from "../src/topic-discovery.js";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -123,6 +124,7 @@ describe("autonomous content agent", () => {
   it("discovers a feed topic, researches it, passes the quality gate, and publishes provenance", async () => {
     const store = makeStore();
     const publishedAt = new Date().toISOString();
+    const rssSummary = "RSS discovery only marker; it must not become publication evidence.";
     const research = {
       start: vi.fn(async (_question: string, _mode: string, seeds: Array<{ url: string }>) => {
         const session = completedResearch(seeds[0].url);
@@ -135,7 +137,7 @@ describe("autonomous content agent", () => {
       {
         title: "New React rendering research findings",
         url: "https://react.dev/blog/new-rendering-findings",
-        summary: "Official research article with measured results and methodology. ".repeat(4),
+        summary: rssSummary,
         publishedAt,
         provider: "fixture-feed",
       },
@@ -164,6 +166,11 @@ describe("autonomous content agent", () => {
       const post = (await store.getPost(run.postId!))!;
       expect(post.researchId).toBe(run.researchId);
       expect(post.sources.map((item) => item.url)).toContain(topicRecord.url);
+      expect(post.sources.map((item) => item.content ?? "").join("\n")).not.toContain(rssSummary);
+      expect(research.start.mock.calls[0]?.[2]?.[0]).toMatchObject({
+        snippet: rssSummary,
+        provider: "topic-feed",
+      });
       expect(post.claims.every((claim) => claim.verification?.verdict === "supported")).toBe(true);
     } finally {
       store.close();
@@ -503,15 +510,19 @@ describe("autonomous content agent", () => {
   it("cancels a durable Post Agent run during topic discovery", async () => {
     const store = makeStore();
     const jobs = new InMemoryDurableJobStore();
-    let releaseFeed!: (entries: []) => void;
-    const feedPending = new Promise<[]>((resolve) => {
-      releaseFeed = resolve;
-    });
+    let feedSignal: AbortSignal | undefined;
     const agent = new ContentAgent(
       store,
       { start: vi.fn(), cancel: vi.fn() } as never,
       ["fixture-feed"],
-      async () => feedPending,
+      async (_url, signal) => {
+        feedSignal = signal;
+        return new Promise<[]>((_resolve, reject) => {
+          const abort = () => reject(signal?.reason ?? new Error("feed cancelled"));
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        });
+      },
       undefined,
       async (run) => {
         const result = await jobs.enqueueJob({
@@ -555,13 +566,12 @@ describe("autonomous content agent", () => {
       expect(await jobs.cancelJob(queuedRun.id, undefined, true)).toMatchObject({
         status: "cancel_requested",
       });
-      releaseFeed([]);
 
       const job = await waitForJob(jobs, queuedRun.id);
       expect(job.status).toBe("cancelled");
+      expect(feedSignal?.aborted).toBe(true);
       expect((await store.getRun(queuedRun.id))?.status).toBe("CANCELLED");
     } finally {
-      releaseFeed?.([]);
       await worker.stop();
       store.close();
     }
@@ -667,6 +677,53 @@ describe("autonomous content agent", () => {
     store.close();
   });
 
+  it("does not save feed candidates with an invalid non-empty timestamp", async () => {
+    const store = makeStore();
+    const url = "https://example.com/research/malformed-date";
+    try {
+      const result = await discoverTopics(store, ["fixture-feed"], async () => [
+        {
+          title: "A detailed new research announcement",
+          url,
+          summary: "Documented findings with a useful description. ".repeat(8),
+          publishedAt: "not-a-real-date",
+          provider: "fixture-feed",
+        },
+      ]);
+
+      expect(result.candidates).toHaveLength(0);
+      expect(await store.getTopicByUrl(url)).toBeUndefined();
+    } finally {
+      store.close();
+    }
+  });
+
+  it("passes cancellation to trusted-domain discovery search", async () => {
+    const store = makeStore();
+    const controller = new AbortController();
+    let searchSignal: AbortSignal | undefined;
+    const fallback = {
+      search: vi.fn(async (_query: string, signal?: AbortSignal) => {
+        searchSignal = signal;
+        return new Promise<never>((_resolve, reject) => {
+          const abort = () => reject(signal?.reason ?? new Error("search cancelled"));
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        });
+      }),
+    };
+    try {
+      const pending = discoverTopics(store, [], async () => [], fallback, controller.signal);
+      await vi.waitFor(() => expect(fallback.search).toHaveBeenCalledOnce());
+      controller.abort(new Error("worker cancellation requested"));
+
+      await expect(pending).rejects.toThrow("worker cancellation requested");
+      expect(searchSignal).toBe(controller.signal);
+    } finally {
+      store.close();
+    }
+  });
+
   it("uses bounded trusted-domain search when every configured feed fails", async () => {
     const store = makeStore();
     const fallback = {
@@ -749,5 +806,98 @@ describe("saved topic discovery backlog", () => {
     } finally {
       store.close();
     }
+  });
+});
+
+describe("Post Agent RSS feed registry", () => {
+  it("uses the canonical feed URLs and exact trusted-domain entries", () => {
+    expect(DEFAULT_TOPIC_FEEDS).toEqual([
+      "https://github.blog/feed/",
+      "https://blog.cloudflare.com/rss/",
+      "https://techcrunch.com/feed/",
+      "https://www.theverge.com/rss/index.xml",
+      "https://www.engadget.com/rss.xml",
+      "https://feeds.arstechnica.com/arstechnica/index",
+      "https://feeds.venturebeat.com/VentureBeat",
+      "https://feeds.arstechnica.com/arstechnica/technology-lab",
+      "https://feeds.arstechnica.com/arstechnica/gadgets",
+      "https://electrek.co/feed/",
+      "https://feeds.arstechnica.com/arstechnica/cars",
+      "https://www.supplychaindive.com/feeds/news/",
+      "https://www.freightwaves.com/feed",
+      "https://www.retaildive.com/feeds/news/",
+      "https://www.marketingdive.com/feeds/news/",
+      "https://www.bleepingcomputer.com/feed/",
+      "https://krebsonsecurity.com/feed/",
+      "https://www.cybersecuritydive.com/feeds/news/",
+      "https://www.utilitydive.com/feeds/news/",
+      "https://www.energy.gov/listings/energy-news?view=rss",
+      "https://www.sebi.gov.in/sebirss.xml",
+      "https://rbi.org.in/pressreleases_rss.xml",
+      "https://rbi.org.in/notifications_rss.xml",
+      "https://www.sec.gov/news/pressreleases.rss",
+      "https://www.ftc.gov/feeds/press-release.xml",
+      "https://www.ftc.gov/feeds/press-release-competition.xml",
+      "https://www.cpsc.gov/Newsroom/CPSC-RSS-Feed/Recalls-RSS",
+      "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/medwatch/rss.xml",
+    ]);
+    expect(DEFAULT_TOPIC_FEEDS).toHaveLength(28);
+    expect(
+      DEFAULT_TOPIC_FEEDS.filter((feed) => {
+        try {
+          const hostname = new URL(feed).hostname;
+          return (
+            new URL(feed).protocol !== "https:" ||
+            !DEFAULT_TOPIC_ALLOWED_DOMAINS.some(
+              (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+            )
+          );
+        } catch {
+          return true;
+        }
+      }),
+    ).toEqual([]);
+    expect(DEFAULT_TOPIC_ALLOWED_DOMAINS).toEqual([
+      "github.blog",
+      "blog.cloudflare.com",
+      "react.dev",
+      "nodejs.org",
+      "techcrunch.com",
+      "theverge.com",
+      "engadget.com",
+      "arstechnica.com",
+      "venturebeat.com",
+      "electrek.co",
+      "supplychaindive.com",
+      "freightwaves.com",
+      "retaildive.com",
+      "marketingdive.com",
+      "bleepingcomputer.com",
+      "krebsonsecurity.com",
+      "cybersecuritydive.com",
+      "utilitydive.com",
+      "energy.gov",
+      "sebi.gov.in",
+      "rbi.org.in",
+      "sec.gov",
+      "ftc.gov",
+      "cpsc.gov",
+      "fda.gov",
+    ]);
+    expect(DEFAULT_TOPIC_FEEDS.some((feed) => /[?&](?:utm_[^=]+|fbclid|gclid)=/i.test(feed))).toBe(
+      false,
+    );
+    expect(DEFAULT_TOPIC_FEEDS).toContain("https://www.energy.gov/listings/energy-news?view=rss");
+    expect(normalizeTopicFeedUrls(DEFAULT_TOPIC_FEEDS)).toEqual(DEFAULT_TOPIC_FEEDS);
+  });
+
+  it("removes feed duplicates after canonical URL normalization", () => {
+    expect(
+      normalizeTopicFeedUrls([
+        "https://example.com/feed/",
+        " https://EXAMPLE.com/feed/?utm_source=chatgpt.com#latest ",
+        "https://example.com/feed",
+      ]),
+    ).toEqual(["https://example.com/feed/"]);
   });
 });

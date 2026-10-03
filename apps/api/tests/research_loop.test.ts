@@ -1375,7 +1375,7 @@ describe("autonomous research loop", () => {
       tools.register({
         name,
         description: name,
-        execute: async () => {
+        execute: async (input) => {
           calls.push(name);
           if (name === "web_search" || name === "search_again") return [result];
           if (name === "fetch_url") return { url: result.url, html: "<article>Evidence</article>" };
@@ -1383,9 +1383,15 @@ describe("autonomous research loop", () => {
             return {
               title: result.title,
               content:
-                "A sufficiently long evidence sentence describing a measurable performance difference in the benchmark results.",
+                "React Native and Flutter have a measurable performance difference in the documented benchmark results from this source.",
             };
-          if (name === "extract_claims") return [claim, { ...claim, id: "claim-2" }];
+          if (name === "extract_claims") {
+            const source = (input as { sources: Source[] }).sources[0]!;
+            return [claim, { ...claim, id: "claim-2" }].map((item) => ({
+              ...item,
+              sourceIds: [source.id],
+            }));
+          }
           if (name === "verify_claim")
             return { verdict: "supported", rationale: "The evidence supports the claim." };
           if (name === "synthesize") return "Cited answer";
@@ -1533,7 +1539,12 @@ describe("autonomous research loop", () => {
       execute: async (input) => {
         const source = (input as { sources: Source[] }).sources[0]!;
         return [
-          { ...claim, sourceIds: [source.id], evidence: source.content ?? claim.evidence },
+          {
+            ...claim,
+            text: "React is a JavaScript library for building user interfaces.",
+            sourceIds: [source.id],
+            evidence: source.content ?? claim.evidence,
+          },
           {
             ...claim,
             id: "claim-2",
@@ -1618,12 +1629,13 @@ describe("autonomous research loop", () => {
       tools.register({
         name,
         description: name,
-        execute: async () => {
+        execute: async (input) => {
           calls.push(name);
           if (name === "web_search") return [result];
           if (name === "fetch_url") return { url: result.url, html: "<article>Evidence</article>" };
           if (name === "extract_content") return { title: result.title, content: claim.evidence };
-          if (name === "extract_claims") return [claim];
+          if (name === "extract_claims")
+            return [{ ...claim, sourceIds: [(input as { sources: Source[] }).sources[0]!.id] }];
           if (name === "verify_claims_batch")
             return [
               {
@@ -1646,6 +1658,11 @@ describe("autonomous research loop", () => {
     const failed = await store.get(session.id);
     expect(failed?.status).toBe("FAILED");
     expect(failed?.error).toContain("OpenRouter returned 429");
+    expect(failed?.claims).toEqual([
+      expect.objectContaining({
+        verification: expect.objectContaining({ verdict: "unavailable" }),
+      }),
+    ]);
     expect(calls).not.toContain("search_again");
   });
 

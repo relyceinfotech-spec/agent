@@ -84,6 +84,7 @@ function sourceSupportsPublishableClaim(
   source: Source,
 ): boolean {
   if (
+    claim.latestnessDisposition?.status === "superseded" ||
     claim.verification?.verdict !== "supported" ||
     claim.evidence.length < 80 ||
     !claim.sourceIds.includes(source.id)
@@ -177,6 +178,7 @@ function usefulSources(session: ResearchSession): Source[] {
     Boolean(
       source.content &&
       source.content.length >= 120 &&
+      source.contentOrigin !== "metadata" &&
       source.retrievalMethod !== "serper_snippet" &&
       !source.fetchError &&
       source.quality.overall >= 0.4,
@@ -228,8 +230,11 @@ export function evaluatePostQuality(
   if (!useful.some((source) => canonicalizeUrl(source.url) === canonicalizeUrl(topic.url))) {
     reasons.push("Original topic source was not fetched and validated");
   }
-  if (topic.publishedAt && Date.now() - Date.parse(topic.publishedAt) > 14 * 86_400_000) {
-    reasons.push("Topic is no longer fresh enough for autonomous publication");
+  if (topic.publishedAt) {
+    const publishedAt = Date.parse(topic.publishedAt);
+    if (!Number.isFinite(publishedAt) || Date.now() - publishedAt > 14 * 86_400_000) {
+      reasons.push("Topic is no longer fresh enough for autonomous publication");
+    }
   }
   const evidenceIssue = reasons.length > 0;
   if (session.conflicts?.some((conflict) => conflict.status === "open")) {

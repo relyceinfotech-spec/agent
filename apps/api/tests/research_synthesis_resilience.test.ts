@@ -15,7 +15,9 @@ import { InMemoryDurableJobStore } from "../src/jobs.js";
 import { auditResearchCitations, OpenRouterProvider } from "../src/llm.js";
 import { requestedFactCoverage } from "../src/requested-facts.js";
 import {
+  buildDeterministicResearchAnswer,
   parseStructuredResearchAnswer,
+  reconcileLatestnessClaimDisposition,
   renderStructuredResearchAnswer,
 } from "../src/research-answer.js";
 import { createServer } from "../src/server.js";
@@ -160,6 +162,45 @@ function response(statements: Array<{ text: string; sourceIds?: string[] }>) {
 
 function validModelResponse() {
   return response([{ text: expectedLatest }, { text: expectedDate }]);
+}
+
+function secondaryReleaseSource(id: string, claimText: string): Source {
+  return {
+    id,
+    title: "Secondary release article",
+    url: `https://example.test/releases/${id}`,
+    domain: "example.test",
+    snippet: claimText,
+    content: claimText,
+    sourceType: "web",
+    quality: { relevance: 0.8, authority: 0.5, freshness: 0.4, completeness: 0.8, overall: 0.6 },
+  };
+}
+
+function releaseClaim(
+  id: string,
+  text: string,
+  sourceId: string,
+  verdict: NonNullable<Claim["verification"]>["verdict"] = "supported",
+): Claim {
+  return {
+    id,
+    text,
+    evidence: text,
+    sourceIds: [sourceId],
+    confidence: 0.9,
+    verification: { verdict },
+  };
+}
+
+function withoutOfficialRequirement(plan: ResearchPlan): ResearchPlan {
+  return {
+    ...plan,
+    interpretation: {
+      ...plan.interpretation,
+      sourceRequirements: { officialSources: "none" },
+    },
+  };
 }
 
 function makeModel() {
@@ -358,6 +399,202 @@ describe("provider-free synthesis resilience", () => {
         { text: expectedLatest, sourceIds: ["different-source"] },
       ]),
     ).toMatchObject({ status: "REJECTED" });
+  });
+});
+
+describe("latestness consistency across synthesis", () => {
+  const staleLatest = "The latest version of React is 19.1.0, released in March 2025.";
+
+  it("keeps source support while marking a superseded current claim in the ledger", () => {
+    const { claim, assessment } = fixture();
+    const staleSource = secondaryReleaseSource("react-stale-ledger-source", staleLatest);
+    const historicalSource = secondaryReleaseSource(
+      "react-historical-ledger-source",
+      "React 19.1.0 was a previous stable release in March 2025.",
+    );
+    const stale = releaseClaim("react-stale-ledger-claim", staleLatest, staleSource.id);
+    const historical = releaseClaim(
+      "react-historical-ledger-claim",
+      "React 19.1.0 was a previous stable release in March 2025.",
+      historicalSource.id,
+    );
+
+    const originalClaims = [claim, stale, historical];
+    const claims = reconcileLatestnessClaimDisposition(originalClaims, true, assessment);
+
+    expect(claims).toBe(originalClaims);
+    expect(claims.find((candidate) => candidate.id === stale.id)).toBe(stale);
+    expect(claims.find((candidate) => candidate.id === stale.id)).toMatchObject({
+      verification: { verdict: "supported" },
+      latestnessDisposition: {
+        status: "superseded",
+        entity: "React",
+        acceptedVersion: "19.3.0",
+      },
+    });
+    expect(
+      claims.find((candidate) => candidate.id === claim.id)?.latestnessDisposition,
+    ).toBeUndefined();
+    expect(
+      claims.find((candidate) => candidate.id === historical.id)?.latestnessDisposition,
+    ).toBeUndefined();
+  });
+
+  it("removes a supported stale secondary claim before synthesis and rejects a rewrite that reintroduces it", async () => {
+    config.OPENROUTER_API_KEY = "test-only-key";
+    const provider = makeModel();
+    const { plan, source, claim, state, assessment } = fixture();
+    const secondary = secondaryReleaseSource("react-stale-secondary", staleLatest);
+    const secondaryPlan = withoutOfficialRequirement(plan);
+    const staleClaim = releaseClaim("react-stale-claim", staleLatest, secondary.id);
+    const complete = vi.spyOn(provider, "complete").mockImplementation(async (_system, user) => {
+      expect(user).not.toContain(staleLatest);
+      return response([
+        { text: expectedLatest, sourceIds: [source.id] },
+        { text: staleLatest, sourceIds: [secondary.id] },
+        { text: expectedDate, sourceIds: [source.id] },
+      ]);
+    });
+
+    const answer = await provider.synthesize(
+      question,
+      secondaryPlan,
+      [source, secondary],
+      [claim, staleClaim],
+      state,
+    );
+
+    expect(complete).toHaveBeenCalledOnce();
+    expect(answer).toContain(expectedLatest);
+    expect(answer).toContain(expectedDate);
+    expect(answer).not.toContain("19.1.0");
+    expect(provider.metrics.synthesis).toMatchObject({
+      fallbackUsed: true,
+      finalAnswerSource: "deterministic",
+      citationValidationResult: "VALIDATED",
+    });
+    expect(provider.metrics.citationEntailment?.finalAnswer).not.toContain("19.1.0");
+    expect(
+      provider.metrics.citationEntailment?.items.find((item) =>
+        item.text.includes("latest stable release of React"),
+      )?.sourceIds,
+    ).toContain(source.id);
+  });
+
+  it("keeps older versions when the claim explicitly describes them as historical", () => {
+    const { plan, source, claim, state } = fixture();
+    const secondary = secondaryReleaseSource(
+      "react-historical-secondary",
+      "React 19.1.0 was a previous stable release, published in March 2025.",
+    );
+    const historical = releaseClaim(
+      "react-historical-claim",
+      "React 19.1.0 was a previous stable release, published in March 2025.",
+      secondary.id,
+    );
+    const built = buildDeterministicResearchAnswer({
+      question,
+      plan: withoutOfficialRequirement(plan),
+      sources: [source, secondary],
+      claims: [claim, historical],
+      researchState: state,
+    });
+
+    expect(built.answer).toContain("19.1.0 was a previous stable release");
+    expect(built.answer).toContain(expectedLatest);
+    expect(built.answer).toContain(expectedDate);
+  });
+
+  it("keeps an explicitly time-bounded statement that an older version was once latest", () => {
+    const { plan, source, claim, state } = fixture();
+    const secondary = secondaryReleaseSource(
+      "react-historical-latest-secondary",
+      "React 19.1.0 was the latest stable version in 2025.",
+    );
+    const historical = releaseClaim(
+      "react-historical-latest-claim",
+      "React 19.1.0 was the latest stable version in 2025.",
+      secondary.id,
+    );
+    const built = buildDeterministicResearchAnswer({
+      question,
+      plan: withoutOfficialRequirement(plan),
+      sources: [source, secondary],
+      claims: [claim, historical],
+      researchState: state,
+    });
+
+    expect(built.answer).toContain("was the latest stable version in 2025");
+  });
+
+  it("drops multiple conflicting current-version claims from different sources", () => {
+    const { plan, source, claim, state } = fixture();
+    const first = secondaryReleaseSource(
+      "react-stale-191-secondary",
+      "The latest React version is 19.1.0.",
+    );
+    const second = secondaryReleaseSource(
+      "react-stale-192-secondary",
+      "The current React release is version 19.2.0.",
+    );
+    const built = buildDeterministicResearchAnswer({
+      question,
+      plan: withoutOfficialRequirement(plan),
+      sources: [source, first, second],
+      claims: [
+        claim,
+        releaseClaim("react-stale-191", "The latest React version is 19.1.0.", first.id),
+        releaseClaim("react-stale-192", "The current React release is version 19.2.0.", second.id),
+      ],
+      researchState: state,
+    });
+
+    expect(built.answer).toContain(expectedLatest);
+    expect(built.answer).not.toContain("19.1.0");
+    expect(built.answer).not.toContain("19.2.0");
+  });
+
+  it("falls back when model synthesis pairs the canonical version with a conflicting release date", async () => {
+    config.OPENROUTER_API_KEY = "test-only-key";
+    const provider = makeModel();
+    const { plan, source, claim, state } = fixture();
+    const wrongDate = "React 19.3.0 was released on October 1, 2025.";
+    vi.spyOn(provider, "complete").mockResolvedValue(
+      response([{ text: expectedLatest }, { text: wrongDate }]),
+    );
+
+    const answer = await provider.synthesize(question, plan, [source], [claim], state);
+
+    expect(answer).toContain(expectedLatest);
+    expect(answer).toContain(expectedDate);
+    expect(answer).not.toContain(wrongDate);
+    expect(provider.metrics.synthesis).toMatchObject({
+      fallbackUsed: true,
+      finalAnswerSource: "deterministic",
+      citationValidationResult: "VALIDATED",
+    });
+  });
+
+  it("does not filter an unrelated latest fact that names no version", () => {
+    const { plan, source, claim, state } = fixture();
+    const secondary = secondaryReleaseSource(
+      "react-latest-practice-secondary",
+      "The latest practice for React applications is to profile before optimizing.",
+    );
+    const unrelated = releaseClaim(
+      "react-latest-practice-claim",
+      "The latest practice for React applications is to profile before optimizing.",
+      secondary.id,
+    );
+    const built = buildDeterministicResearchAnswer({
+      question,
+      plan: withoutOfficialRequirement(plan),
+      sources: [source, secondary],
+      claims: [claim, unrelated],
+      researchState: state,
+    });
+
+    expect(built.answer).toContain("The latest practice for React applications");
   });
 });
 

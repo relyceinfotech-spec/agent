@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import {
+  comparisonClaimHasTargetFinding,
+  comparisonCoverage,
+  comparisonEvidencePassages,
+} from "./comparison-evidence.js";
 import { currentWorkerContext } from "./worker-context.js";
 import { config } from "./config.js";
 import {
@@ -48,11 +53,20 @@ import type { SearchProvider } from "./search.js";
 import type { SessionStore } from "./store.js";
 import { createToolRegistry, MAX_BATCH_VERIFICATION_CLAIMS, ToolRegistry } from "./agent/tools.js";
 import type { SearchAttempt } from "./search.js";
+import { searchDiagnosticTrace, safeSearchMessage } from "./search-diagnostics.js";
 import { pMap } from "./concurrency.js";
 import { isSerperSnippetSufficient, SourceRetrievalError } from "./source-retrieval.js";
-import { subjectEntityMismatchReason } from "./entities.js";
+import { containsExactEntity, subjectEntityMismatchReason } from "./entities.js";
+import {
+  querySubjectMismatchReason,
+  comparisonClaimMismatchReason,
+  relevantSourceContent,
+  requestedSubjectNames,
+} from "./query-relevance.js";
+import { withOperationContext } from "./operation-context.js";
 import type { CitationEntailmentReport } from "./citation-entailment.js";
 import { enforceResearchChatBoundedFactCoverage } from "./research-chat-fact-gate.js";
+import { reconcileLatestnessClaimDisposition } from "./research-answer.js";
 import {
   extractRequestedFacts,
   classifyEvidenceStatus,
@@ -110,6 +124,8 @@ const TEST_EVALUATION_BUDGET_LIMITS: ResearchBudget = {
   maxModelDecisions: 4,
 };
 interface LoopState {
+  sessionId: string;
+  jobId?: string;
   mode: ResearchMode;
   question: string;
   plan: Awaited<ReturnType<typeof buildPlan>>;
@@ -150,10 +166,10 @@ interface EvidenceAssessment {
 function verificationVerdict(
   value: string | undefined,
 ): NonNullable<Claim["verification"]>["verdict"] {
-  const verdict = value?.toLowerCase() ?? "";
-  if (verdict.includes("support")) return "supported";
-  if (verdict.includes("contrad")) return "contradicted";
-  if (verdict.includes("uncertain")) return "uncertain";
+  const verdict = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (verdict === "supported") return "supported";
+  if (verdict === "contradicted") return "contradicted";
+  if (verdict === "uncertain") return "uncertain";
   return "unavailable";
 }
 
@@ -885,6 +901,9 @@ export class ResearchRunner {
     } = {},
   ): Promise<ResearchSession | undefined> {
     const current = await this.store.get(id);
+    if (current && current.question !== question && !options.resume) {
+      throw new Error("Research session belongs to a different request");
+    }
     if (current?.status === "CANCELLED") return current;
     if (
       current?.status === "COMPLETED" ||
@@ -1134,7 +1153,10 @@ export class ResearchRunner {
         const session = await this.store.get(id);
         if (session) {
           await this.update(id, {
-            searchAttempts: [...(session.searchAttempts ?? []), ...attempts],
+            searchAttempts: searchDiagnosticTrace([
+              ...((session.searchAttempts ?? []) as SearchAttempt[]),
+              ...attempts,
+            ]),
           });
         }
       }
@@ -1179,6 +1201,14 @@ export class ResearchRunner {
 
   private pageLimitForPass(state: LoopState, budget: ResearchBudget): number {
     if (state.searchPasses > 0 || budget.maxSearchPasses === 0) return budget.maxPages;
+    if (
+      state.researchChatOptimization &&
+      state.mode === "quick" &&
+      state.plan.interpretation.comparison &&
+      budget.maxPages >= 2 &&
+      this.canSearchAgain(state, budget)
+    )
+      return budget.maxPages - 1;
     // Reserve a bounded second pass for research modes with enough page budget.
     // A two-page budget cannot be split without making the first evidence check too weak.
     return budget.maxPages > 2
@@ -1193,6 +1223,12 @@ export class ResearchRunner {
 
     const requestedFacts = requestedFactsForPlan(state.plan);
     if (this.isFocusedLifecycleLookup(state)) return Math.min(1, remainingSlots);
+    if (
+      state.researchChatOptimization &&
+      state.mode === "quick" &&
+      state.plan.interpretation.comparison
+    )
+      return Math.min(1, remainingSlots);
     const needsIndependentEvidence =
       state.mode === "deep" ||
       state.plan.interpretation.entities.length >= 2 ||
@@ -1201,8 +1237,21 @@ export class ResearchRunner {
   }
 
   private taskEligibleClaims(state: LoopState): Claim[] {
+    const sourceIds = new Set(
+      state.fetchedSources
+        .filter((source) => !source.subjectMismatchReason)
+        .map((source) => source.id),
+    );
+    const currentClaims = state.claims.filter(
+      (claim) =>
+        claim.provenance?.sessionId === state.sessionId &&
+        claim.provenance.question === state.question &&
+        claim.provenance.jobId === state.jobId &&
+        claim.sourceIds.length > 0 &&
+        claim.sourceIds.every((sourceId) => sourceIds.has(sourceId)),
+    );
     if (state.plan.interpretation.sourceRequirements?.officialSources !== "required") {
-      return state.claims;
+      return currentClaims;
     }
 
     const eligibleOfficialSourceIds = new Set(
@@ -1216,7 +1265,7 @@ export class ResearchRunner {
         .map((source) => source.id),
     );
 
-    return state.claims.filter((claim) =>
+    return currentClaims.filter((claim) =>
       claim.sourceIds.some((sourceId) => eligibleOfficialSourceIds.has(sourceId)),
     );
   }
@@ -1281,8 +1330,6 @@ export class ResearchRunner {
       }
     }
 
-    const verifiedClaims = eligibleClaims.filter((c) => c.verification?.verdict === "supported");
-    const verifiedClaimTexts = verifiedClaims.map((claim) => `${claim.text}\n${claim.evidence}`);
     const requestedFacts = requestedFactsForPlan(state.plan);
     const officialSourcesRequired =
       state.plan.interpretation.sourceRequirements?.officialSources === "required";
@@ -1302,6 +1349,16 @@ export class ResearchRunner {
           releaseRecords,
         })
       : undefined;
+    state.claims = reconcileLatestnessClaimDisposition(
+      state.claims,
+      requestedFacts.includes("latestness"),
+      latestnessAssessment,
+    );
+    const currentEligibleClaims = this.taskEligibleClaims(state);
+    const verifiedClaims = currentEligibleClaims.filter(
+      (claim) => claim.verification?.verdict === "supported",
+    );
+    const verifiedClaimTexts = verifiedClaims.map((claim) => `${claim.text}\n${claim.evidence}`);
     const latestnessProven = latestnessAssessment?.conclusion === "PROVEN";
     const coverageOptions = factCoverageOptions(
       state.plan,
@@ -1319,6 +1376,37 @@ export class ResearchRunner {
       state.fetchedSources,
       officialSourcesRequired,
     );
+    if (
+      state.researchChatOptimization &&
+      requestedFacts.includes("price") &&
+      state.plan.interpretation.formatPreference === "comparison"
+    ) {
+      const subjects = [
+        ...new Set([
+          ...state.plan.interpretation.entities,
+          ...requestedSubjectNames(state.question),
+        ]),
+      ];
+      const missingPriceSubject =
+        subjects.length >= 2 &&
+        subjects.some(
+          (subject) =>
+            !verifiedClaims.some(
+              (claim) =>
+                containsExactEntity(claim.text, subject) &&
+                requestedFactCoverage(state.question, claim.text, {
+                  requestedFacts: ["price"],
+                }).present.includes("price"),
+            ),
+        );
+      if (missingPriceSubject) {
+        verifiedFactCoverage.present = verifiedFactCoverage.present.filter(
+          (fact) => fact !== "price",
+        );
+        if (!verifiedFactCoverage.missing.includes("price"))
+          verifiedFactCoverage.missing.push("price");
+      }
+    }
     const objectiveCoverage = applyCanonicalFactCoverageToObjectives(
       objectives,
       verifiedFactCoverage,
@@ -1329,6 +1417,29 @@ export class ResearchRunner {
       state.plan.interpretation.entities,
     );
 
+    const comparison =
+      state.researchChatOptimization && state.plan.interpretation.comparison
+        ? comparisonCoverage(state.plan.interpretation.comparison, verifiedClaims)
+        : undefined;
+    if (comparison) {
+      for (const objective of objectives) {
+        const cells = comparison.cells.filter((cell) => cell.dimension === objective.category);
+        const covered = cells.filter((cell) => cell.claimIds.length > 0);
+        objective.coverage = cells.length ? covered.length / cells.length : 0;
+        objective.status =
+          objective.coverage === 1 ? "fulfilled" : objective.coverage > 0 ? "partial" : "pending";
+        objective.evidenceIds = [...new Set(covered.flatMap((cell) => cell.claimIds))];
+        objective.sourceIds = [...new Set(covered.flatMap((cell) => cell.sourceIds))];
+        const canonicalObjective = objectiveCoverage?.find(
+          (entry) => entry.objectiveId === objective.id,
+        );
+        if (canonicalObjective) {
+          canonicalObjective.status = objective.status;
+          canonicalObjective.claimIds = [...objective.evidenceIds];
+          canonicalObjective.sourceIds = [...objective.sourceIds];
+        }
+      }
+    }
     const weights: Record<string, number> = { critical: 3, high: 2, medium: 1, low: 0.5 };
     let totalWeight = 0;
     let weightedScore = 0;
@@ -1347,6 +1458,22 @@ export class ResearchRunner {
 
     return {
       objectives,
+      comparisonCoverage: comparison,
+      comparisonOutcome: comparison
+        ? comparison.sufficient
+          ? "sufficient"
+          : state.fetchedSources.some((source) => source.content && !source.subjectMismatchReason)
+            ? "relevant_but_insufficient"
+            : "no_relevant_evidence"
+        : undefined,
+      ...(state.researchChatOptimization
+        ? {
+            providerMetrics: this.registry.providerMetrics?.() ?? {
+              planner: this.llm.metrics,
+              writer: this.synthesisProvider.metrics,
+            },
+          }
+        : {}),
       completedObjectives,
       missingObjectives,
       queries: state.plan.queries,
@@ -1355,10 +1482,10 @@ export class ResearchRunner {
       conflicts: state.conflicts,
       verifiedClaims,
       coverage,
-      evidenceStatus: classifyEvidenceStatusFromCoverage(
-        verifiedFactCoverage,
-        verifiedClaims.length > 0,
-      ),
+      evidenceStatus:
+        comparison && !comparison.sufficient
+          ? "INSUFFICIENT_EVIDENCE"
+          : classifyEvidenceStatusFromCoverage(verifiedFactCoverage, verifiedClaims.length > 0),
       requestedFactCoverage: verifiedFactCoverage,
       objectiveCoverage,
       missingRequestedFacts: missingRequestedFactSupportFromCoverage(verifiedFactCoverage),
@@ -1397,12 +1524,18 @@ export class ResearchRunner {
         state.plan.interpretation.formatPreference === "lookup" &&
         state.plan.interpretation.entities.length <= 1 &&
         state.plan.interpretation.dimensions.length <= 2);
-    const minimumClaims = compactLookup
-      ? 1
-      : state.plan.interpretation.dimensions.length > 4
-        ? 4
-        : 2;
+    const minimumClaims =
+      (state.mode === "quick" && researchState.comparisonCoverage?.sufficient) || compactLookup
+        ? 1
+        : state.plan.interpretation.dimensions.length > 4
+          ? 4
+          : 2;
     const reasons: string[] = [];
+    if (researchState.comparisonCoverage && !researchState.comparisonCoverage.sufficient) {
+      reasons.push(
+        `${researchState.comparisonOutcome === "no_relevant_evidence" ? "No relevant comparison evidence" : "Relevant but insufficient comparison evidence"}: ${researchState.comparisonCoverage.missing.map((gap) => `${gap.target}: ${gap.dimension}`).join(", ")}`,
+      );
+    }
     const objectiveCoverage = researchState.coverage;
     reasons.push(...missingRequestedFactSupportFromCoverage(canonicalCoverage));
     if (researchState.latestnessAssessment?.unresolvedState) {
@@ -1431,7 +1564,9 @@ export class ResearchRunner {
       );
     if (
       supported >= 2 &&
-      (state.mode === "deep" || state.plan.interpretation.entities.length >= 2) &&
+      (state.mode === "deep" ||
+        (state.plan.interpretation.entities.length >= 2 &&
+          !researchState.comparisonCoverage?.sufficient)) &&
       independentDomains.size < 2
     ) {
       reasons.push("verified claims lack independent source domains");
@@ -1558,6 +1693,8 @@ export class ResearchRunner {
       requestedFacts: requestedFactsForPlan(state.plan),
       requestedFactRequirements: state.plan.requestedFactRequirements,
       coverage: `${Math.round(researchState.coverage * 100)}%`,
+      comparisonCoverage: researchState.comparisonCoverage,
+      comparisonOutcome: researchState.comparisonOutcome,
       completedObjectives: researchState.completedObjectives,
       missingObjectives: researchState.missingObjectives,
       dimensions: state.plan.interpretation.dimensions,
@@ -1666,20 +1803,59 @@ export class ResearchRunner {
   }
   private async triageSources(id: string, state: LoopState, budget: ResearchBudget) {
     const ranked = rankResults(state.plan.interpretation.normalizedQuestion, state.rawResults);
+    const comparison = state.researchChatOptimization
+      ? state.plan.interpretation.comparison
+      : undefined;
+    const supportedClaims = state.claims.filter(
+      (claim) => claim.verification?.verdict === "supported",
+    );
+    const supportedSources = state.fetchedSources.filter((source) =>
+      supportedClaims.some((claim) => claim.sourceIds.includes(source.id)),
+    );
+    const candidates = comparison
+      ? ranked.filter((source) => !state.fetchedUrls.has(source.url))
+      : ranked;
     const recoveryRequirements = state.researchChatOptimization
       ? state.searchRecoveries.at(-1)?.requirements
       : undefined;
     const officialSourceRequirement =
       state.plan.interpretation.sourceRequirements?.officialSources ?? "none";
     const selection = selectResearchSourcesWithDecisions(
-      ranked,
+      candidates,
       state.plan.interpretation.entities,
-      budget.maxSources,
+      comparison ? Math.max(0, budget.maxSources - state.fetchedSources.length) : budget.maxSources,
       officialSourceRequirement,
       state.question,
       recoveryRequirements,
+      state.researchChatOptimization && !!state.plan.interpretation.comparison,
+      comparison
+        ? {
+            comparison,
+            neededTargets: comparison.targets.filter(
+              (target) =>
+                !supportedClaims.some((claim) =>
+                  comparisonClaimHasTargetFinding({ ...comparison, targets: [target] }, claim.text),
+                ),
+            ),
+            usedDomains: supportedSources.map((source) => source.domain),
+            unavailableUrls: state.fetchedSources
+              .filter(
+                (source) =>
+                  source.fetchError || source.subjectMismatchReason || !source.content?.trim(),
+              )
+              .map((source) => source.url),
+          }
+        : undefined,
     );
-    state.rankedSources = selection.selected;
+    state.rankedSources = comparison
+      ? [
+          ...state.fetchedSources.filter(
+            (source) =>
+              source.content?.trim() && !source.subjectMismatchReason && !source.fetchError,
+          ),
+          ...selection.selected,
+        ]
+      : selection.selected;
     const priorDecisions = new Map(
       state.sourceSelectionDecisions.map((decision) => [
         `${decision.query.toLowerCase()}|${decision.sourceId}`,
@@ -1778,15 +1954,17 @@ export class ResearchRunner {
     const sourceMap = new Map(state.fetchedSources.map((source) => [source.id, source]));
     state.claims = state.claims.map((claim) => ({
       ...claim,
-      evidence: claim.sourceIds.some((sourceId) =>
-        sourceMap.get(sourceId)?.content?.includes(claim.evidence.slice(0, 80)),
+      evidence: claim.sourceIds.some(
+        (sourceId) =>
+          Boolean(claim.evidence?.trim()) &&
+          sourceMap.get(sourceId)?.content?.includes(claim.evidence),
       )
         ? claim.evidence.slice(0, 1200)
         : claim.sourceIds
             .map((sourceId) => sourceMap.get(sourceId)?.content ?? "")
             .filter(Boolean)
             .join("\n\n")
-            .slice(0, 1200) || claim.evidence,
+            .slice(0, 1200),
     }));
   }
   private async executeAction(
@@ -1842,6 +2020,14 @@ export class ResearchRunner {
       if (pendingSources.length === 0) return;
 
       for (const source of pendingSources) {
+        for (const decision of state.sourceSelectionDecisions) {
+          if (
+            decision.retrieval?.status === "failed" ||
+            decision.retrieval?.status === "unusable"
+          ) {
+            decision.retrieval.replacementUrl ??= source.url;
+          }
+        }
         state.fetchedUrls.add(source.url);
       }
 
@@ -1862,6 +2048,7 @@ export class ResearchRunner {
               url: source.url,
               title: source.title,
               snippet: source.snippet,
+              provider: source.provider,
               question: state.question,
               allowSnippetEvidence: this.snippetEvidencePolicy.get(id) ?? true,
               requestedFacts: requestedFactsForPlan(state.plan),
@@ -1916,11 +2103,18 @@ export class ResearchRunner {
               content: string;
               canonicalUrl?: string;
               publishedAt?: string;
+              contentOrigin?: Source["contentOrigin"];
             };
-            const subjectMismatchReason = subjectEntityMismatchReason(
-              state.plan.interpretation.normalizedQuestion,
-              document.title,
-            );
+            const subjectMismatchReason =
+              subjectEntityMismatchReason(
+                state.plan.interpretation.normalizedQuestion,
+                document.title,
+              ) ??
+              querySubjectMismatchReason(
+                state.question,
+                document.content,
+                `${source.title} ${source.snippet}`,
+              );
             const taskEvidence = subjectMismatchReason
               ? {
                   status: "INSUFFICIENT_EVIDENCE" as const,
@@ -1940,11 +2134,30 @@ export class ResearchRunner {
                 );
             state.fetchedSources.push({
               ...source,
-              title: document.title || source.title,
-              content: document.content.slice(0, 12000),
+              title:
+                document.title && !querySubjectMismatchReason(state.question, document.title)
+                  ? document.title
+                  : source.title,
+              content:
+                state.researchChatOptimization && state.plan.interpretation.comparison
+                  ? comparisonEvidencePassages(
+                      state.plan.interpretation.comparison,
+                      document.content,
+                    )
+                      .filter((passage) => !querySubjectMismatchReason(state.question, passage))
+                      .join("\n\n")
+                      .slice(0, 12000)
+                  : state.researchChatOptimization
+                    ? relevantSourceContent(
+                        state.question,
+                        document.content,
+                        `${source.title} ${document.title} ${source.snippet}`,
+                      ).slice(0, 12000)
+                    : document.content.slice(0, 12000),
               pagePublishedAt: document.publishedAt,
               fetchedAt: new Date().toISOString(),
               canonicalUrl: document.canonicalUrl,
+              contentOrigin: document.contentOrigin,
               retrievalMethod: fetched.retrievalMethod as Source["retrievalMethod"],
               retrievalSourceUrl: fetched.retrievalSourceUrl,
               releaseHistorySourceKind: fetched.releaseHistorySourceKind,
@@ -2007,6 +2220,25 @@ export class ResearchRunner {
                   }
                 : decision.taskEvidence,
               subjectMismatchReason: source.subjectMismatchReason ?? decision.subjectMismatchReason,
+              retrieval: {
+                ...decision.retrieval,
+                status: source.fetchError
+                  ? "failed"
+                  : source.subjectMismatchReason || !source.content?.trim()
+                    ? "unusable"
+                    : "success",
+                category: source.fetchError
+                  ? /redirect/i.test(source.fetchError)
+                    ? "REDIRECT_LIMIT"
+                    : source.fetchFailureCategory
+                  : undefined,
+                httpStatus: source.fetchError
+                  ? Number(source.fetchError.match(/HTTP\s+(\d{3})/)?.[1]) || undefined
+                  : undefined,
+                message: source.fetchError
+                  ? safeSearchMessage(new Error(source.fetchError))
+                  : source.subjectMismatchReason,
+              },
             }
           : decision;
       });
@@ -2025,6 +2257,11 @@ export class ResearchRunner {
           state.claimsExtractedFor = state.fetchedSources.length;
         }
       }
+      // Refill the bounded candidate slots from the existing result set. Failed
+      // fetches remain counted against both source/page limits and are never retried.
+      if (state.researchChatOptimization && state.plan.interpretation.comparison) {
+        await this.triageSources(id, state, budget);
+      }
       await this.step(id, labelFor(action), "complete");
       return;
     }
@@ -2033,15 +2270,49 @@ export class ResearchRunner {
         ? state.fetchedSources
             .slice(state.claimsExtractedFor)
             .filter((source) => !source.subjectMismatchReason)
-        : state.fetchedSources;
-      const extracted = await this.useTool<Claim[]>(id, action, {
+        : state.fetchedSources.filter((source) => !source.subjectMismatchReason);
+      const extractedInput = await this.useTool<Claim[]>(id, action, {
         sources: sourcesToExtract,
         question: state.plan.interpretation.normalizedQuestion,
         entities: state.plan.interpretation.entities,
         requestedFacts: requestedFactsForPlan(state.plan),
         officialSourcesRequired:
           state.plan.interpretation.sourceRequirements?.officialSources === "required",
+        researchChatOptimization: state.researchChatOptimization,
       });
+      const sourceIds = new Set(sourcesToExtract.map((source) => source.id));
+      const extracted = extractedInput
+        .filter(
+          (claim) =>
+            (!claim.provenance ||
+              (claim.provenance.sessionId === id &&
+                claim.provenance.question === state.question &&
+                claim.provenance.jobId === state.jobId)) &&
+            claim.sourceIds.length > 0 &&
+            claim.sourceIds.every((sourceId) => sourceIds.has(sourceId)) &&
+            !(
+              state.researchChatOptimization &&
+              state.plan.interpretation.comparison &&
+              !comparisonClaimHasTargetFinding(state.plan.interpretation.comparison, claim.text)
+            ) &&
+            !(
+              state.researchChatOptimization &&
+              comparisonClaimMismatchReason(state.question, claim.text)
+            ) &&
+            !querySubjectMismatchReason(
+              state.question,
+              claim.text,
+              sourcesToExtract
+                .filter((source) => claim.sourceIds.includes(source.id))
+                .map((source) => `${source.title} ${source.snippet}`)
+                .join("\n"),
+            ),
+        )
+        .map((claim) => ({
+          ...claim,
+          sourceIds: [...claim.sourceIds],
+          provenance: { sessionId: id, jobId: state.jobId, question: state.question },
+        }));
       if (this.adaptiveEvidenceLoop) {
         const seen = new Set(
           state.claims.map(
@@ -2075,7 +2346,7 @@ export class ResearchRunner {
     if (action === "verify_claims") {
       this.computeResearchState(state);
       const pending = selectVerificationClaims(
-        state.claims,
+        this.taskEligibleClaims(state),
         Math.min(budget.maxClaimsToVerify, MAX_BATCH_VERIFICATION_CLAIMS),
         verificationFocusTerms(
           state.plan.interpretation.dimensions,
@@ -2105,6 +2376,11 @@ export class ResearchRunner {
               let rationale: string | undefined;
               if (hasSingleVerifier) {
                 const result = (await this.registry.execute("verify_claim", {
+                  sessionId: id,
+                  jobId: state.jobId,
+                  question: state.question,
+                  sourceIds: claim.sourceIds,
+                  researchChatOptimization: true,
                   claim: claim.text,
                   evidence: claim.evidence,
                 })) as { verdict?: string; status?: string; rationale?: string; reason?: string };
@@ -2112,7 +2388,11 @@ export class ResearchRunner {
                 rationale = result.rationale ?? result.reason;
               } else if (hasBatch) {
                 const results = (await this.registry.execute("verify_claims_batch", {
+                  sessionId: id,
+                  jobId: state.jobId,
+                  question: state.question,
                   claims: [{ id: claim.id, claim: claim.text, evidence: claim.evidence }],
+                  researchChatOptimization: true,
                 })) as Array<{ id: string; verdict?: string; rationale?: string }>;
                 const result = results.find((candidate) => candidate.id === claim.id);
                 verdict = result?.verdict;
@@ -2120,6 +2400,7 @@ export class ResearchRunner {
               }
 
               const normalizedVerdict = verificationVerdict(verdict);
+              claim.verification = { verdict: normalizedVerdict, rationale };
               if (
                 normalizedVerdict === "unavailable" &&
                 /openrouter returned 429/i.test(rationale ?? "")
@@ -2136,6 +2417,13 @@ export class ResearchRunner {
               };
             } catch (error) {
               if (error instanceof Error && /openrouter returned 429/i.test(error.message)) {
+                for (const unchecked of state.claims.filter((item) => !item.verification)) {
+                  unchecked.verification = {
+                    verdict: "unavailable",
+                    rationale: "Verification skipped after provider rate limit",
+                  };
+                }
+                claim.verification = { verdict: "unavailable", rationale: error.message };
                 throw error;
               }
               claim.verification = {
@@ -2154,6 +2442,9 @@ export class ResearchRunner {
         } else if (hasBatch) {
           try {
             const batchResults = (await this.registry.execute("verify_claims_batch", {
+              sessionId: id,
+              jobId: state.jobId,
+              question: state.question,
               claims: pending.map((c) => ({ id: c.id, claim: c.text, evidence: c.evidence })),
             })) as Array<{ id: string; verdict?: string; rationale?: string }>;
 
@@ -2162,8 +2453,6 @@ export class ResearchRunner {
                 result.verdict === "unavailable" &&
                 /openrouter returned 429/i.test(result.rationale ?? ""),
             );
-            if (rateLimit) throw new Error(rateLimit.rationale ?? "OpenRouter returned 429");
-
             const resultMap = new Map(batchResults.map((r) => [r.id, r]));
             for (const claim of pending) {
               const res = resultMap.get(claim.id);
@@ -2171,6 +2460,15 @@ export class ResearchRunner {
                 verdict: verificationVerdict(res?.verdict),
                 rationale: res?.rationale ?? "Batch verification did not return a verdict",
               };
+            }
+            if (rateLimit) {
+              for (const unchecked of state.claims.filter((item) => !item.verification)) {
+                unchecked.verification = {
+                  verdict: "unavailable",
+                  rationale: "Verification skipped after provider rate limit",
+                };
+              }
+              throw new Error(rateLimit.rationale ?? "OpenRouter returned 429");
             }
           } catch (error) {
             if (error instanceof Error && /openrouter returned 429/i.test(error.message))
@@ -2189,6 +2487,10 @@ export class ResearchRunner {
             async (claim) => {
               try {
                 const result = (await this.registry.execute("verify_claim", {
+                  sessionId: id,
+                  jobId: state.jobId,
+                  question: state.question,
+                  sourceIds: claim.sourceIds,
                   claim: claim.text,
                   evidence: claim.evidence,
                 })) as { verdict?: string; rationale?: string };
@@ -2196,8 +2498,12 @@ export class ResearchRunner {
                   verdict: verificationVerdict(result.verdict),
                   rationale: result.rationale ?? "Verification did not return a verdict",
                 };
-              } catch {
-                claim.verification = { verdict: "uncertain", rationale: "Failed verification" };
+              } catch (error) {
+                claim.verification = {
+                  verdict: "unavailable",
+                  rationale:
+                    error instanceof Error ? error.message.slice(0, 240) : "Failed verification",
+                };
               }
             },
             3,
@@ -2248,6 +2554,9 @@ export class ResearchRunner {
       });
       await this.update(id, { sourceSelectionDecisions: state.sourceSelectionDecisions });
       state.verified = true;
+      if (state.researchChatOptimization && state.plan.interpretation.comparison) {
+        await this.triageSources(id, state, budget);
+      }
       if (state.researchChatOptimization && this.synthesisClaims(state).length <= 1) {
         state.conflictsChecked = true;
       }
@@ -2298,6 +2607,7 @@ export class ResearchRunner {
         ),
       ].sort((left, right) => compareVersions(left, right) ?? 0);
       const recoveryRequirements: ResearchRecoveryRequirements = {
+        comparison: researchState.comparisonCoverage,
         requestedFacts: factCoverage.required,
         resolvedFacts: factCoverage.present,
         unresolvedFacts: factCoverage.missing,
@@ -2397,7 +2707,11 @@ export class ResearchRunner {
         return;
       }
       const results = await this.searchWithTrace(id, action, queries);
-      state.rawResults.push(...results);
+      // Newly targeted results win equal-quality ties before the bounded
+      // selection can be filled by older results from the initial query.
+      if (state.researchChatOptimization && state.plan.interpretation.comparison)
+        state.rawResults.unshift(...results);
+      else state.rawResults.push(...results);
       state.queriesIssued += queries.length;
       state.searchPasses += 1;
       state.triaged = false;
@@ -2462,8 +2776,8 @@ export class ResearchRunner {
         () => controller.abort(new Error("Research time budget exhausted")),
         budget.maxTimeMs,
       );
-      const execution = runWithResearchExecutionContext(deadlineContext, () =>
-        this.runWithinContext(id, options),
+      const execution = withOperationContext(() =>
+        runWithResearchExecutionContext(deadlineContext!, () => this.runWithinContext(id, options)),
       );
       await raceWithResearchAbort(execution, controller.signal);
     } catch (error) {
@@ -2610,6 +2924,8 @@ export class ResearchRunner {
         return;
       }
       const state: LoopState = {
+        sessionId: id,
+        jobId: currentWorkerContext()?.lease.job.id,
         mode: session.mode,
         question: session.question,
         plan,
@@ -2714,7 +3030,10 @@ export class ResearchRunner {
               answer,
               evidenceSources.length,
             );
-          synthesisCompleted = true;
+          synthesisCompleted =
+            Boolean(answer?.trim()) &&
+            !/^Insufficient evidence|^Research collected evidence but cannot/i.test(answer) &&
+            this.synthesisProvider.metrics?.synthesis?.finalAnswerSource !== "unavailable";
           const synthDur = Math.round(performance.now() - synthStart);
           stageTimings["synthesize"] = synthDur;
           await this.step(
@@ -2802,7 +3121,10 @@ export class ResearchRunner {
             answer,
             evidenceSources.length,
           );
-          synthesisCompleted = true;
+          synthesisCompleted =
+            Boolean(answer?.trim()) &&
+            !/^Insufficient evidence|^Research collected evidence but cannot/i.test(answer) &&
+            this.synthesisProvider.metrics?.synthesis?.finalAnswerSource !== "unavailable";
           const synthDur = Math.round(performance.now() - synthStart);
           stageTimings["synthesize"] = synthDur;
           await this.step(
@@ -2871,6 +3193,7 @@ export class ResearchRunner {
       if (execution?.signal.aborted || (execution && Date.now() >= execution.deadlineAt))
         throw error;
       const failed = await this.update(id, {
+        ...execution?.capturePartialState?.(),
         status: "FAILED",
         error: message,
         failureStage: activeResearchStage() ?? "research",

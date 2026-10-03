@@ -65,6 +65,70 @@ function fullPageGetCount(deps: SourceRetrievalDependencies): number {
 }
 
 describe("shared source retrieval ladder", () => {
+  it.each(["opengraph", "jsonld"])(
+    "does not stop at %s descriptions when a comparison has no discrete fact list",
+    async (metadataKind) => {
+      const question = "Compare current Aster and Beryl indexing performance";
+      const description =
+        "A technical overview of the available indexing approaches, their background, and advice for readers choosing tools for a production application.";
+      const metadata =
+        metadataKind === "opengraph"
+          ? `<meta property="og:description" content="${description}">`
+          : `<script type="application/ld+json">${JSON.stringify({ "@type": "Article", headline: "Aster and Beryl indexing performance", description })}</script>`;
+      const body =
+        "Aster indexing achieves lower latency by traversing fewer graph neighbors in the documented benchmark workload. Beryl indexing achieves higher throughput by grouping queries into partitions in the documented workload.";
+      const deps = dependencies({
+        [`HEAD ${pageUrl}`]: htmlResponse(""),
+        [`GET ${pageUrl} range`]: htmlResponse(
+          `<html><head><title>Aster and Beryl indexing performance</title>${metadata}</head></html>`,
+        ),
+        [`GET ${pageUrl}`]: htmlResponse(
+          `<html><head><title>Aster and Beryl indexing performance</title>${metadata}</head><article><p>${body}</p></article></html>`,
+        ),
+      });
+      const result = await retrieveSource(
+        {
+          result: {
+            url: pageUrl,
+            title: "Aster and Beryl indexing performance",
+            snippet: description,
+          },
+          question,
+          requestedFacts: [],
+          researchChatOptimization: true,
+          allowSnippetEvidence: false,
+        },
+        deps,
+      );
+      expect(result.retrievalMethod).toBe("http");
+      expect(result.document.content).toContain(body);
+      expect(fullPageGetCount(deps)).toBe(1);
+      expect(result.retrievalReasons.join(" ")).toContain("a source-linked comparison finding");
+    },
+  );
+  it("retains a task-useful structured article without requiring complete comparison coverage", async () => {
+    const body =
+      "Aster indexing achieves lower latency by traversing fewer neighboring records in this documented benchmark workload.";
+    const deps = dependencies({
+      [`HEAD ${pageUrl}`]: htmlResponse(""),
+      [`GET ${pageUrl} range`]: htmlResponse(
+        `<html><head><title>Aster and Beryl indexing performance</title><script type="application/ld+json">${JSON.stringify({ "@type": "Article", headline: "Aster and Beryl indexing performance", articleBody: body + " The benchmark is reproducible." })}</script></head></html>`,
+      ),
+    });
+    const result = await retrieveSource(
+      {
+        result: { url: pageUrl, title: "Aster and Beryl indexing performance", snippet: "" },
+        question: "Compare Aster and Beryl indexing performance",
+        requestedFacts: [],
+        researchChatOptimization: true,
+        allowSnippetEvidence: false,
+      },
+      deps,
+    );
+    expect(result.retrievalMethod).toBe("structured");
+    expect(result.document.content).toContain(body);
+    expect(fullPageGetCount(deps)).toBe(0);
+  });
   it("uses a sufficient Serper snippet without crawling", async () => {
     const snippet = {
       title: "React Native performance benchmark",
@@ -547,6 +611,7 @@ describe("shared source retrieval ladder", () => {
 
     expect(result.retrievalMethod).toBe("structured");
     expect(result.document.content).toContain("version 1.2.3");
+    expect(result.document.contentOrigin).toBe("metadata");
     expect(fullPageGetCount(deps)).toBe(0);
   });
 
@@ -575,6 +640,7 @@ describe("shared source retrieval ladder", () => {
 
     expect(result.retrievalMethod).toBe("structured");
     expect(result.retrievalAttempts).toEqual(["serper_snippet", "rss", "structured"]);
+    expect(result.document.contentOrigin).toBeUndefined();
     expect(fullPageGetCount(deps)).toBe(0);
     expect(result.retrievalReasons).toContain(
       "The advertised feed was unavailable, unmatched, or too thin to support the task.",

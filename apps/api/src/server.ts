@@ -19,6 +19,8 @@ import { createToolRegistry, type ToolRegistry } from "./agent/tools.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { installGracefulShutdown } from "./lifecycle.js";
 import { sanitizeRequestLogUrl } from "./logging.js";
+import { searchDiagnosticTrace } from "./search-diagnostics.js";
+import type { SearchAttempt } from "./search.js";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID, timingSafeEqual } from "node:crypto";
@@ -106,6 +108,8 @@ export interface ServerDependencies {
   researchBudget?: Partial<ResearchBudget>;
   evaluationBudgetCeilings?: Partial<ResearchBudget>;
   postAgentResearchBudget?: Partial<ResearchBudget>;
+  postAgentMaxAttempts?: number;
+  researchMaxAttempts?: number;
   fastLookupLimits?: Pick<ResearchBudget, "maxQueries" | "maxSources" | "maxPages" | "maxTimeMs">;
   authVerifier?: AuthVerifier;
   quotaPolicy?: QuotaPolicy;
@@ -344,7 +348,7 @@ export async function createServer(dependencies: ServerDependencies = {}) {
         kind: "post_agent",
         ownerScope: "system",
         payload: { runId: run.id },
-        maxAttempts: 3,
+        maxAttempts: dependencies.postAgentMaxAttempts ?? 3,
       });
       if (!queued.job) throw new Error("Autonomous job could not be persisted");
     },
@@ -402,24 +406,27 @@ export async function createServer(dependencies: ServerDependencies = {}) {
                 if (!session) throw new Error("Chat research result is unavailable");
                 return { session, jobId: job.id };
               },
-              isQueryInterpretation(job.payload.interpretation) &&
-                job.payload.interpretation.ambiguityScore < 0.4
+              isQueryInterpretation(job.payload.interpretation)
                 ? job.payload.interpretation
                 : undefined,
             );
             if (response.route === "direct") {
               const now = new Date().toISOString();
+              const directUnavailable =
+                !response.answer?.trim() ||
+                /OPENROUTER_API_KEY is not configured|synthesis unavailable/i.test(response.answer);
               const session: ResearchSession = {
                 id: sessionId,
                 question: String(job.payload.question),
                 mode: "quick",
-                status: "COMPLETED",
+                status: directUnavailable ? "FAILED" : "COMPLETED",
                 createdAt: job.createdAt,
                 updatedAt: now,
                 sources: [],
                 claims: [],
                 steps: [],
                 answer: response.answer,
+                error: directUnavailable ? "Direct synthesis is unavailable" : undefined,
               };
               if (await store.get(sessionId)) await store.update(session);
               else await store.create(session);
@@ -431,6 +438,13 @@ export async function createServer(dependencies: ServerDependencies = {}) {
               );
             const persisted = await store.get(sessionId);
             if (!persisted) throw new Error("Chat result could not be persisted");
+            if (persisted.searchAttempts?.length)
+              await context.reportProgress({
+                sessionId,
+                searchAttempts: searchDiagnosticTrace(
+                  persisted.searchAttempts as SearchAttempt[],
+                ) as unknown as JobJsonValue,
+              });
             if (persisted.status === "FAILED")
               throw new Error(persisted.error ?? "Chat research failed");
             const { session: _session, sources: _sources, ...compact } = response;
@@ -498,6 +512,13 @@ export async function createServer(dependencies: ServerDependencies = {}) {
             ? await withResearchOwner(job.ownerId, execute)
             : await execute();
           if (!session) throw new Error("Research worker did not persist a session result");
+          if (session.searchAttempts?.length)
+            await context.reportProgress({
+              sessionId,
+              searchAttempts: searchDiagnosticTrace(
+                session.searchAttempts as SearchAttempt[],
+              ) as unknown as JobJsonValue,
+            });
           if (session.status === "FAILED") {
             if (job.attempts < job.maxAttempts && !isNonRetryableResearchFailure(session.error)) {
               const retry = () => store.update({ ...session, status: "QUEUED", error: undefined });
@@ -901,7 +922,7 @@ export async function createServer(dependencies: ServerDependencies = {}) {
       ownerScope,
       idempotencyKey: input.idempotencyKey,
       payload,
-      maxAttempts: 3,
+      maxAttempts: dependencies.researchMaxAttempts ?? 3,
       quota,
     });
     return { ...result, blocked: undefined, quotaLimit };
@@ -1186,16 +1207,14 @@ export async function createServer(dependencies: ServerDependencies = {}) {
           .code(response.route === "direct" || response.answer ? 200 : 202)
           .send({ ...response, session, sources: session?.sources });
       }
-      return reply
-        .code(202)
-        .send({
-          route: parsed.data.deepResearch ? "deep" : "web",
-          interpretation: preview.interpretation,
-          researchId: queued.job.payload.sessionId,
-          jobId: queued.job.id,
-          session: await researchSnapshot(session, current ?? queued.job),
-          toolEvents: memoryToolEvent ? [memoryToolEvent] : [],
-        });
+      return reply.code(202).send({
+        route: parsed.data.deepResearch ? "deep" : "web",
+        interpretation: preview.interpretation,
+        researchId: queued.job.payload.sessionId,
+        jobId: queued.job.id,
+        session: await researchSnapshot(session, current ?? queued.job),
+        toolEvents: memoryToolEvent ? [memoryToolEvent] : [],
+      });
     }),
   );
 
@@ -2081,18 +2100,16 @@ export async function createServer(dependencies: ServerDependencies = {}) {
           return reply.serviceUnavailable("Account entitlements are temporarily unavailable");
         if (sendQuotaRejection(queued, "followup", reply)) return reply;
         if (!queued.job) return reply.internalServerError("Could not persist follow-up request");
-        return reply
-          .code(202)
-          .send({
-            id: queued.job.id,
-            postId: request.params.id,
-            question: parsed.data.question,
-            status: "QUEUED",
-            createdAt: queued.job.createdAt,
-            updatedAt: queued.job.updatedAt,
-            usedLiveResearch: false,
-            sourceIds: [],
-          });
+        return reply.code(202).send({
+          id: queued.job.id,
+          postId: request.params.id,
+          question: parsed.data.question,
+          status: "QUEUED",
+          createdAt: queued.job.createdAt,
+          updatedAt: queued.job.updatedAt,
+          usedLiveResearch: false,
+          sourceIds: [],
+        });
       } catch (error) {
         if (error instanceof ResearchPostNotFoundError)
           return reply.notFound("Research post not found");
