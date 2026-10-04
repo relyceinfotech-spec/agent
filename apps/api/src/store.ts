@@ -1,4 +1,5 @@
 import type { ResearchSession } from "./domain.js";
+import type { StructuredPersonRoleFact } from "./application-data.js";
 import { DatabaseSync } from "node:sqlite";
 import { SqliteDurableJobStore } from "./job-store.js";
 import { currentWorkerContext, throwIfWorkerStopped } from "./worker-context.js";
@@ -39,6 +40,10 @@ export interface StoredDocument {
     headings?: string[];
     contentType?: "html" | "rss" | "pdf" | "structured";
     contentOrigin?: "metadata";
+    predicateEvidenceContent?: string;
+    structuredDataPresent?: boolean;
+    structuredFacts?: StructuredPersonRoleFact[];
+    retrievalSourceUrl?: string;
     retrievalMethod?: string;
     provider?: string;
     providers?: string[];

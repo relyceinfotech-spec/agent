@@ -1,10 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const retrieval = vi.hoisted(() => ({ retrieveSource: vi.fn() }));
+const siteDiscovery = vi.hoisted(() => ({ discover: vi.fn() }));
 
 vi.mock("../src/source-retrieval.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/source-retrieval.js")>();
   return { ...actual, retrieveSource: retrieval.retrieveSource };
+});
+
+vi.mock("../src/site-discovery.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/site-discovery.js")>();
+  return { ...actual, discoverInternalSiteCandidates: siteDiscovery.discover };
 });
 
 import { createToolRegistry } from "../src/agent/tools.js";
@@ -64,7 +70,10 @@ function createKnowledgeStore(document: StoredDocument): KnowledgeStore {
 }
 
 describe("question-aware retrieval cache", () => {
-  beforeEach(() => retrieval.retrieveSource.mockReset());
+  beforeEach(() => {
+    retrieval.retrieveSource.mockReset();
+    siteDiscovery.discover.mockReset();
+  });
 
   it("revalidates cached latest-release discovery before using it as normal Chat evidence", async () => {
     const cached = storedDocument(
@@ -144,6 +153,79 @@ describe("question-aware retrieval cache", () => {
     expect(retrieval.retrieveSource).not.toHaveBeenCalled();
     expect(result.cached).toBe(true);
     expect(result.retrievalMethod).toBe("cache");
+  });
+
+  it("adds bounded same-origin page candidates for an unresolved precise company fact", async () => {
+    const rootUrl = "https://relyceinfotech.com/en";
+    const fetched = retrievedSource();
+    fetched.url = rootUrl;
+    fetched.html = '<nav><a href="/company/leadership">Leadership</a></nav>';
+    fetched.document = {
+      title: "Relyce Infotech | Company",
+      description: "Company profile",
+      domain: "relyceinfotech.com",
+      content:
+        "Relyce Infotech provides software development, cloud consulting, and implementation services for business customers.",
+      headings: [],
+      contentType: "html",
+    };
+    retrieval.retrieveSource.mockResolvedValue(fetched);
+    const candidate = {
+      title: "Relyce Infotech — Leadership",
+      url: "https://relyceinfotech.com/company/leadership",
+      snippet: "A same-origin leadership page.",
+      provider: "site-discovery",
+      siteDiscoveryOrigin: "https://relyceinfotech.com",
+    };
+    siteDiscovery.discover.mockResolvedValue([candidate]);
+    const registry = createToolRegistry({ search: async () => [] }, new OpenRouterProvider());
+
+    const result = (await registry.execute("fetch_url", {
+      url: rootUrl,
+      title: "Relyce Infotech | Company",
+      snippet: "Relyce Infotech company profile.",
+      sourceType: "commercial",
+      question: "Who is the CEO of Relyce Infotech?",
+      requestedPredicate: {
+        entity: "Relyce Infotech",
+        predicate: "CEO",
+        aliases: ["CEO", "chief executive officer"],
+      },
+      entities: ["Relyce Infotech"],
+      siteDiscoveryMaxCandidates: 2,
+      researchChatOptimization: true,
+      allowSnippetEvidence: false,
+    })) as RetrievedSource & { siteDiscoveryCandidates: (typeof candidate)[] };
+
+    expect(siteDiscovery.discover).toHaveBeenCalledWith(
+      expect.objectContaining({ rootUrl, entity: "Relyce Infotech", maxCandidates: 2 }),
+    );
+    expect(result.siteDiscoveryCandidates).toEqual([candidate]);
+    expect(result.retrievalReasons?.at(-1)).toContain("Same-origin discovery found 1");
+  });
+
+  it("pins discovered-page retrieval to its recorded same origin and disables snippets", async () => {
+    const childUrl = "https://relyceinfotech.com/company/leadership";
+    retrieval.retrieveSource.mockResolvedValue(retrievedSource());
+    const registry = createToolRegistry({ search: async () => [] }, new OpenRouterProvider());
+
+    await registry.execute("fetch_url", {
+      url: childUrl,
+      title: "Relyce Infotech — Leadership",
+      snippet: "A same-origin leadership page.",
+      provider: "site-discovery",
+      siteDiscoveryOrigin: "https://relyceinfotech.com",
+      question: "Who is the CEO of Relyce Infotech?",
+      allowSnippetEvidence: true,
+      researchChatOptimization: true,
+    });
+
+    expect(retrieval.retrieveSource).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allowedOrigin: "https://relyceinfotech.com",
+        allowSnippetEvidence: false,
+      }),
+    );
   });
 
   it("preserves metadata-only provenance when a validated cache entry is reused", async () => {

@@ -240,6 +240,226 @@ describe("provider-free synthesis resilience", () => {
     expect(complete.mock.calls[0]?.[1]).toContain("Verified answer skeleton");
   });
 
+  it("passes source relationship and corroboration metadata to the writer and qualifies a lone third-party fact", async () => {
+    config.OPENROUTER_API_KEY = "test-only-key";
+    const provider = makeModel();
+    const { plan: basePlan, state: baseState } = fixture();
+    const question = "Who is the CEO of Relyce Infotech?";
+    const source: Source = {
+      id: "company-profile",
+      title: "Relyce Infotech leadership profile",
+      url: "https://directory.example/relyce-infotech",
+      domain: "directory.example",
+      snippet: "Ukenthiran A is the CEO of Relyce Infotech.",
+      content: "Ukenthiran A is the CEO of Relyce Infotech.",
+      sourceType: "commercial",
+      quality: {
+        relevance: 0.9,
+        authority: 0.55,
+        freshness: 0.6,
+        completeness: 0.8,
+        overall: 0.75,
+      },
+    };
+    const claim: Claim = {
+      id: "claim-relyce-ceo",
+      text: "Ukenthiran A is the CEO of Relyce Infotech.",
+      evidence: "Ukenthiran A is the CEO of Relyce Infotech.",
+      sourceIds: [source.id],
+      confidence: 0.8,
+      verification: { verdict: "supported" },
+    };
+    const plan: ResearchPlan = {
+      ...basePlan,
+      objectives: ["Identify the CEO of Relyce Infotech"],
+      requestedFacts: [],
+      queries: ["Relyce Infotech CEO"],
+      interpretation: {
+        ...basePlan.interpretation,
+        normalizedQuestion: question,
+        entities: ["Relyce Infotech"],
+        topic: "Relyce Infotech CEO",
+        dimensions: ["CEO"],
+        requestedPredicate: {
+          entity: "Relyce Infotech",
+          predicate: "CEO",
+          aliases: ["CEO", "chief executive officer", "chief executive"],
+        },
+        sourceRequirements: { officialSources: "none" },
+      },
+    };
+    const state: ResearchState = {
+      ...baseState,
+      sources: [source],
+      claims: [claim],
+      verifiedClaims: [claim],
+      requestedFactCoverage: { required: [], present: [], missing: [] },
+      latestnessAssessment: undefined,
+      releaseRecords: [],
+    };
+    const rawAnswer = JSON.stringify({
+      statements: [{ text: claim.text, sourceIds: [source.id] }],
+    });
+    const complete = vi.spyOn(provider, "complete").mockResolvedValue(rawAnswer);
+
+    const answer = await provider.synthesize(question, plan, [source], [claim], state);
+
+    expect(complete.mock.calls[0]?.[1]).toContain(
+      '"relationshipToEntity":"third_party_or_unclassified"',
+    );
+    expect(complete.mock.calls[0]?.[1]).toContain('"independentPublisherCount":1');
+    expect(complete.mock.calls[0]?.[1]).toContain('"authorityScore":0.55');
+    expect(answer).toContain("A third-party listing at directory.example states that");
+    expect(answer).toContain("Ukenthiran A is the CEO of Relyce Infotech.");
+  });
+
+  it("synthesizes a verified source-bound JSON-LD role relation as a cited answer", async () => {
+    config.OPENROUTER_API_KEY = "test-only-key";
+    const provider = makeModel();
+    const { plan: basePlan, state: baseState } = fixture();
+    const preciseQuestion = "Who is the CEO of Relyce Infotech?";
+    const sourceUrl = "https://relyceinfotech.com/services";
+    const retrievalUrl = "https://relyceinfotech.com/services/";
+    const source: Source = {
+      id: "relyce-services-jsonld",
+      title: "Relyce Infotech Services",
+      url: sourceUrl,
+      retrievalSourceUrl: retrievalUrl,
+      domain: "relyceinfotech.com",
+      snippet: "Relyce Infotech company information.",
+      content: "Structured JSON-LD links Ukenthiran A to Relyce Infotech as Founder & CEO.",
+      sourceType: "official",
+      structuredFacts: [
+        {
+          sourceFormat: "json-ld",
+          sourceUrl: retrievalUrl,
+          entity: "Relyce Infotech",
+          person: "Ukenthiran A",
+          relationship: "employee",
+          jobTitle: "Founder & CEO",
+          statement: "Structured JSON-LD links Ukenthiran A to Relyce Infotech as Founder & CEO.",
+        },
+      ],
+      quality: { relevance: 1, authority: 1, freshness: 1, completeness: 1, overall: 1 },
+    };
+    const roleText =
+      "@graph.name: Relyce Infotech; @graph.employee.name: Ukenthiran A; " +
+      "@graph.employee.jobTitle: Founder & CEO";
+    const roleClaim: Claim = {
+      id: "relyce-serialized-role",
+      text: roleText,
+      evidence: roleText,
+      sourceIds: [source.id],
+      confidence: 1,
+      verification: { verdict: "supported" },
+    };
+    const genericClaim: Claim = {
+      id: "relyce-generic-company",
+      text: "Relyce Infotech provides software and consulting services.",
+      evidence: `Relyce Infotech provides software and consulting services.\n${roleText}`,
+      sourceIds: [source.id],
+      confidence: 1,
+      verification: { verdict: "supported" },
+    };
+    const requirement = {
+      entity: "Relyce Infotech",
+      predicate: "CEO",
+      aliases: ["CEO", "chief executive officer"],
+    };
+    const plan: ResearchPlan = {
+      ...basePlan,
+      objectives: ["Identify the CEO of Relyce Infotech"],
+      requestedFacts: [],
+      queries: ["Relyce Infotech CEO"],
+      interpretation: {
+        ...basePlan.interpretation,
+        normalizedQuestion: preciseQuestion,
+        entities: ["Relyce Infotech"],
+        topic: "Relyce Infotech CEO",
+        dimensions: ["CEO"],
+        requestedPredicate: requirement,
+        sourceRequirements: { officialSources: "none" },
+      },
+    };
+    const state: ResearchState = {
+      ...baseState,
+      sources: [source],
+      claims: [genericClaim, roleClaim],
+      verifiedClaims: [genericClaim, roleClaim],
+      requestedFactCoverage: {
+        required: [],
+        present: [],
+        missing: [],
+        requestedPredicate: { predicate: "CEO", present: true },
+      },
+      latestnessAssessment: undefined,
+      releaseRecords: [],
+    };
+    const naturalAnswer = "Ukenthiran A is the Founder & CEO of Relyce Infotech.";
+    const complete = vi
+      .spyOn(provider, "complete")
+      .mockResolvedValue(response([{ text: naturalAnswer, sourceIds: [source.id] }]));
+
+    const answer = await provider.synthesize(
+      preciseQuestion,
+      plan,
+      [source],
+      [genericClaim, roleClaim],
+      state,
+    );
+
+    expect(answer).toContain(`${naturalAnswer} [1]`);
+    expect(provider.metrics.synthesis).toMatchObject({
+      attempted: true,
+      fallbackUsed: false,
+      finalAnswerSource: "model",
+      requiredFactCoverage: {
+        missing: [],
+        requestedPredicate: { predicate: "CEO", present: true },
+      },
+      evidenceFactCoverage: {
+        missing: [],
+        requestedPredicate: { predicate: "CEO", present: true },
+      },
+      citationValidationResult: "VALIDATED",
+    });
+    expect(complete).toHaveBeenCalledTimes(1);
+
+    const deterministicProvider = makeModel();
+    const deterministicComplete = vi
+      .spyOn(deterministicProvider, "complete")
+      .mockRejectedValue(new Error("Deterministic first-party answer should not call a model"));
+    const deterministicAnswer = await deterministicProvider.synthesize(
+      preciseQuestion,
+      plan,
+      [source],
+      [roleClaim],
+      { ...state, claims: [roleClaim], verifiedClaims: [roleClaim] },
+      "quick",
+      undefined,
+      undefined,
+      true,
+    );
+    expect(deterministicAnswer).toContain(`${naturalAnswer} [1]`);
+    expect(deterministicComplete).not.toHaveBeenCalled();
+    expect(deterministicProvider.metrics.synthesis).toMatchObject({
+      attempted: false,
+      fallbackUsed: true,
+      finalAnswerSource: "deterministic",
+      citationValidationResult: "VALIDATED",
+    });
+
+    const genericOnly = buildDeterministicResearchAnswer({
+      question: preciseQuestion,
+      plan,
+      sources: [source],
+      claims: [genericClaim],
+      researchState: { ...state, claims: [genericClaim], verifiedClaims: [genericClaim] },
+    });
+    expect(genericOnly.evidenceCoverage.requestedPredicate?.present).toBe(false);
+    expect(genericOnly.answer).not.toContain("Ukenthiran A");
+  });
+
   it("rejects malformed synthesis and uses the complete deterministic answer", async () => {
     config.OPENROUTER_API_KEY = "test-only-key";
     const provider = makeModel();

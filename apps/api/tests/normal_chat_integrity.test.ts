@@ -671,18 +671,34 @@ describe("normal Chat integrity", () => {
       officialSourceRequirement: "none" as const,
       officialEvidenceResolved: false,
     };
-    const recovery = await rewriteQueries(
-      question,
-      plan,
-      [],
-      "quick",
-      llm,
-      undefined,
-      recoveryRequirements,
-    );
-    expect(recovery).toHaveLength(1);
+    const recovery: string[] = [];
+    let recoveryPlan = plan;
+    for (let pass = 0; pass < 3; pass += 1) {
+      const next = await rewriteQueries(
+        question,
+        recoveryPlan,
+        [],
+        "quick",
+        llm,
+        undefined,
+        recoveryRequirements,
+      );
+      expect(next).toHaveLength(1);
+      recovery.push(next[0]!);
+      recoveryPlan = { ...recoveryPlan, queries: [...recoveryPlan.queries, next[0]!] };
+    }
+    expect(recovery).toHaveLength(3);
     expect(recovery[0]).toMatch(/Relyce Infotech/i);
-    expect(recovery[0]).toMatch(/chief executive officer/i);
+    expect(recovery[0]).toMatch(/"Relyce Infotech".*"CEO".*company profile business directory/i);
+    expect(recovery[1]).toMatch(
+      /"Relyce Infotech".*"CEO".*professional biography staff directory/i,
+    );
+    expect(recovery[2]).toMatch(/"Relyce Infotech".*"CEO".*news interview independent reporting/i);
+    for (const candidate of recovery) {
+      expect(validateRecoveryQuery(candidate, question, plan, recoveryRequirements).accepted).toBe(
+        true,
+      );
+    }
     expect(
       validateRecoveryQuery(
         "Relyce Infotech company leadership",
@@ -704,6 +720,41 @@ describe("normal Chat integrity", () => {
         plan.objectives,
       ),
     ).toMatchObject({ accepted: true, reasons: [] });
+  });
+
+  it("does not target third-party profile sites when an official source is required", async () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const model = offline();
+    const base = await understandQuery(question, model, "quick", { allowModel: false });
+    const plan = await buildPlan(question, "quick", model, {
+      ...base,
+      sourceRequirements: { officialSources: "required" },
+    });
+    const recoveryRequirements = {
+      requestedPredicate: { requirement: plan.interpretation.requestedPredicate!, resolved: false },
+      requestedFacts: [],
+      resolvedFacts: [],
+      unresolvedFacts: [],
+      latestnessRequired: false,
+      latestnessResolved: false,
+      qualifiers: { latest: false, stable: false },
+      officialSourceRequirement: "required" as const,
+      officialEvidenceResolved: false,
+    };
+
+    const recovery = await rewriteQueries(
+      question,
+      plan,
+      [],
+      "quick",
+      model,
+      undefined,
+      recoveryRequirements,
+    );
+
+    expect(recovery.length).toBeGreaterThan(0);
+    expect(recovery.every((query) => /official primary source/i.test(query))).toBe(true);
+    expect(recovery.some((query) => /linkedin/i.test(query))).toBe(false);
   });
 
   it("rejects a candidate about another company's matching CEO fact", () => {

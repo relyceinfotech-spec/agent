@@ -27,6 +27,7 @@ import {
 import { failedSearchAttempt, searchDiagnosticTrace } from "../search-diagnostics.js";
 import { config } from "../config.js";
 import type { KnowledgeStore, StoredDocument } from "../store.js";
+import { isStructuredPersonRoleFact } from "../application-data.js";
 import { getResearchExecutionContext } from "../execution-context.js";
 import { classifyFirstPartyGitHubSource } from "../rank.js";
 import {
@@ -41,7 +42,13 @@ import {
   extractReleaseFactClaimCandidates,
   validateDeterministicReleaseFactCandidates,
 } from "../version-evidence.js";
-import { requestedFactCoverage, type RequestedFactKind } from "../requested-facts.js";
+import {
+  requestedFactCoverage,
+  requestedPredicatePresent,
+  type RequestedFactKind,
+  type RequestedPredicateRequirement,
+} from "../requested-facts.js";
+import { discoverInternalSiteCandidates, entityMatchedSiteOrigin } from "../site-discovery.js";
 import { comparisonClaimMismatchReason, querySubjectMismatchReason } from "../query-relevance.js";
 
 const requestedFactKinds = new Set<RequestedFactKind>([
@@ -650,6 +657,11 @@ export function createToolRegistry(
         requestedFacts?: unknown;
         researchChatOptimization?: boolean;
         provider?: string;
+        sourceType?: Source["sourceType"];
+        entities?: unknown;
+        requestedPredicate?: unknown;
+        siteDiscoveryOrigin?: string;
+        siteDiscoveryMaxCandidates?: number;
       };
       const requestedFacts = readRequestedFacts(payload);
       const researchChatOptimization = payload.researchChatOptimization === true;
@@ -669,7 +681,28 @@ export function createToolRegistry(
             ? ""
             : (payload.snippet ?? ""),
       };
+      const requestedPredicate =
+        payload.requestedPredicate &&
+        typeof payload.requestedPredicate === "object" &&
+        typeof (payload.requestedPredicate as RequestedPredicateRequirement).entity === "string" &&
+        typeof (payload.requestedPredicate as RequestedPredicateRequirement).predicate === "string"
+          ? (payload.requestedPredicate as RequestedPredicateRequirement)
+          : undefined;
+      const entityHints = [
+        ...(Array.isArray(payload.entities)
+          ? payload.entities.filter((entity): entity is string => typeof entity === "string")
+          : []),
+        ...(requestedPredicate ? [requestedPredicate.entity] : []),
+      ];
+      const siteDiscoveryOrigin =
+        payload.provider === "site-discovery" && payload.siteDiscoveryOrigin
+          ? payload.siteDiscoveryOrigin
+          : undefined;
+      if (siteDiscoveryOrigin && new URL(rawUrl).origin !== siteDiscoveryOrigin) {
+        throw new Error("Discovered page is outside its validated site origin");
+      }
       if (
+        payload.provider !== "site-discovery" &&
         payload.allowSnippetEvidence !== false &&
         isSerperSnippetSufficient(searchResult, payload.question ?? "", requestedFactHints)
       ) {
@@ -679,6 +712,7 @@ export function createToolRegistry(
             question: payload.question ?? "",
             requestedFacts: requestedFactHints,
             researchChatOptimization,
+            allowedOrigin: siteDiscoveryOrigin,
           })),
           cached: false,
         };
@@ -706,6 +740,18 @@ export function createToolRegistry(
           domain: cached.metadata.domain ?? new URL(cached.url).hostname,
           language: cached.metadata.language,
           content: cached.content,
+          predicateEvidenceContent:
+            typeof cached.metadata.predicateEvidenceContent === "string"
+              ? cached.metadata.predicateEvidenceContent
+              : cached.content,
+          structuredDataPresent: cached.metadata.structuredDataPresent === true,
+          ...(Array.isArray(cached.metadata.structuredFacts)
+            ? {
+                structuredFacts: cached.metadata.structuredFacts
+                  .filter(isStructuredPersonRoleFact)
+                  .slice(0, 64),
+              }
+            : {}),
           headings: cached.metadata.headings ?? [],
           contentType: cached.metadata.contentType,
           contentOrigin: cachedContentOrigin(cached),
@@ -724,6 +770,10 @@ export function createToolRegistry(
         if (assessment.sufficient) {
           return {
             url: cached.url,
+            retrievalSourceUrl:
+              typeof cached.metadata.retrievalSourceUrl === "string"
+                ? cached.metadata.retrievalSourceUrl
+                : cached.url,
             html: cached.rawHtml,
             contentType:
               document.contentType === "pdf"
@@ -777,6 +827,10 @@ export function createToolRegistry(
           if (assessment.sufficient) {
             return {
               url: cached.url,
+              retrievalSourceUrl:
+                typeof cached.metadata?.retrievalSourceUrl === "string"
+                  ? cached.metadata.retrievalSourceUrl
+                  : cached.url,
               html: cached.rawHtml,
               contentType,
               document,
@@ -813,6 +867,7 @@ export function createToolRegistry(
           validateExtraction(document);
           return {
             url,
+            retrievalSourceUrl: url,
             html: "",
             document,
             contentType: "application/pdf",
@@ -831,13 +886,59 @@ export function createToolRegistry(
         const result = await retrieveSource({
           result: searchResult,
           question,
-          allowSnippetEvidence: payload.allowSnippetEvidence,
+          allowSnippetEvidence:
+            payload.provider === "site-discovery" ? false : payload.allowSnippetEvidence,
           requestedFacts: requestedFactHints,
           researchChatOptimization,
+          allowedOrigin: siteDiscoveryOrigin,
         });
+        const maxSiteCandidates = Math.max(
+          0,
+          Math.min(4, Math.floor(payload.siteDiscoveryMaxCandidates ?? 0)),
+        );
+        const siteOrigin =
+          !siteDiscoveryOrigin && requestedPredicate && maxSiteCandidates > 0
+            ? entityMatchedSiteOrigin({
+                url: result.url,
+                title: [result.document.title, payload.title].filter(Boolean).join(" "),
+                entities: entityHints,
+                sourceType: payload.sourceType,
+              })
+            : undefined;
+        let siteDiscoveryCandidates: Awaited<ReturnType<typeof discoverInternalSiteCandidates>> =
+          [];
+        if (
+          requestedPredicate &&
+          siteOrigin &&
+          result.html &&
+          !requestedPredicatePresent(
+            result.document.predicateEvidenceContent ?? result.document.content,
+            requestedPredicate,
+            result.document.structuredFacts,
+          )
+        ) {
+          siteDiscoveryCandidates = await discoverInternalSiteCandidates({
+            rootUrl: result.url,
+            rootTitle: result.document.title || payload.title || requestedPredicate.entity,
+            rootHtml: result.html,
+            entity: requestedPredicate.entity,
+            predicate: requestedPredicate,
+            maxCandidates: maxSiteCandidates,
+          });
+        }
         return {
           ...result,
+          retrievalSourceUrl: result.retrievalSourceUrl ?? result.url,
           cached: false,
+          siteDiscoveryCandidates,
+          ...(siteDiscoveryCandidates.length
+            ? {
+                retrievalReasons: [
+                  ...result.retrievalReasons,
+                  `Same-origin discovery found ${siteDiscoveryCandidates.length} relevant internal page candidate(s) for the unresolved requested fact.`,
+                ],
+              }
+            : {}),
           ...(cacheRejectionReason
             ? {
                 retrievalAttempts: ["cache", ...result.retrievalAttempts],
@@ -897,6 +998,9 @@ export function createToolRegistry(
             extractionStatus?: string;
             retrievedContentLength?: number;
             canonicalUrl?: string;
+            predicateEvidenceContent?: string;
+            structuredDataPresent?: boolean;
+            structuredFacts?: Source["structuredFacts"];
           };
           retrievalMethod?: string;
         }
@@ -922,6 +1026,9 @@ export function createToolRegistry(
             headings: document.headings,
             contentType: document.contentType,
             contentOrigin: document.contentOrigin,
+            predicateEvidenceContent: document.predicateEvidenceContent,
+            structuredDataPresent: document.structuredDataPresent,
+            structuredFacts: document.structuredFacts,
             retrievalMethod: (input as { retrievalMethod?: string }).retrievalMethod,
             ...sourceMetadata,
           },

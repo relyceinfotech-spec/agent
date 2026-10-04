@@ -93,4 +93,45 @@ describe("browser retrieval fallback", () => {
     },
     25000,
   );
+
+  it.skipIf(!hasBrowser)(
+    "captures only bounded same-origin JSON used by the rendered page and omits query strings",
+    async () => {
+      const payload = {
+        company: { name: "Relyce Infotech", ceo: "Ukenthiran A" },
+      };
+      const server = createServer((request, response) => {
+        if (request.url?.startsWith("/api/about")) {
+          response.setHeader("content-type", "application/json; charset=utf-8");
+          response.end(JSON.stringify(payload));
+          return;
+        }
+        response.setHeader("content-type", "text/html");
+        response.end(`<html><body><div id="root"></div><script>
+          fetch('/api/about?session=must-not-enter-provenance').then((response) => response.json()).then((data) => {
+            document.getElementById('root').textContent = data.company.name;
+          });
+        </script></body></html>`);
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Fixture server unavailable");
+        const result = await browserFetch(`http://127.0.0.1:${address.port}/about`);
+
+        expect(result.html).toContain("Relyce Infotech");
+        expect(result.applicationResponses).toEqual([
+          expect.objectContaining({
+            path: "/api/about",
+            contentType: "application/json",
+            body: JSON.stringify(payload),
+          }),
+        ]);
+        expect(JSON.stringify(result.applicationResponses)).not.toContain("session=");
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    },
+    25000,
+  );
 });

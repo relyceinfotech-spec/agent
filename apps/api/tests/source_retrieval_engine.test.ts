@@ -32,6 +32,7 @@ function dependencies(
   routes: Record<string, Response | Error | (() => Response)>,
   browserHtml?: string,
   resolvedUrls: Record<string, string> = {},
+  browserApplicationResponses: Array<{ path: string; contentType: string; body: string }> = [],
 ): SourceRetrievalDependencies {
   return {
     fetch: vi.fn(async (url: string, init: RequestInit = {}) => {
@@ -49,7 +50,11 @@ function dependencies(
         dispose: async () => {},
       };
     }),
-    browser: vi.fn(async (url: string) => ({ url, html: browserHtml ?? "<main></main>" })),
+    browser: vi.fn(async (url: string) => ({
+      url,
+      html: browserHtml ?? "<main></main>",
+      applicationResponses: browserApplicationResponses,
+    })),
   };
 }
 
@@ -244,6 +249,26 @@ describe("shared source retrieval ladder", () => {
     });
     expect(isSerperSnippetSufficient(genericLeadership, question)).toBe(false);
     expect(isSerperSnippetSufficient(supportedPredicate, question)).toBe(true);
+  });
+
+  it("preserves an explicit CEO statement embedded late in a long LinkedIn result", async () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const snippet =
+      "Startup Fest 2025 at Sathyabama Institute of Science & Technology, Chennai was a resounding success, and Relyce infotech presented its stall. The event provided a platform to showcase its vision and solutions and received encouraging feedback from investors and mentors. The team participated in discussions about its technology and AI solution. Core Team: Ukenthiran A Founder & CEO of Relyce infotech Dharsan L | Tamizharuvi P | GOHULA KANNAN | Naveenkumar Sivarajan.";
+    const result = {
+      ...searchResult,
+      title: "Relyce infotech | LinkedIn",
+      url: "https://www.linkedin.com/company/relyce-infotech",
+      snippet,
+    };
+    const deps = dependencies({});
+
+    expect(assessSerperSnippet(result, question).sufficient).toBe(true);
+    const retrieved = await retrieveSource({ result, question }, deps);
+
+    expect(retrieved.retrievalMethod).toBe("serper_snippet");
+    expect(retrieved.document.content).toContain("Ukenthiran A Founder & CEO of Relyce infotech");
+    expect(deps.fetch).not.toHaveBeenCalled();
   });
 
   it("requires a snippet to support the requested entity/version lifecycle date", () => {
@@ -784,6 +809,115 @@ describe("shared source retrieval ladder", () => {
     ]);
     expect(deps.browser).toHaveBeenCalledTimes(1);
     expect(fullPageGetCount(deps)).toBe(1);
+  });
+
+  it("extracts a same-origin public JSON fact when rendered DOM remains sparse", async () => {
+    const shell =
+      '<html><body><div id="root"></div><script src="/bundle.js"></script></body></html>';
+    const appData = JSON.stringify({
+      company: {
+        name: "Relyce Infotech",
+        leadership: [
+          { name: "Ukenthiran A", role: "Founder & CEO", email: "private@example.test" },
+        ],
+        api_key: "must-not-be-retained",
+      },
+    });
+    const deps = dependencies(
+      {
+        [`HEAD ${pageUrl}`]: () => new Response(null, { headers: { "content-type": "text/html" } }),
+        [`GET ${pageUrl} range`]: () => htmlResponse(shell),
+        [`GET ${pageUrl}`]: () => htmlResponse(shell),
+      },
+      '<html><body><main><div id="app"></div></main></body></html>',
+      {},
+      [{ path: "/api/company/about", contentType: "application/json", body: appData }],
+    );
+
+    const result = await retrieveSource(
+      {
+        result: { url: pageUrl, title: "Relyce Infotech", snippet: "" },
+        question: "Who is the CEO of Relyce Infotech?",
+        allowSnippetEvidence: false,
+        researchChatOptimization: true,
+      },
+      deps,
+    );
+
+    expect(result.retrievalMethod).toBe("browser");
+    expect(result.document.content).toContain("company.name: Relyce Infotech");
+    expect(result.document.content).toContain("Founder & CEO");
+    expect(result.document.content).toContain("Ukenthiran A");
+    expect(result.document.content).not.toContain("private@example.test");
+    expect(result.document.content).not.toContain("must-not-be-retained");
+    expect(result.retrievalReasons.join("\n")).toContain(
+      "same-origin browser response(s): /api/company/about",
+    );
+  });
+
+  it("keeps discovered-page browser rendering pinned to the validated site origin", async () => {
+    const origin = "https://relyceinfotech.com";
+    const childUrl = `${origin}/company/leadership`;
+    const ceoEvidence = "Ukenthiran A is the Founder & CEO of Relyce Infotech.";
+    const renderedBody = `${ceoEvidence} The company profile identifies his executive role and describes his responsibility for the organization's strategy, technology operations, consulting services, and long-term development.`;
+    const shell =
+      '<html><body><div id="root"></div><script src="/bundle.js"></script></body></html>';
+    const rendered = `<html><body><main><article><h1>Relyce Infotech leadership</h1><p>${renderedBody}</p></article></main></body></html>`;
+    const deps = dependencies(
+      {
+        [`HEAD ${childUrl}`]: htmlResponse(""),
+        [`GET ${childUrl} range`]: htmlResponse(shell),
+        [`GET ${childUrl}`]: htmlResponse(shell),
+      },
+      rendered,
+    );
+    const result = await retrieveSource(
+      {
+        result: { url: childUrl, title: "Relyce Infotech leadership", snippet: "" },
+        question: "Who is the CEO of Relyce Infotech?",
+        allowSnippetEvidence: false,
+        researchChatOptimization: true,
+        allowedOrigin: origin,
+      },
+      deps,
+    );
+
+    expect(result.retrievalMethod).toBe("browser");
+    expect(result.document.content).toContain(ceoEvidence);
+    expect(deps.browser).toHaveBeenCalledWith(childUrl, undefined, origin);
+    expect(
+      (deps.fetch as ReturnType<typeof vi.fn>).mock.calls.every((call) => call[3] === origin),
+    ).toBe(true);
+  });
+
+  it("rejects a discovered page whose final HTTP URL leaves the validated origin", async () => {
+    const origin = "https://relyceinfotech.com";
+    const childUrl = `${origin}/company/leadership`;
+    const deps = dependencies(
+      {
+        [`HEAD ${childUrl}`]: htmlResponse(""),
+        [`GET ${childUrl} range`]: htmlResponse("<html><head></head></html>"),
+        [`GET ${childUrl}`]: htmlResponse(
+          "<html><body>Relyce Infotech leadership information</body></html>",
+        ),
+      },
+      undefined,
+      { [childUrl]: "https://attacker.example/company/leadership" },
+    );
+
+    await expect(
+      retrieveSource(
+        {
+          result: { url: childUrl, title: "Relyce Infotech leadership", snippet: "" },
+          question: "Who is the CEO of Relyce Infotech?",
+          allowSnippetEvidence: false,
+          allowedOrigin: origin,
+        },
+        deps,
+      ),
+    ).rejects.toThrow("Fetch result is outside the discovered site origin");
+    expect(deps.fetch).toHaveBeenCalledOnce();
+    expect(deps.browser).not.toHaveBeenCalled();
   });
 
   it("cancels an unresponsive browser fallback at the shared research deadline", async () => {

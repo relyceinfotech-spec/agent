@@ -36,6 +36,7 @@ import type {
   ReleaseEvidenceRecord,
   QueryInterpretation,
 } from "./domain.js";
+import type { ExtractedDocument } from "./extract.js";
 import { isQueryInterpretation } from "./domain.js";
 import {
   assessLatestnessEvidence,
@@ -43,7 +44,12 @@ import {
   extractReleaseEvidenceRecords,
 } from "./version-evidence.js";
 import { auditResearchCitations, OpenRouterProvider } from "./llm.js";
-import { buildPlan, rewriteQueries, validateRecoveryQuery } from "./planner.js";
+import {
+  buildPlan,
+  preciseFactRecoverySourceClass,
+  rewriteQueries,
+  validateRecoveryQuery,
+} from "./planner.js";
 import {
   isOfficialSourceForEntities,
   rankResults,
@@ -57,6 +63,8 @@ import { searchDiagnosticTrace, safeSearchMessage } from "./search-diagnostics.j
 import { pMap } from "./concurrency.js";
 import { isSerperSnippetSufficient, SourceRetrievalError } from "./source-retrieval.js";
 import { containsExactEntity, subjectEntityMismatchReason } from "./entities.js";
+import { entityMatchedSiteOrigin } from "./site-discovery.js";
+import { buildClaimSourceReliance, publisherDomainKey } from "./source-provenance.js";
 import {
   querySubjectMismatchReason,
   comparisonClaimMismatchReason,
@@ -66,7 +74,10 @@ import {
 import { withOperationContext } from "./operation-context.js";
 import type { CitationEntailmentReport } from "./citation-entailment.js";
 import { enforceResearchChatBoundedFactCoverage } from "./research-chat-fact-gate.js";
-import { reconcileLatestnessClaimDisposition } from "./research-answer.js";
+import {
+  firstPartyStructuredRoleForClaim,
+  reconcileLatestnessClaimDisposition,
+} from "./research-answer.js";
 import {
   extractRequestedFacts,
   classifyEvidenceStatus,
@@ -76,6 +87,8 @@ import {
   missingRequestedFactSupport as checkMissingRequestedFactSupport,
   requestedFactCoverage,
   requestedPredicatePresent,
+  extractRequestedPredicate,
+  claimTextSupportsStructuredFact,
   type RequestedFactCoverage,
   type RequestedFactKind,
   type RequestedPredicateRequirement,
@@ -105,6 +118,17 @@ type Action =
   | "detect_conflicts"
   | "search_again"
   | "synthesize";
+interface ActionOption {
+  token: string;
+  action: Action;
+  sourceId?: string;
+}
+
+interface ActionChoice {
+  action: Action;
+  sourceId?: string;
+}
+
 export interface ResearchBudget {
   maxSteps: number;
   maxQueries: number;
@@ -209,6 +233,8 @@ export function missingRequestedFactSupport(
     releaseEvidence?: ReleaseEvidenceRecord[];
     officialSourcesRequired?: boolean;
     requestedPredicate?: RequestedPredicateRequirement;
+    predicateEvidence?: string[];
+    structuredFacts?: Source["structuredFacts"];
   } = {},
 ): string[] {
   return checkMissingRequestedFactSupport(question, verifiedClaimTexts, options);
@@ -254,6 +280,7 @@ function sourceTaskEvidence(
     latestnessSourceIds?: string[];
   } = {},
 ): Source[] {
+  const requestedPredicate = extractRequestedPredicate(question);
   return sources.map((source) => {
     if (source.subjectMismatchReason) {
       return {
@@ -271,8 +298,23 @@ function sourceTaskEvidence(
       (claim) => claim.verification?.verdict === "supported" && claim.sourceIds.includes(source.id),
     );
     const verifiedClaims = sourceClaims.map((claim) => `${claim.text}\n${claim.evidence}`);
+    const structuredFacts = requestedPredicate
+      ? (source.structuredFacts ?? []).filter(
+          (fact) =>
+            [source.url, source.canonicalUrl, source.retrievalSourceUrl].includes(fact.sourceUrl) &&
+            sourceClaims.some((claim) =>
+              claimTextSupportsStructuredFact(
+                `${claim.text}\n${claim.evidence}`,
+                fact,
+                requestedPredicate,
+              ),
+            ),
+        )
+      : [];
     const sourceEvidenceOptions = {
       requestedFacts,
+      predicateEvidence: [source.predicateEvidenceContent ?? verifiedClaims.join("\n")],
+      structuredFacts,
       releaseEvidence: (options.releaseEvidence ?? []).filter(
         (record) => record.sourceId === source.id,
       ),
@@ -301,10 +343,14 @@ function sourceTaskEvidence(
 
 function unverifiedTaskEvidence(
   question: string,
-  content: string,
+  document: Pick<ExtractedDocument, "content" | "predicateEvidenceContent" | "structuredFacts">,
   requestedFacts: RequestedFactKind[],
 ) {
-  const missingFacts = missingRequestedFactSupport(question, [content], { requestedFacts });
+  const missingFacts = missingRequestedFactSupport(question, [document.content], {
+    requestedFacts,
+    predicateEvidence: [document.predicateEvidenceContent ?? document.content],
+    structuredFacts: document.structuredFacts,
+  });
   return {
     status: missingFacts.length > 0 ? ("INSUFFICIENT_EVIDENCE" as const) : ("UNVERIFIED" as const),
     missingFacts,
@@ -643,6 +689,8 @@ export function selectVerificationClaims(
   limit: number,
   focusTerms: string[] = [],
   requestedFacts: RequestedFactKind[] = [],
+  requestedPredicate?: RequestedPredicateRequirement,
+  sources: Source[] = [],
 ): Claim[] {
   const importance = { critical: 4, high: 3, medium: 2, low: 1 };
   const releaseFactKinds = new Set<RequestedFactKind>([
@@ -664,6 +712,26 @@ export function selectVerificationClaims(
       0,
     );
   };
+  const requestedPredicatePriority = (claim: Claim) => {
+    if (!requestedPredicate) return 0;
+    if (requestedPredicatePresent(claim.text, requestedPredicate)) return 1;
+
+    // JSON-LD claims may be serialized as semicolon-separated key/value fields.
+    // Use the source-bound relation to prioritize these exact claims for
+    // verification, while leaving the evidence and completion gates unchanged.
+    const claimSourceIds = new Set(claim.sourceIds);
+    return sources.some(
+      (source) =>
+        claimSourceIds.has(source.id) &&
+        (source.structuredFacts ?? []).some(
+          (fact) =>
+            [source.url, source.canonicalUrl, source.retrievalSourceUrl].includes(fact.sourceUrl) &&
+            claimTextSupportsStructuredFact(claim.text, fact, requestedPredicate),
+        ),
+    )
+      ? 1
+      : 0;
+  };
   const groups = new Map<string, Claim[]>();
   const pendingClaims = claims.filter((item) => {
     if (item.verification) return false;
@@ -679,16 +747,22 @@ export function selectVerificationClaims(
   for (const group of groups.values()) {
     group.sort(
       (a, b) =>
+        requestedPredicatePriority(b) - requestedPredicatePriority(a) ||
         releaseFactPriority(b, requiredReleaseFacts) -
           releaseFactPriority(a, requiredReleaseFacts) ||
         importance[b.importance ?? "medium"] - importance[a.importance ?? "medium"] ||
         relevance(b) - relevance(a),
     );
   }
+  const orderedGroups = [...groups.values()].sort(
+    (left, right) =>
+      Math.max(...right.map(requestedPredicatePriority)) -
+      Math.max(...left.map(requestedPredicatePriority)),
+  );
   const selected: Claim[] = [];
   while (selected.length < limit) {
     let added = false;
-    for (const group of groups.values()) {
+    for (const group of orderedGroups) {
       const claim = group.shift();
       if (claim) {
         selected.push(claim);
@@ -759,9 +833,9 @@ export function researchBudgetFor(
     maxQueries: Math.min(ceilings.maxQueries, overrides.maxQueries ?? ceilings.maxQueries),
     maxSources: Math.min(ceilings.maxSources, overrides.maxSources ?? ceilings.maxSources),
     maxPages: Math.min(ceilings.maxPages, overrides.maxPages ?? ceilings.maxPages),
-    // Quick mode defaults to one recovery pass. Explicit bounded harnesses may
-    // raise this only through the test-only bounded evaluator ceiling. The
-    // independent maxQueries ceiling still controls total provider searches.
+    // Quick mode defaults to one general recovery pass. The precise-fact path
+    // may use its remaining query allowance sequentially after planning.
+    // Extended evaluator ceilings still apply when explicitly supplied.
     maxSearchPasses: Math.min(
       maxSearchPassCeiling,
       Math.max(0, Math.floor(overrides.maxSearchPasses ?? defaults.maxSearchPasses)),
@@ -820,6 +894,32 @@ function labelFor(action: Action) {
     search_again: "🔄 search_again",
     synthesize: "✍️ synthesize",
   }[action];
+}
+
+function researchActionFailureCategory(error: unknown): string {
+  if (error instanceof Error && /timeout|abort/i.test(error.name)) return "timeout";
+  if (!error || typeof error !== "object") return "provider_error";
+
+  const details = error as {
+    status?: unknown;
+    statusCode?: unknown;
+    cause?: { code?: unknown };
+  };
+  const status =
+    typeof details.statusCode === "number"
+      ? details.statusCode
+      : typeof details.status === "number"
+        ? details.status
+        : undefined;
+  if (status === 429) return "rate_limited";
+  if (status === 401 || status === 403) return "provider_permission";
+  if (status !== undefined && status >= 500) return "provider_server_error";
+  if (status !== undefined) return "provider_http_error";
+
+  const code = typeof details.cause?.code === "string" ? details.cause.code : "";
+  if (/^(?:ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|UND_ERR_[A-Z_]+)$/i.test(code))
+    return "network_error";
+  return "provider_error";
 }
 
 export class ResearchRunner {
@@ -1176,13 +1276,17 @@ export class ResearchRunner {
       }
     }
   }
-  private pendingSource(state: LoopState, budget: ResearchBudget) {
+  private pendingSources(state: LoopState, budget: ResearchBudget) {
     const candidates = state.rankedSources.filter(
       (source) => !state.fetchedUrls.has(source.url) && !source.fetchError,
     );
-    if (this.pagesUsed(state) < this.pageLimitForPass(state, budget)) return candidates[0];
-    if (!state.researchChatOptimization) return undefined;
-    return candidates.find((source) => this.isSnippetSufficientForState(state, source));
+    if (this.pagesUsed(state) < this.pageLimitForPass(state, budget)) return candidates;
+    if (!state.researchChatOptimization) return [];
+    return candidates.filter((source) => this.isSnippetSufficientForState(state, source));
+  }
+
+  private pendingSource(state: LoopState, budget: ResearchBudget) {
+    return this.pendingSources(state, budget)[0];
   }
 
   private pageRetrievalCount(state: LoopState): number {
@@ -1388,6 +1492,36 @@ export class ResearchRunner {
       (claim) => claim.verification?.verdict === "supported",
     );
     const verifiedClaimTexts = verifiedClaims.map((claim) => `${claim.text}\n${claim.evidence}`);
+    const requestedPredicate = state.plan.interpretation.requestedPredicate;
+    const predicateEvidence = state.fetchedSources
+      .filter((source) => verifiedClaims.some((claim) => claim.sourceIds.includes(source.id)))
+      .flatMap((source) =>
+        source.predicateEvidenceContent !== undefined
+          ? [source.predicateEvidenceContent]
+          : verifiedClaims
+              .filter((claim) => claim.sourceIds.includes(source.id))
+              .map((claim) => `${claim.text}\n${claim.evidence}`),
+      );
+    const verifiedStructuredFacts = requestedPredicate
+      ? state.fetchedSources.flatMap((source) => {
+          const sourceClaims = verifiedClaims.filter((claim) =>
+            claim.sourceIds.includes(source.id),
+          );
+          return (source.structuredFacts ?? []).filter(
+            (fact) =>
+              [source.url, source.canonicalUrl, source.retrievalSourceUrl].includes(
+                fact.sourceUrl,
+              ) &&
+              sourceClaims.some((claim) =>
+                claimTextSupportsStructuredFact(
+                  `${claim.text}\n${claim.evidence}`,
+                  fact,
+                  requestedPredicate,
+                ),
+              ),
+          );
+        })
+      : [];
     const latestnessProven = latestnessAssessment?.conclusion === "PROVEN";
     const coverageOptions = factCoverageOptions(
       state.plan,
@@ -1399,7 +1533,11 @@ export class ResearchRunner {
     // state. Controller sufficiency, objective completion, and recovery all
     // consume this exact value.
     const verifiedFactCoverage = enforceResearchChatBoundedFactCoverage(
-      requestedFactCoverage(state.question, verifiedClaimTexts, coverageOptions),
+      requestedFactCoverage(state.question, verifiedClaimTexts, {
+        ...coverageOptions,
+        predicateEvidence,
+        structuredFacts: verifiedStructuredFacts,
+      }),
       state.question,
       verifiedClaims,
       state.fetchedSources,
@@ -1541,7 +1679,9 @@ export class ResearchRunner {
     };
     const missingRequestedFacts = missingRequestedFactSupportFromCoverage(canonicalCoverage);
     const supported = supportedClaims.length;
-    const sourceDomains = new Map(state.fetchedSources.map((source) => [source.id, source.domain]));
+    const sourceDomains = new Map(
+      state.fetchedSources.map((source) => [source.id, publisherDomainKey(source.domain)]),
+    );
     const independentDomains = new Set(
       supportedClaims.flatMap((claim) =>
         claim.sourceIds.map((id) => sourceDomains.get(id)).filter(Boolean),
@@ -1677,14 +1817,57 @@ export class ResearchRunner {
    * per skipped call.
    *
    * Branch points where the model adds real value:
-   *  • After evidence is gathered: model may synthesize early when evidence is
-   *    already sufficient, or continue with verify_claims for thoroughness.
-   *    The evidence guard still applies — "synthesize" is only offered when
-   *    assessEvidence() says sufficient, so the model cannot bypass it.
+   *  • While evidence is insufficient: choose a bounded candidate source or
+   *    request a targeted recovery search.
+   *  • After required evidence is sufficient: synthesize, inspect another
+   *    candidate, or request bounded corroboration on lookup/comparison/deep
+   *    tasks.
+   *  The model cannot create a URL or bypass the deterministic evidence gate.
    */
-  private allowedActions(state: LoopState, budget: ResearchBudget): Action[] {
+  private allowedActions(state: LoopState, budget: ResearchBudget): ActionOption[] {
     const next = this.nextAction(state, budget);
     const evidence = this.assessEvidence(state);
+    const requestedPredicate = state.plan.interpretation.requestedPredicate;
+    const fastPredicateLookup = Boolean(
+      state.researchChatOptimization &&
+      state.mode === "quick" &&
+      requestedPredicate &&
+      !state.plan.interpretation.comparison &&
+      requestedFactsForPlan(state.plan).length === 0,
+    );
+    const deterministicOption: ActionOption = { token: next, action: next };
+
+    // An exact first-party structured role relation does not need an optional
+    // model decision about whether to fetch more sources. Conflicts, ambiguity,
+    // and all missing-evidence cases still use the existing adaptive loop.
+    if (
+      fastPredicateLookup &&
+      requestedPredicate &&
+      next === "synthesize" &&
+      evidence.sufficient &&
+      !state.conflicts.some((conflict) => conflict.status === "open")
+    ) {
+      const bindings = this.taskEligibleClaims(state)
+        .filter((claim) => claim.verification?.verdict === "supported")
+        .flatMap((claim) =>
+          state.fetchedSources.flatMap((source) => {
+            const fact = firstPartyStructuredRoleForClaim(
+              claim,
+              source,
+              state.plan.interpretation.entities,
+              requestedPredicate,
+            );
+            return fact ? [{ sourceId: source.id, fact }] : [];
+          }),
+        );
+      const uniqueBindings = new Map(
+        bindings.map(({ sourceId, fact }) => [
+          `${sourceId}\u0000${fact.entity}\u0000${fact.person}\u0000${fact.jobTitle}`,
+          fact,
+        ]),
+      );
+      if (uniqueBindings.size === 1) return [deterministicOption];
+    }
 
     // Once Research Chat has enough supported evidence, do not spend another
     // controller/verifier call on incidental claims. Preserve conflict
@@ -1695,11 +1878,59 @@ export class ResearchRunner {
       next === "verify_claims" &&
       evidence.sufficient
     ) {
-      return [state.conflictsChecked ? "synthesize" : "detect_conflicts"];
+      const action = state.conflictsChecked ? "synthesize" : "detect_conflicts";
+      return [{ token: action, action }];
     }
 
-    // All other steps are fully deterministic — skip the LLM call.
-    return [next];
+    if (
+      !this.adaptiveEvidenceLoop ||
+      !state.researchChatOptimization ||
+      !this.llm.enabled ||
+      state.modelDecisions >= budget.maxModelDecisions
+    ) {
+      return [deterministicOption];
+    }
+
+    const additionalEvidenceHasValue =
+      state.plan.interpretation.comparison !== undefined ||
+      state.plan.interpretation.requestedPredicate !== undefined ||
+      requestedFactsForPlan(state.plan).includes("latestness");
+    if (next === "synthesize" && evidence.sufficient && additionalEvidenceHasValue) {
+      const candidates = this.pendingSources(state, budget).slice(0, 3);
+      const options: ActionOption[] = [
+        deterministicOption,
+        ...candidates.map((source) => ({
+          token: `fetch_url:${source.id}`,
+          action: "fetch_url" as const,
+          sourceId: source.id,
+        })),
+      ];
+      if (this.canSearchAgain(state, budget))
+        options.push({ token: "search_again", action: "search_again" });
+      // Synthesis is offered only after deterministic evidence sufficiency.
+      // The model may spend the remaining budget on another candidate/search
+      // for corroboration, then the evidence gate is evaluated again.
+      if (options.length > 1) return options;
+    }
+
+    if (next !== "fetch_url" || evidence.sufficient || !this.canSearchAgain(state, budget)) {
+      return [deterministicOption];
+    }
+
+    // A live research branch: inspect one of the bounded, already-triaged
+    // candidates, or spend a remaining query on a targeted recovery search.
+    // The model chooses only among these options; URL validation, budgets,
+    // evidence checks, and the completion gate remain deterministic.
+    const candidates = this.pendingSources(state, budget).slice(0, 3);
+    if (candidates.length === 0) return [deterministicOption];
+    return [
+      ...candidates.map((source) => ({
+        token: `fetch_url:${source.id}`,
+        action: "fetch_url" as const,
+        sourceId: source.id,
+      })),
+      { token: "search_again", action: "search_again" },
+    ];
   }
   private observation(state: LoopState, budget: ResearchBudget): Record<string, unknown> {
     const evidence = this.assessEvidence(state);
@@ -1757,6 +1988,59 @@ export class ResearchRunner {
         resolved: officialEvidenceResolved,
       },
       latestRecoveryRequirements: state.searchRecoveries.at(-1)?.requirements,
+      sourceDiversity: {
+        attemptedRecoveryClasses: state.searchRecoveries
+          .map((recovery) => recovery.sourceClass)
+          .filter((sourceClass): sourceClass is NonNullable<typeof sourceClass> =>
+            Boolean(sourceClass),
+          ),
+        observedPublisherDomains: [
+          ...new Set(
+            state.rankedSources.map((source) => publisherDomainKey(source.domain)).filter(Boolean),
+          ),
+        ].slice(0, 12),
+        supportedClaimSources: buildClaimSourceReliance(
+          eligibleSupportedClaims,
+          state.fetchedSources,
+          state.plan.interpretation.entities,
+        ).map((summary) => ({
+          claimId: summary.claimId,
+          independentPublisherCount: summary.independentPublisherCount,
+          corroboratedAcrossIndependentPublishers: summary.corroboratedAcrossIndependentPublishers,
+          sources: summary.sources.map((source) => ({
+            id: source.id,
+            publisherDomain: source.publisherDomain,
+            sourceType: source.sourceType,
+            relationshipToEntity: source.relationshipToEntity,
+            authorityScore: source.authorityScore,
+          })),
+        })),
+      },
+      candidateSources: this.pendingSources(state, budget)
+        .slice(0, 3)
+        .map((source) => ({
+          sourceId: source.id,
+          title: source.title.slice(0, 180),
+          domain: source.domain,
+          snippet: source.snippet.slice(0, 320),
+          sourceType: source.sourceType,
+          relevance: source.quality.relevance,
+          authority: source.quality.authority,
+          extractionStatus: source.extractionStatus,
+          retrievedContentLength: source.retrievedContentLength,
+          subjectMismatchReason: source.subjectMismatchReason,
+          missingRequestedFacts: source.taskEvidence?.missingFacts ?? [],
+        })),
+      recentRetrievals: state.fetchedSources.slice(-3).map((source) => ({
+        title: source.title.slice(0, 180),
+        domain: source.domain,
+        retrievalMethod: source.retrievalMethod,
+        extractionStatus: source.extractionStatus,
+        retrievedContentLength: source.retrievedContentLength,
+        failureCategory: source.fetchFailureCategory,
+        subjectMismatchReason: source.subjectMismatchReason,
+        missingRequestedFacts: source.taskEvidence?.missingFacts ?? [],
+      })),
       budgetRemaining: {
         queries: Math.max(0, budget.maxQueries - state.queriesIssued),
         pages: Math.max(0, budget.maxPages - this.pagesUsed(state)),
@@ -1770,7 +2054,7 @@ export class ResearchRunner {
     id: string,
     state: LoopState,
     budget: ResearchBudget,
-  ): Promise<Action> {
+  ): Promise<ActionChoice> {
     const allowed = this.allowedActions(state, budget);
     const recommended = allowed[0];
     const evidence = this.assessEvidence(state);
@@ -1784,53 +2068,67 @@ export class ResearchRunner {
       await this.recordDecision(id, {
         requestedAction: undefined,
         controllerDecision: "fallback",
-        nextAction: recommended,
+        nextAction: recommended.action,
         reason:
-          recommended === "search_again" && unresolvedLatestness
+          recommended.action === "search_again" && unresolvedLatestness
             ? `latestness remains unresolved (${unresolvedLatestness.reason}); retrieve additional official evidence. ${evidence.reasons.join("; ")}`
-            : recommended === "search_again" && evidence.reasons.length > 0
+            : recommended.action === "search_again" && evidence.reasons.length > 0
               ? `evidence remains insufficient: ${evidence.reasons.join("; ")}`
-              : recommended === "synthesize" && unresolvedLatestness
+              : recommended.action === "synthesize" && unresolvedLatestness
                 ? `research budget exhausted for latestness resolution; report uncertainty (${unresolvedLatestness.reason})`
                 : "deterministic controller step — single valid action, no model decision needed",
       });
-      return recommended;
+      return { action: recommended.action, sourceId: recommended.sourceId };
     }
 
     // Genuine branch: model has real options. Consult it if available.
     let requestedAction: string | undefined;
+    let decisionFailureCategory: string | undefined;
     if (this.llm.enabled && state.modelDecisions < budget.maxModelDecisions) {
+      // Count the attempt before awaiting the provider. Failed or timed-out
+      // decisions still consume budget, so a broken provider cannot be retried
+      // on every controller branch until the overall deadline expires.
+      state.modelDecisions += 1;
       try {
         requestedAction = await this.llm.proposeResearchAction(
           this.observation(state, budget),
-          allowed,
+          allowed.map((option) => option.token),
         );
-        state.modelDecisions += 1;
-      } catch {
+      } catch (error) {
         requestedAction = undefined;
+        decisionFailureCategory = researchActionFailureCategory(error);
       }
     }
-    const requested = requestedAction as Action | undefined;
-    if (requested && allowed.includes(requested)) {
+    const requested = allowed.find((option) => option.token === requestedAction);
+    if (requested) {
       await this.recordDecision(id, {
         requestedAction,
         controllerDecision: "allow",
-        nextAction: requested,
-        reason: evidence.sufficient
-          ? "evidence sufficiency guard passed"
-          : "action is valid for the current state",
+        nextAction: requested.action,
+        reason:
+          requested.sourceId !== undefined
+            ? "model selected a bounded source candidate for retrieval"
+            : requested.action === "search_again"
+              ? evidence.sufficient
+                ? "model requested one optional corroboration search within the remaining research budget"
+                : `model requested targeted recovery while evidence remains insufficient: ${evidence.reasons.join("; ")}`
+              : evidence.sufficient
+                ? "evidence sufficiency guard passed"
+                : "action is valid for the current state",
       });
-      return requested;
+      return { action: requested.action, sourceId: requested.sourceId };
     }
     await this.recordDecision(id, {
       requestedAction,
       controllerDecision: requestedAction ? "override" : "fallback",
-      nextAction: recommended,
+      nextAction: recommended.action,
       reason: requestedAction
         ? `requested action is not in the allowed set; ${evidence.reasons.join("; ") || "controller sequencing guard"}`
-        : "model decision unavailable — deterministic fallback",
+        : decisionFailureCategory
+          ? `model decision failed (${decisionFailureCategory}) — deterministic fallback`
+          : "model decision unavailable — deterministic fallback",
     });
-    return recommended;
+    return { action: recommended.action, sourceId: recommended.sourceId };
   }
   private async triageSources(id: string, state: LoopState, budget: ResearchBudget) {
     const ranked = rankResults(state.plan.interpretation.normalizedQuestion, state.rawResults);
@@ -1846,9 +2144,21 @@ export class ResearchRunner {
     const recoveryRequirements = state.researchChatOptimization
       ? state.searchRecoveries.at(-1)?.requirements
       : undefined;
+    const sourceSelectionRequirements =
+      recoveryRequirements ??
+      (state.researchChatOptimization && state.plan.interpretation.requestedPredicate
+        ? {
+            requestedPredicate: {
+              requirement: state.plan.interpretation.requestedPredicate,
+              resolved: false,
+            },
+          }
+        : undefined);
     const unresolvedPredicate =
-      recoveryRequirements?.requestedPredicate && !recoveryRequirements.requestedPredicate.resolved
-        ? recoveryRequirements.requestedPredicate.requirement
+      sourceSelectionRequirements?.requestedPredicate &&
+      !sourceSelectionRequirements.requestedPredicate.resolved &&
+      this.hasUnresolvedRequestedPredicate(state)
+        ? sourceSelectionRequirements.requestedPredicate.requirement
         : undefined;
     const candidates =
       comparison || unresolvedPredicate
@@ -1898,7 +2208,7 @@ export class ResearchRunner {
       sourceLimit,
       officialSourceRequirement,
       state.question,
-      recoveryRequirements,
+      sourceSelectionRequirements,
       state.researchChatOptimization && !!state.plan.interpretation.comparison,
       comparison
         ? {
@@ -1918,6 +2228,22 @@ export class ResearchRunner {
               .map((source) => source.url),
           }
         : undefined,
+      state.researchChatOptimization &&
+        !comparison &&
+        !!state.plan.interpretation.requestedPredicate,
+      state.researchChatOptimization &&
+        !comparison &&
+        !!state.plan.interpretation.requestedPredicate,
+      state.researchChatOptimization &&
+        !comparison &&
+        !!state.plan.interpretation.requestedPredicate
+        ? state.fetchedSources
+            .filter(
+              (source) =>
+                source.content?.trim() && !source.fetchError && !source.subjectMismatchReason,
+            )
+            .map((source) => source.domain)
+        : [],
     );
     state.rankedSources = comparison
       ? [
@@ -2044,6 +2370,7 @@ export class ResearchRunner {
     state: LoopState,
     action: Action,
     budget: ResearchBudget,
+    selectedSourceId?: string,
   ) {
     if (action === "web_search") {
       const initialQueryLimit = initialSearchQueryLimit(
@@ -2077,22 +2404,18 @@ export class ResearchRunner {
         0,
         this.pageLimitForPass(state, budget) - this.pagesUsed(state),
       );
-      const candidates = state.rankedSources.filter(
-        (source) => !state.fetchedUrls.has(source.url) && !source.fetchError,
-      );
-      const pendingSources =
-        remainingSlots > 0
-          ? candidates.slice(
-              0,
-              this.adaptiveEvidenceLoop
+      const eligibleSources = this.pendingSources(state, budget);
+      const selectedSource = eligibleSources.find((source) => source.id === selectedSourceId);
+      const pendingSources = selectedSource
+        ? [selectedSource]
+        : eligibleSources.slice(
+            0,
+            remainingSlots > 0
+              ? this.adaptiveEvidenceLoop
                 ? this.adaptiveInitialFetchCount(state, remainingSlots)
-                : remainingSlots,
-            )
-          : state.researchChatOptimization
-            ? candidates
-                .filter((source) => this.isSnippetSufficientForState(state, source))
-                .slice(0, 1)
-            : [];
+                : remainingSlots
+              : 1,
+          );
 
       if (pendingSources.length === 0) return;
 
@@ -2109,6 +2432,7 @@ export class ResearchRunner {
       }
 
       const priorFetchedCount = state.fetchedSources.length;
+      const discoveredSiteCandidates: SearchResult[] = [];
       await this.step(
         id,
         labelFor(action),
@@ -2121,15 +2445,33 @@ export class ResearchRunner {
         pendingSources,
         async (source) => {
           try {
+            const siteOrigin = entityMatchedSiteOrigin({
+              url: source.url,
+              title: source.title,
+              entities: state.plan.interpretation.entities,
+              sourceType: source.sourceType,
+            });
+            const siteDiscoveryMaxCandidates =
+              pendingSources.length === 1 &&
+              this.hasUnresolvedRequestedPredicate(state) &&
+              siteOrigin &&
+              state.plan.interpretation.requestedPredicate
+                ? Math.min(4, Math.max(0, remainingSlots - 1))
+                : 0;
             const fetched = (await this.registry.execute("fetch_url", {
               url: source.url,
               title: source.title,
               snippet: source.snippet,
               provider: source.provider,
+              sourceType: source.sourceType,
               question: state.question,
               allowSnippetEvidence: this.snippetEvidencePolicy.get(id) ?? true,
               requestedFacts: requestedFactsForPlan(state.plan),
               researchChatOptimization: state.researchChatOptimization,
+              entities: state.plan.interpretation.entities,
+              requestedPredicate: state.plan.interpretation.requestedPredicate,
+              siteDiscoveryMaxCandidates,
+              siteDiscoveryOrigin: source.siteDiscoveryOrigin,
             })) as {
               html: string;
               url: string;
@@ -2146,7 +2488,37 @@ export class ResearchRunner {
               extractionConfidence?: number;
               extractionStatus?: Source["extractionStatus"];
               retrievedContentLength?: number;
+              predicateEvidenceContent?: string;
+              structuredDataPresent?: boolean;
+              structuredFacts?: Source["structuredFacts"];
+              siteDiscoveryCandidates?: SearchResult[];
             };
+            // Structured facts are bound to the final URL used during extraction.
+            // Preserve that exact retrieval location alongside the original search
+            // URL so later source-bound coverage checks can validate redirects.
+            const retrievalSourceUrl = fetched.retrievalSourceUrl ?? fetched.url;
+            if (
+              siteDiscoveryMaxCandidates > 0 &&
+              siteOrigin &&
+              Array.isArray(fetched.siteDiscoveryCandidates)
+            ) {
+              for (const candidate of fetched.siteDiscoveryCandidates.slice(
+                0,
+                siteDiscoveryMaxCandidates,
+              )) {
+                try {
+                  if (
+                    candidate.provider === "site-discovery" &&
+                    candidate.siteDiscoveryOrigin === siteOrigin &&
+                    new URL(candidate.url).origin === siteOrigin
+                  ) {
+                    discoveredSiteCandidates.push(candidate);
+                  }
+                } catch {
+                  // Invalid discovery output is ignored; it cannot enter source triage.
+                }
+              }
+            }
             const document = (await this.registry.execute("extract_content", {
               html: fetched.html,
               url: fetched.url,
@@ -2164,7 +2536,7 @@ export class ResearchRunner {
                 retrievalAttempts: fetched.retrievalAttempts,
                 retrievalMethodsSkipped: fetched.retrievalMethodsSkipped,
                 retrievalReasons: fetched.retrievalReasons,
-                retrievalSourceUrl: fetched.retrievalSourceUrl,
+                retrievalSourceUrl,
                 releaseHistorySourceKind: fetched.releaseHistorySourceKind,
                 releaseHistoryComplete: fetched.releaseHistoryComplete,
                 extractionConfidence: fetched.extractionConfidence,
@@ -2178,6 +2550,9 @@ export class ResearchRunner {
             })) as {
               title: string;
               content: string;
+              predicateEvidenceContent?: string;
+              structuredDataPresent?: boolean;
+              structuredFacts?: Source["structuredFacts"];
               canonicalUrl?: string;
               publishedAt?: string;
               contentOrigin?: Source["contentOrigin"];
@@ -2206,37 +2581,45 @@ export class ResearchRunner {
                 }
               : unverifiedTaskEvidence(
                   state.plan.interpretation.normalizedQuestion,
-                  document.content,
+                  document,
                   requestedFactsForPlan(state.plan),
                 );
+            const primaryContent =
+              state.researchChatOptimization && state.plan.interpretation.comparison
+                ? comparisonEvidencePassages(state.plan.interpretation.comparison, document.content)
+                    .filter((passage) => !querySubjectMismatchReason(state.question, passage))
+                    .join("\n\n")
+                : state.researchChatOptimization
+                  ? relevantSourceContent(
+                      state.question,
+                      document.content,
+                      `${source.title} ${document.title} ${source.snippet}`,
+                    )
+                  : document.content;
+            const sourceContent = [
+              primaryContent,
+              ...(document.structuredFacts ?? []).map((fact) => fact.statement),
+            ]
+              .filter(Boolean)
+              .filter((content, index, all) => all.indexOf(content) === index)
+              .join("\n\n")
+              .slice(0, 12000);
             state.fetchedSources.push({
               ...source,
               title:
                 document.title && !querySubjectMismatchReason(state.question, document.title)
                   ? document.title
                   : source.title,
-              content:
-                state.researchChatOptimization && state.plan.interpretation.comparison
-                  ? comparisonEvidencePassages(
-                      state.plan.interpretation.comparison,
-                      document.content,
-                    )
-                      .filter((passage) => !querySubjectMismatchReason(state.question, passage))
-                      .join("\n\n")
-                      .slice(0, 12000)
-                  : state.researchChatOptimization
-                    ? relevantSourceContent(
-                        state.question,
-                        document.content,
-                        `${source.title} ${document.title} ${source.snippet}`,
-                      ).slice(0, 12000)
-                    : document.content.slice(0, 12000),
+              content: sourceContent,
               pagePublishedAt: document.publishedAt,
               fetchedAt: new Date().toISOString(),
               canonicalUrl: document.canonicalUrl,
               contentOrigin: document.contentOrigin,
+              predicateEvidenceContent: document.predicateEvidenceContent,
+              structuredDataPresent: document.structuredDataPresent,
+              structuredFacts: document.structuredFacts,
               retrievalMethod: fetched.retrievalMethod as Source["retrievalMethod"],
-              retrievalSourceUrl: fetched.retrievalSourceUrl,
+              retrievalSourceUrl,
               releaseHistorySourceKind: fetched.releaseHistorySourceKind,
               releaseHistoryComplete: fetched.releaseHistoryComplete,
               retrievalAttempts: fetched.retrievalAttempts,
@@ -2283,6 +2666,16 @@ export class ResearchRunner {
         },
         config.MAX_CONCURRENT_FETCHES,
       );
+      if (discoveredSiteCandidates.length > 0) {
+        const seenUrls = new Set(state.rawResults.map((result) => result.url));
+        state.rawResults.push(
+          ...discoveredSiteCandidates.filter((candidate) => {
+            if (seenUrls.has(candidate.url)) return false;
+            seenUrls.add(candidate.url);
+            return true;
+          }),
+        );
+      }
       const fetchedById = new Map(state.fetchedSources.map((source) => [source.id, source]));
       state.sourceSelectionDecisions = state.sourceSelectionDecisions.map((decision) => {
         const source = fetchedById.get(decision.sourceId);
@@ -2337,6 +2730,8 @@ export class ResearchRunner {
       // Refill the bounded candidate slots from the existing result set. Failed
       // fetches remain counted against both source/page limits and are never retried.
       if (state.researchChatOptimization && state.plan.interpretation.comparison) {
+        await this.triageSources(id, state, budget);
+      } else if (discoveredSiteCandidates.length > 0) {
         await this.triageSources(id, state, budget);
       }
       await this.step(id, labelFor(action), "complete");
@@ -2430,6 +2825,8 @@ export class ResearchRunner {
           requestedFactsForPlan(state.plan),
         ),
         requestedFactsForPlan(state.plan),
+        state.plan.interpretation.requestedPredicate,
+        state.fetchedSources,
       );
 
       if (pending.length > 0) {
@@ -2447,6 +2844,32 @@ export class ResearchRunner {
           let checked = 0;
           for (const claim of pending) {
             if (this.assessEvidence(state).sufficient) break;
+
+            const requestedPredicate = state.plan.interpretation.requestedPredicate;
+            const firstPartyStructuredRole =
+              requestedPredicate &&
+              state.plan.interpretation.entities.includes(requestedPredicate.entity)
+                ? state.fetchedSources
+                    .map((source) =>
+                      firstPartyStructuredRoleForClaim(
+                        claim,
+                        source,
+                        state.plan.interpretation.entities,
+                        requestedPredicate,
+                      ),
+                    )
+                    .find(Boolean)
+                : undefined;
+            if (firstPartyStructuredRole) {
+              claim.verification = {
+                verdict: "supported",
+                rationale:
+                  "Source-bound first-party JSON-LD relation matches the requested entity, person, and role",
+              };
+              checked += 1;
+              if (this.assessEvidence(state).sufficient) break;
+              continue;
+            }
 
             try {
               let verdict: string | undefined;
@@ -2749,6 +3172,41 @@ export class ResearchRunner {
           ),
         ),
       };
+      const fetchedByUrl = new Map(state.fetchedSources.map((source) => [source.url, source]));
+      const observedRecoverySources = rankResults(
+        state.plan.interpretation.normalizedQuestion,
+        state.rawResults,
+      )
+        .slice(0, 20)
+        .map((candidateSource) => {
+          const fetched = fetchedByUrl.get(candidateSource.url);
+          return {
+            domain: candidateSource.domain,
+            title: candidateSource.title.slice(0, 140),
+            sourceType: candidateSource.sourceType,
+            retrievalStatus: !fetched
+              ? ("candidate" as const)
+              : fetched.fetchError
+                ? ("failed" as const)
+                : fetched.subjectMismatchReason || !fetched.content?.trim()
+                  ? ("unusable" as const)
+                  : ("fetched" as const),
+            extractionStatus: fetched?.extractionStatus,
+            missingFacts: fetched?.taskEvidence?.missingFacts?.slice(0, 6),
+          };
+        });
+      const recoveryContext = {
+        attemptedQueries: [
+          ...state.plan.queries,
+          ...state.searchRecoveries.flatMap((recovery) => recovery.queries),
+        ],
+        attemptedSourceClasses: state.searchRecoveries
+          .map((recovery) => recovery.sourceClass)
+          .filter((sourceClass): sourceClass is NonNullable<typeof sourceClass> =>
+            Boolean(sourceClass),
+          ),
+        observedSources: observedRecoverySources,
+      };
       const rewritten = await rewriteQueries(
         state.researchChatOptimization
           ? state.question
@@ -2759,18 +3217,27 @@ export class ResearchRunner {
         this.llm,
         missingObjs,
         recoveryRequirements,
+        recoveryContext,
       );
       const candidate = rewritten[0] ?? "";
-      const queryValidation = validateRecoveryQuery(
-        candidate,
-        state.question,
-        state.plan,
-        recoveryRequirements,
-        recoveryRequirements.unresolvedFacts.length === 0 ? missingObjs.slice(0, 1) : [],
-      );
-      const queryAvailable = state.queriesIssued < budget.maxQueries;
-      const accepted = queryValidation.accepted && queryAvailable;
-      const queries = accepted ? [candidate] : [];
+      const remainingQueryBudget = Math.max(0, budget.maxQueries - state.queriesIssued);
+      const candidateValidations = rewritten.map((query) => ({
+        query,
+        validation: validateRecoveryQuery(
+          query,
+          state.question,
+          state.plan,
+          recoveryRequirements,
+          recoveryRequirements.unresolvedFacts.length === 0 ? missingObjs.slice(0, 1) : [],
+        ),
+      }));
+      const acceptedCandidates = candidateValidations
+        .filter(({ validation }) => validation.accepted)
+        .slice(0, remainingQueryBudget);
+      const queries = acceptedCandidates.map(({ query }) => query);
+      const issuedQueries = new Set(queries);
+      const accepted = queries.length > 0;
+      const sourceClass = preciseFactRecoverySourceClass(candidate);
       const recovery = {
         reason: evidence.reasons,
         missingRequestedFacts: missingRequestedFactSupportFromCoverage(
@@ -2778,13 +3245,25 @@ export class ResearchRunner {
         ),
         officialSourceRequirement,
         requirements: recoveryRequirements,
+        ...(sourceClass ? { sourceClass } : {}),
         queries,
         queryValidation: {
           candidate,
           accepted,
-          reasons: queryAvailable
-            ? queryValidation.reasons
-            : [...queryValidation.reasons, "search query budget is exhausted"],
+          reasons: accepted
+            ? []
+            : remainingQueryBudget > 0
+              ? (candidateValidations[0]?.validation.reasons ?? ["no recovery query candidate"])
+              : ["search query budget is exhausted"],
+          candidates: candidateValidations.map(({ query, validation }) => ({
+            query,
+            accepted: validation.accepted && issuedQueries.has(query),
+            reasons: !validation.accepted
+              ? validation.reasons
+              : issuedQueries.has(query)
+                ? validation.reasons
+                : [...validation.reasons, "search query budget is exhausted"],
+          })),
         },
       };
       state.searchRecoveries.push(recovery);
@@ -2965,6 +3444,25 @@ export class ResearchRunner {
           { researchChatOptimization: options.researchChatOptimization === true },
         ),
       );
+      if (
+        this.adaptiveEvidenceLoop &&
+        options.researchChatOptimization === true &&
+        session.mode === "quick" &&
+        plan.interpretation.requestedPredicate &&
+        !plan.interpretation.comparison &&
+        this.budgetOverrides.maxSearchPasses === undefined
+      ) {
+        // Precise-fact lookups get a bounded chance to inspect each distinct
+        // recovery formulation. Total provider calls remain capped by maxQueries.
+        const queryPassLimit = Math.min(3, Math.max(0, budget.maxQueries - 1));
+        const recoveryPassCeiling = this.evaluationBudgetCeilings
+          ? Math.min(
+              queryPassLimit,
+              Math.max(0, this.evaluationBudgetCeilings.maxSearchPasses ?? budget.maxSearchPasses),
+            )
+          : queryPassLimit;
+        budget.maxSearchPasses = Math.max(budget.maxSearchPasses, recoveryPassCeiling);
+      }
       const planDur = Math.round(performance.now() - planStart);
       stageTimings["understand_query + plan"] = planDur;
 
@@ -3067,7 +3565,8 @@ export class ResearchRunner {
       while (iterations < budget.maxSteps && Date.now() - startedAt < budget.maxTimeMs) {
         const currentSession = await this.store.get(id);
         if (currentSession?.status === "CANCELLED") return;
-        const action = await this.chooseAction(id, state, budget);
+        const choice = await this.chooseAction(id, state, budget);
+        const action = choice.action;
         const currentResearchState = this.computeResearchState(state);
         await this.update(id, {
           status: statusFor(action),
@@ -3153,7 +3652,7 @@ export class ResearchRunner {
           synthesize: "synthesis",
         };
         await runResearchStage(stageByAction[action], () =>
-          this.executeAction(id, state, action, budget),
+          this.executeAction(id, state, action, budget, choice.sourceId),
         );
         const actionDur = Math.round(performance.now() - actionStart);
         stageTimings[action] = (stageTimings[action] ?? 0) + actionDur;

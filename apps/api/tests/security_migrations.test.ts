@@ -10,7 +10,7 @@ const migration = readFileSync(
 );
 const conversationMigration = readFileSync(
   new URL(
-    "../../../supabase/migrations/20261003132219_conversation_history_v1.sql",
+    "../../../supabase/migrations/20261003155721_conversation_history_v1.sql",
     import.meta.url,
   ),
   "utf8",

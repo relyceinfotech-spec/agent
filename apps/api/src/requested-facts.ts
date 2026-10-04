@@ -1,4 +1,5 @@
 import { containsExactEntity, extractKnownEntities } from "./entities.js";
+import type { StructuredPersonRoleFact } from "./application-data.js";
 
 export type EvidenceStatus = "GENERIC_SUPPORT" | "SUPPORTED_EVIDENCE" | "INSUFFICIENT_EVIDENCE";
 
@@ -209,17 +210,61 @@ export function extractRequestedPredicate(
 export function requestedPredicatePresent(
   evidence: string | string[],
   requirement?: RequestedPredicateRequirement,
+  structuredFacts?: StructuredPersonRoleFact[],
 ): boolean {
   if (!requirement) return true;
   const items = Array.isArray(evidence) ? evidence : [evidence];
-  return items.some((item) =>
+  const textMatch = items.some((item) =>
     item.split(/\n+|(?<=[.!?;])\s+/).some((statement) => {
       if (!containsExactEntity(statement, requirement.entity)) return false;
-      return requirement.aliases.some((alias) => {
-        const words = alias.split(/\s+/).map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-        return new RegExp(`\\b${words.join("\\s+")}\\b`, "i").test(statement);
-      });
+      return predicateAliasPresent(statement, requirement);
     }),
+  );
+  if (textMatch) return true;
+  return Boolean(
+    structuredFacts?.some((fact) => structuredFactMatchesPredicate(fact, requirement)),
+  );
+}
+
+function predicateAliasPresent(text: string, requirement: RequestedPredicateRequirement): boolean {
+  return requirement.aliases.some((alias) => {
+    const words = alias.split(/\s+/).map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    return new RegExp(`\\b${words.join("\\s+")}\\b`, "i").test(text);
+  });
+}
+
+/** Match a predicate only against a normalized, source-bound person/role relation. */
+export function structuredFactMatchesPredicate(
+  fact: StructuredPersonRoleFact,
+  requirement: RequestedPredicateRequirement,
+): boolean {
+  return (
+    fact.sourceFormat === "json-ld" &&
+    Boolean(fact.person.trim()) &&
+    Boolean(fact.relationship.trim()) &&
+    containsExactEntity(fact.entity, requirement.entity) &&
+    predicateAliasPresent(fact.jobTitle, requirement)
+  );
+}
+
+/**
+ * Bind a supported claim to one source-derived JSON-LD role relation.
+ *
+ * Structured claim text can be serialized as key/value fields separated by
+ * semicolons, so sentence splitting would incorrectly separate a person's
+ * name from their job title. The structured fact is the relation boundary;
+ * the claim must still name the requested entity, person, and role.
+ */
+export function claimTextSupportsStructuredFact(
+  claimText: string,
+  fact: StructuredPersonRoleFact,
+  requirement: RequestedPredicateRequirement,
+): boolean {
+  if (!structuredFactMatchesPredicate(fact, requirement)) return false;
+  return (
+    containsExactEntity(claimText, requirement.entity) &&
+    containsExactEntity(claimText, fact.person) &&
+    predicateAliasPresent(claimText, requirement)
   );
 }
 
@@ -472,6 +517,8 @@ export function requestedFactCoverage(
     releaseEvidence?: ReleaseFactEvidence[];
     officialSourcesRequired?: boolean;
     requestedPredicate?: RequestedPredicateRequirement;
+    predicateEvidence?: string[];
+    structuredFacts?: StructuredPersonRoleFact[];
   } = {},
 ): RequestedFactCoverage {
   const required = options.requestedFacts ?? extractRequestedFacts(question);
@@ -587,7 +634,11 @@ export function requestedFactCoverage(
       ? {
           requestedPredicate: {
             predicate: requestedPredicate.predicate,
-            present: requestedPredicatePresent(evidenceItems, requestedPredicate),
+            present: requestedPredicatePresent(
+              options.predicateEvidence ?? evidenceItems,
+              requestedPredicate,
+              options.structuredFacts,
+            ),
           },
         }
       : {}),
@@ -634,6 +685,8 @@ export function missingRequestedFactSupport(
     releaseEvidence?: ReleaseFactEvidence[];
     officialSourcesRequired?: boolean;
     requestedPredicate?: RequestedPredicateRequirement;
+    predicateEvidence?: string[];
+    structuredFacts?: StructuredPersonRoleFact[];
   } = {},
 ): string[] {
   return missingRequestedFactSupportFromCoverage(
@@ -652,6 +705,8 @@ export function classifyEvidenceStatus(
     releaseEvidence?: ReleaseFactEvidence[];
     officialSourcesRequired?: boolean;
     requestedPredicate?: RequestedPredicateRequirement;
+    predicateEvidence?: string[];
+    structuredFacts?: StructuredPersonRoleFact[];
   } = {},
 ): EvidenceStatus {
   return classifyEvidenceStatusFromCoverage(

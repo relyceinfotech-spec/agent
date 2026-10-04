@@ -154,6 +154,47 @@ describe("rankResults", () => {
     expect(selectedByPass[1]).toHaveLength(0);
   });
 
+  it("treats subdomains as one publisher when preferring independent sources", () => {
+    const question = "Who is the CEO of Acme Systems?";
+    const ranked = rankResults(question, [
+      {
+        title: "Acme Systems company profile",
+        url: "https://directory.example.com/acme",
+        snippet: "A company profile for Acme Systems.",
+      },
+      {
+        title: "Acme Systems leadership profile",
+        url: "https://people.example.com/acme/leadership",
+        snippet: "A leadership profile for Acme Systems.",
+      },
+      {
+        title: "Acme Systems executive listing",
+        url: "https://profiles.example.org/acme",
+        snippet: "An executive listing for Acme Systems.",
+      },
+    ]);
+
+    const { selected } = selectResearchSourcesWithDecisions(
+      ranked,
+      ["Acme Systems"],
+      2,
+      "none",
+      question,
+      undefined,
+      false,
+      undefined,
+      true,
+    );
+
+    expect(selected).toHaveLength(2);
+    expect(selected.map((source) => source.domain)).toContain("profiles.example.org");
+    expect(
+      selected.filter((source) =>
+        ["directory.example.com", "people.example.com"].includes(source.domain),
+      ),
+    ).toHaveLength(1);
+  });
+
   it("reserves relevant vendor documentation before high-keyword SEO comparisons", () => {
     const question = "Compare React Native and Flutter for a startup in 2026";
     const seo = Array.from({ length: 5 }, (_, index) => ({
@@ -414,6 +455,58 @@ describe("rankResults", () => {
 
     expect(selection.selected).toEqual([]);
     expect(selection.decisions[0]?.selected).toBe(false);
+  });
+
+  it("prioritizes exact entity and predicate metadata before fetching precise-fact sources", () => {
+    const question = "Who is the CEO of Relyce Infotech?";
+    const ranked = rankResults(question, [
+      {
+        title: "Relyce Infotech services",
+        url: "https://relyceinfotech.com/services",
+        snippet:
+          "Relyce Infotech provides software development and technology consulting services.",
+      },
+      {
+        title: "Relyce Infotech company profile",
+        url: "https://relyceinfotech.com/en",
+        snippet: "Company profile and team information for Relyce Infotech.",
+      },
+      {
+        title: "Relyce Infotech | LinkedIn",
+        url: "https://www.linkedin.com/company/relyce-infotech",
+        snippet: "Company profile: Ukenthiran A is Founder & CEO of Relyce Infotech.",
+      },
+      {
+        title: "Infotech CEO and leadership profiles",
+        url: "https://industry.example/infotech-leadership",
+        snippet: "A broad directory of Infotech companies and executive profiles.",
+      },
+    ]);
+
+    const selection = selectResearchSourcesWithDecisions(
+      ranked,
+      ["Relyce Infotech"],
+      2,
+      "none",
+      question,
+      {
+        requestedPredicate: {
+          requirement: {
+            entity: "Relyce Infotech",
+            predicate: "CEO",
+            aliases: ["CEO", "chief executive officer"],
+          },
+          resolved: false,
+        },
+      },
+      false,
+      undefined,
+      true,
+      true,
+    );
+
+    expect(new URL(selection.selected[0]!.url).hostname).toBe("www.linkedin.com");
+    expect(selection.selected[0]?.snippet).toContain("Founder & CEO of Relyce Infotech");
   });
 
   it("checks official domains against requested entities rather than trusting generic labels", () => {

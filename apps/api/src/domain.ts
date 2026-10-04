@@ -5,6 +5,7 @@ import type {
   RequestedFactRequirements,
   RequestedPredicateRequirement,
 } from "./requested-facts.js";
+import type { StructuredPersonRoleFact } from "./application-data.js";
 
 export type ResearchMode = "quick" | "deep";
 export type ResearchStatus =
@@ -29,6 +30,8 @@ export interface SearchResult {
   publishedAt?: string;
   provider?: string;
   providers?: string[];
+  /** Present only on URLs discovered inside an entity-matched first-party site. */
+  siteDiscoveryOrigin?: string;
   query?: string;
   discoveredAt?: string;
 }
@@ -64,6 +67,10 @@ export interface Source extends SearchResult {
   releaseHistoryComplete?: boolean;
   retrievalSourceUrl?: string;
   content?: string;
+  /** Text eligible for precise-fact matching, excluding flattened JSON-LD fields. */
+  predicateEvidenceContent?: string;
+  structuredDataPresent?: boolean;
+  structuredFacts?: StructuredPersonRoleFact[];
   contentOrigin?: "metadata";
   fetchedAt?: string;
   quality: {
@@ -91,6 +98,14 @@ export interface Source extends SearchResult {
   };
 }
 export type OfficialSourceRequirement = "none" | "preferred" | "required";
+
+export type ResearchSourceClass =
+  | "company_profiles"
+  | "professional_profiles"
+  | "independent_reporting"
+  | "official_entity"
+  | "official_announcement"
+  | "official_records";
 
 export interface SourceSelectionDecision {
   query: string;
@@ -523,6 +538,7 @@ export interface ResearchSession {
     officialSourceRequirement: OfficialSourceRequirement;
     queries: string[];
     requirements?: ResearchRecoveryRequirements;
+    sourceClass?: ResearchSourceClass;
     queryValidation?: {
       candidate: string;
       accepted: boolean;

@@ -692,6 +692,109 @@ describe("fact-targeted verifier claim selection", () => {
     expect(selectVerificationClaims(claims, 2).map((claim) => claim.id)).toContain("generic");
   });
 
+  it("verifies an exact requested entity-predicate claim before generic claims", () => {
+    const requestedPredicate = {
+      entity: "Relyce Infotech",
+      predicate: "CEO",
+      aliases: ["CEO", "chief executive officer"],
+    };
+    const claims: Claim[] = [
+      {
+        id: "generic-first",
+        text: "Relyce Infotech provides software and consulting services.",
+        sourceIds: ["company-profile"],
+        evidence: "Relyce Infotech provides software and consulting services.",
+        confidence: 0.9,
+      },
+      {
+        id: "generic-other-source",
+        text: "Relyce Infotech operates in the technology sector.",
+        sourceIds: ["directory"],
+        evidence: "Relyce Infotech operates in the technology sector.",
+        confidence: 0.9,
+      },
+      {
+        id: "requested-ceo",
+        text: "Ukenthiran A is the Founder & CEO of Relyce Infotech.",
+        sourceIds: ["linkedin"],
+        evidence: "Ukenthiran A is the Founder & CEO of Relyce Infotech.",
+        confidence: 0.9,
+      },
+    ];
+
+    expect(
+      selectVerificationClaims(claims, 1, [], [], requestedPredicate).map((c) => c.id),
+    ).toEqual(["requested-ceo"]);
+  });
+
+  it("prioritizes a serialized claim only when its source binds the requested structured role", () => {
+    const requestedPredicate = {
+      entity: "Relyce Infotech",
+      predicate: "CEO",
+      aliases: ["CEO", "chief executive officer"],
+    };
+    const sourceUrl = "https://relyceinfotech.com/services";
+    const source: Source = {
+      id: "relyce-services",
+      title: "Relyce Infotech Services",
+      url: sourceUrl,
+      snippet: "Relyce Infotech services",
+      domain: "relyceinfotech.com",
+      quality: { relevance: 1, authority: 1, freshness: 1, completeness: 1, overall: 1 },
+      structuredFacts: [
+        {
+          sourceFormat: "json-ld",
+          sourceUrl,
+          entity: "Relyce Infotech",
+          person: "Ukenthiran A",
+          relationship: "employee",
+          jobTitle: "Founder & CEO",
+          statement: "Structured JSON-LD links Ukenthiran A to Relyce Infotech as Founder & CEO.",
+        },
+      ],
+    };
+    const serializedRole =
+      "@graph.name: Relyce Infotech; @graph.employee.name: Ukenthiran A; " +
+      "@graph.employee.jobTitle: Founder & CEO";
+    const boundSourceEvidence =
+      "Relyce Infotech provides software and consulting services.\n" + serializedRole;
+    const claims: Claim[] = [
+      {
+        id: "generic-company",
+        text: "Relyce Infotech provides software and consulting services.",
+        sourceIds: [source.id],
+        // Evidence binding may add other source statements. They must not make
+        // a generic claim look like the precise role claim during prioritization.
+        evidence: boundSourceEvidence,
+        confidence: 1,
+        importance: "critical",
+      },
+      {
+        id: "serialized-role",
+        text: serializedRole,
+        sourceIds: [source.id],
+        evidence: serializedRole,
+        confidence: 1,
+        importance: "critical",
+      },
+    ];
+
+    expect(
+      selectVerificationClaims(claims, 1, [], [], requestedPredicate, [source]).map((c) => c.id),
+    ).toEqual(["serialized-role"]);
+    expect(
+      selectVerificationClaims(claims, 1, [], [], requestedPredicate, [
+        {
+          ...source,
+          structuredFacts: source.structuredFacts?.map((fact) => ({ ...fact, jobTitle: "CTO" })),
+        },
+      ]).map((c) => c.id),
+    ).toEqual(["generic-company"]);
+    expect(
+      selectVerificationClaims(claims, 1, [], [], requestedPredicate).map((c) => c.id),
+    ).toEqual(["generic-company"]);
+  });
+
   it("tags and selects only the verified-eligible lifecycle passage for Research Chat", async () => {
     const lifecycleQuestion =
       "According to the official Node.js release schedule, when does Node.js 22 reach end of life?";

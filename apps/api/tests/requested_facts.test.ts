@@ -277,6 +277,8 @@ describe("task-specific requested-fact evidence", () => {
     const question = "Who is the CEO of Relyce Infotech?";
     const profile = "Relyce Infotech is an IT services and software development company.";
     const genericLeadership = "Relyce Infotech is led by a team of experienced professionals.";
+    const genericCeoMention =
+      "Relyce Infotech helps customers recruit and develop experienced CEOs.";
     const explicitRole = "Relyce Infotech lists Jane Doe as its chief executive officer.";
 
     expect(requestedFactCoverage(question, profile).requestedPredicate).toEqual({
@@ -284,6 +286,9 @@ describe("task-specific requested-fact evidence", () => {
       present: false,
     });
     expect(requestedFactCoverage(question, genericLeadership).requestedPredicate?.present).toBe(
+      false,
+    );
+    expect(requestedFactCoverage(question, genericCeoMention).requestedPredicate?.present).toBe(
       false,
     );
     expect(classifyEvidenceStatus(question, [profile])).toBe("GENERIC_SUPPORT");

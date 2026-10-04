@@ -236,6 +236,7 @@ export async function safeFetch(
   init: RequestInit = {},
   maxRedirects = 3,
   timeoutMs = 12000,
+  allowedOrigin?: string,
 ): Promise<{ url: string; response: Response; dispose: () => Promise<void> }> {
   let currentUrl = urlInput;
   let redirectsCount = 0;
@@ -250,6 +251,9 @@ export async function safeFetch(
       throw new Error("Research session deadline exhausted");
     }
     const validatedUrl = await bounded(assertSafeHttpUrl(currentUrl));
+    if (allowedOrigin && validatedUrl.origin !== allowedOrigin) {
+      throw new Error("Fetch destination is outside the allowed site origin");
+    }
     // Pin the connection to an address that was checked immediately before use.
     const addresses = await bounded(
       dns.lookup(validatedUrl.hostname, { all: true, verbatim: true }),
@@ -299,6 +303,11 @@ export async function safeFetch(
           throw new Error("Redirect response missing Location header");
         }
         const resolvedRedirect = new URL(location, validatedUrl).toString();
+        if (allowedOrigin && new URL(resolvedRedirect).origin !== allowedOrigin) {
+          await response.body?.cancel();
+          await dispatcher.close();
+          throw new Error("Redirect destination is outside the allowed site origin");
+        }
         // Re-validate the redirect destination against SSRF!
         await bounded(assertSafeHttpUrl(resolvedRedirect));
         await response.body?.cancel();
@@ -364,10 +373,11 @@ export async function safeFetchWithRetry(
   maxRedirects = 3,
   timeoutMs = 12000,
   maxAttempts = 2,
+  allowedOrigin?: string,
 ): Promise<{ url: string; response: Response; dispose: () => Promise<void> }> {
   return retryTransient(
     async () => {
-      const fetched = await safeFetch(urlInput, init, maxRedirects, timeoutMs);
+      const fetched = await safeFetch(urlInput, init, maxRedirects, timeoutMs, allowedOrigin);
       if (isRetryableFetchStatus(fetched.response.status)) {
         await fetched.response.body?.cancel();
         await fetched.dispose();

@@ -241,10 +241,10 @@ describe("independent comparison source acquisition", () => {
     expect(session.error).toMatch(/^INSUFFICIENT_EVIDENCE/);
   });
   it("reaches a candidate beyond the original shortlist after a failure using only three page attempts", async () => {
-    const failed = entry("initial.example.edu", `${hnsw} ${ivf}`);
-    const useful = entry("primary.example.edu", hnsw);
-    const redundant = entry("redundant.example.edu", hnsw);
-    const alternate = entry("alternate.example.net", ivf);
+    const failed = entry("initial-publisher.edu", `${hnsw} ${ivf}`);
+    const useful = entry("primary-publisher.edu", hnsw);
+    const redundant = entry("redundant-publisher.edu", hnsw);
+    const alternate = entry("alternate-publisher.net", ivf);
     const results = [failed, useful, redundant, alternate];
     const initial = selectResearchSourcesWithDecisions(
       rankResults(question, results),

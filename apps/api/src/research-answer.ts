@@ -8,10 +8,13 @@ import type {
 } from "./domain.js";
 import { containsExactEntity, extractKnownEntities } from "./entities.js";
 import {
+  claimTextSupportsStructuredFact,
   extractRequestedFacts,
   requestedFactCoverage,
+  requestedPredicatePresent,
   type RequestedFactCoverage,
   type RequestedFactKind,
+  type RequestedPredicateRequirement,
   type ReleaseFactEvidence,
 } from "./requested-facts.js";
 import type { ControllerVerifiedStatement } from "./citation-entailment.js";
@@ -20,6 +23,12 @@ import {
   enforceResearchChatBoundedFactCoverage,
 } from "./research-chat-fact-gate.js";
 import { compareVersions } from "./version-evidence.js";
+import {
+  buildClaimSourceReliance,
+  isFirstPartySourceForEntities,
+  qualifySingleThirdPartyClaim,
+  type ClaimSourceReliance,
+} from "./source-provenance.js";
 
 export interface StructuredAnswerStatement {
   text: string;
@@ -33,6 +42,72 @@ export interface DeterministicResearchAnswer {
   evidenceCoverage: RequestedFactCoverage;
   answerCoverage: RequestedFactCoverage;
   officialSourcesRequired: boolean;
+}
+
+/** Return one exact, source-bound JSON-LD role fact from a first-party page. */
+export function firstPartyStructuredRoleForClaim(
+  claim: Claim,
+  source: Source,
+  entities: string[],
+  requirement: RequestedPredicateRequirement,
+) {
+  if (
+    !claim.sourceIds.includes(source.id) ||
+    !source.content?.trim() ||
+    source.subjectMismatchReason ||
+    !isFirstPartySourceForEntities(source, entities)
+  ) {
+    return undefined;
+  }
+
+  const sourceUrls = [source.url, source.canonicalUrl, source.retrievalSourceUrl];
+  const matches = (source.structuredFacts ?? []).filter(
+    (fact) =>
+      sourceUrls.includes(fact.sourceUrl) &&
+      claimTextSupportsStructuredFact(claim.text, fact, requirement),
+  );
+  const distinct = new Map(
+    matches.map((fact) => [
+      `${fact.entity}\u0000${fact.person}\u0000${fact.relationship}\u0000${fact.jobTitle}\u0000${fact.sourceUrl}`,
+      fact,
+    ]),
+  );
+  return distinct.size === 1 ? distinct.values().next().value : undefined;
+}
+
+/** Ensure a precise fact from one non-first-party publisher remains attributed. */
+export function qualifyUncorroboratedThirdPartyFactStatements(
+  statements: StructuredAnswerStatement[],
+  claims: Claim[],
+  sources: Source[],
+  entities: string[],
+  requirement: ResearchPlan["interpretation"]["requestedPredicate"],
+): StructuredAnswerStatement[] {
+  if (!requirement) return statements;
+  const relianceByClaim = new Map<string, ClaimSourceReliance>(
+    buildClaimSourceReliance(claims, sources, entities).map((summary) => [
+      summary.claimId,
+      summary,
+    ]),
+  );
+  return statements.map((statement) => {
+    if (!requestedPredicatePresent(statement.text, requirement)) return statement;
+    const matching = claims
+      .filter(
+        (claim) =>
+          claim.verification?.verdict === "supported" &&
+          claim.sourceIds.some((sourceId) => statement.sourceIds.includes(sourceId)) &&
+          requestedPredicatePresent(`${claim.text}. ${claim.evidence}`, requirement),
+      )
+      .map((claim) => relianceByClaim.get(claim.id))
+      .filter((summary): summary is ClaimSourceReliance => Boolean(summary));
+    if (matching.some((summary) => summary.corroboratedAcrossIndependentPublishers))
+      return statement;
+    const reliance = matching[0];
+    if (!reliance) return statement;
+    const text = qualifySingleThirdPartyClaim(statement.text, reliance);
+    return text === statement.text ? statement : { ...statement, text };
+  });
 }
 
 const MAX_STATEMENTS = 10;
@@ -556,6 +631,23 @@ export function buildDeterministicResearchAnswer(args: {
   const releaseEvidence = record ? [releaseFactEvidence(record)] : [];
   const latestnessVersion = latestnessProven ? record?.version : undefined;
   const verifiedTexts = supportedClaims.flatMap((claim) => [claim.text, claim.evidence]);
+  const requestedPredicate = plan.interpretation.requestedPredicate;
+  const structuredRoleBindings = requestedPredicate
+    ? supportedClaims.flatMap((claim) =>
+        sources.flatMap((source) => {
+          if (!claim.sourceIds.includes(source.id)) return [];
+          return (source.structuredFacts ?? [])
+            .filter(
+              (fact) =>
+                [source.url, source.canonicalUrl, source.retrievalSourceUrl].includes(
+                  fact.sourceUrl,
+                ) && claimTextSupportsStructuredFact(claim.text, fact, requestedPredicate),
+            )
+            .map((fact) => ({ claimId: claim.id, sourceId: source.id, fact }));
+        }),
+      )
+    : [];
+  const verifiedStructuredFacts = structuredRoleBindings.map((binding) => binding.fact);
   const evidenceCoverage = enforceResearchChatBoundedFactCoverage(
     requestedFactCoverage(question, verifiedTexts, {
       requestedFacts,
@@ -563,7 +655,8 @@ export function buildDeterministicResearchAnswer(args: {
       latestnessVersion,
       releaseEvidence,
       officialSourcesRequired,
-      requestedPredicate: plan.interpretation.requestedPredicate,
+      requestedPredicate,
+      structuredFacts: verifiedStructuredFacts,
     }),
     question,
     supportedClaims,
@@ -627,10 +720,24 @@ export function buildDeterministicResearchAnswer(args: {
     }
   }
 
+  const relianceByClaim = new Map(
+    buildClaimSourceReliance(supportedClaims, sources, plan.interpretation.entities).map(
+      (summary) => [summary.claimId, summary],
+    ),
+  );
   for (const claim of supportedClaims) {
+    const structuredRole = structuredRoleBindings.find((binding) => binding.claimId === claim.id);
+    const structuredRoleStatement = structuredRole
+      ? `${structuredRole.fact.person} is the ${structuredRole.fact.jobTitle} of ${structuredRole.fact.entity}.`
+      : undefined;
     addStatement(
-      claim.text,
-      claim.sourceIds.filter((id) => sourceIds.has(id)),
+      qualifySingleThirdPartyClaim(
+        structuredRoleStatement ?? claim.text,
+        relianceByClaim.get(claim.id),
+      ),
+      structuredRole
+        ? [structuredRole.sourceId]
+        : claim.sourceIds.filter((id) => sourceIds.has(id)),
     );
   }
 

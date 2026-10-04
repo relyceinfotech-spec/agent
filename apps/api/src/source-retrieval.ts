@@ -1,6 +1,10 @@
 import * as cheerio from "cheerio";
 import type { ReleaseHistorySourceKind, SearchResult, Source } from "./domain.js";
-import { browserFetch } from "./browser.js";
+import { browserFetch, type BrowserApplicationResponse } from "./browser.js";
+import {
+  extractEmbeddedApplicationData,
+  extractPublicApplicationData,
+} from "./application-data.js";
 import { extractHtml, extractRetrievedDocument, validateExtraction } from "./extract.js";
 import { config } from "./config.js";
 import {
@@ -58,8 +62,21 @@ interface FetchResult {
 }
 
 export interface SourceRetrievalDependencies {
-  fetch: (url: string, init?: RequestInit) => Promise<FetchResult>;
-  browser: (url: string, signal?: AbortSignal) => Promise<{ url: string; html: string }>;
+  fetch: (
+    url: string,
+    init?: RequestInit,
+    maxRedirects?: number,
+    allowedOrigin?: string,
+  ) => Promise<FetchResult>;
+  browser: (
+    url: string,
+    signal?: AbortSignal,
+    allowedOrigin?: string,
+  ) => Promise<{
+    url: string;
+    html: string;
+    applicationResponses?: BrowserApplicationResponse[];
+  }>;
 }
 
 export class SourceRetrievalError extends Error {
@@ -82,7 +99,7 @@ function stopIfResearchDeadlineExpired(): void {
 }
 
 const defaultDependencies: SourceRetrievalDependencies = {
-  fetch: (url, init = {}) => {
+  fetch: (url, init = {}, maxRedirects, allowedOrigin) => {
     const headers = new Headers({
       "user-agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -90,10 +107,56 @@ const defaultDependencies: SourceRetrievalDependencies = {
         "text/html,application/xhtml+xml,application/atom+xml,application/rss+xml,application/xml,application/json,text/plain;q=0.8",
     });
     new Headers(init.headers).forEach((value, key) => headers.set(key, value));
-    return safeFetchWithRetry(url, { ...init, headers }, 3, config.FETCH_TIMEOUT_MS);
+    return safeFetchWithRetry(
+      url,
+      { ...init, headers },
+      maxRedirects ?? 3,
+      config.FETCH_TIMEOUT_MS,
+      2,
+      allowedOrigin,
+    );
   },
   browser: browserFetch,
 };
+
+function originBoundDependencies(
+  dependencies: SourceRetrievalDependencies,
+  allowedOrigin: string,
+): SourceRetrievalDependencies {
+  return {
+    fetch: (url, init, maxRedirects) => {
+      let target: URL;
+      try {
+        target = new URL(url);
+      } catch {
+        throw new Error("Invalid same-site retrieval URL");
+      }
+      if (target.origin !== allowedOrigin) {
+        throw new Error("Same-site retrieval URL is outside the discovered origin");
+      }
+      return dependencies.fetch(url, init, maxRedirects, allowedOrigin).then(async (fetched) => {
+        if (new URL(fetched.url).origin !== allowedOrigin) {
+          if (!fetched.response.bodyUsed)
+            await fetched.response.body?.cancel().catch(() => undefined);
+          await fetched.dispose().catch(() => undefined);
+          throw new Error("Fetch result is outside the discovered site origin");
+        }
+        return fetched;
+      });
+    },
+    browser: (url, signal) => {
+      if (new URL(url).origin !== allowedOrigin) {
+        throw new Error("Same-site browser URL is outside the discovered origin");
+      }
+      return dependencies.browser(url, signal, allowedOrigin).then((rendered) => {
+        if (new URL(rendered.url).origin !== allowedOrigin) {
+          throw new Error("Browser result is outside the discovered site origin");
+        }
+        return rendered;
+      });
+    },
+  };
+}
 
 function meaningfulTerms(text: string): string[] {
   return [...new Set(text.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? [])].filter(
@@ -278,6 +341,60 @@ function qualityConfidence(document: ExtractedDocument): number {
   return Math.min(1, Number((lengthScore + sentenceScore + metadataBoost).toFixed(2)));
 }
 
+function extractRenderedDocument(
+  rendered: {
+    url: string;
+    html: string;
+    applicationResponses?: BrowserApplicationResponse[];
+  },
+  retrievalReasons: string[],
+): ExtractedDocument {
+  const document = extractHtml(rendered.html, new URL(rendered.url));
+  const embeddedCount = extractEmbeddedApplicationData(rendered.html).length;
+  const capturedLines: string[] = [];
+  const capturedPaths: string[] = [];
+  let capturedBytes = 0;
+  for (const response of (rendered.applicationResponses ?? []).slice(0, 4)) {
+    const bytes = Buffer.byteLength(response.body, "utf8");
+    if (
+      !/^(?:application\/json|application\/[\w.+-]+\+json)\b/i.test(response.contentType) ||
+      bytes === 0 ||
+      bytes > 64_000 ||
+      capturedBytes + bytes > 128_000
+    )
+      continue;
+    const content = extractPublicApplicationData(response.body);
+    if (!content) continue;
+    capturedBytes += bytes;
+    capturedLines.push(content);
+    capturedPaths.push(response.path.replace(/[?#].*$/, "").slice(0, 160));
+  }
+  if (capturedLines.length) {
+    document.content = [...new Set([document.content.trim(), ...capturedLines].filter(Boolean))]
+      .join("\n\n")
+      .slice(0, 20_000);
+    document.predicateEvidenceContent = [
+      ...new Set([document.predicateEvidenceContent?.trim(), ...capturedLines].filter(Boolean)),
+    ]
+      .join("\n\n")
+      .slice(0, 20_000);
+    if (document.contentType !== "structured" && document.content.length < 120) {
+      document.contentType = "structured";
+    }
+  }
+  if (embeddedCount) {
+    retrievalReasons.push(
+      `Parsed ${embeddedCount} bounded JSON application-data block(s) embedded in the page without executing scripts.`,
+    );
+  }
+  if (capturedLines.length) {
+    retrievalReasons.push(
+      `Extracted bounded public JSON from ${capturedLines.length} same-origin browser response(s): ${capturedPaths.join(", ")}.`,
+    );
+  }
+  return document;
+}
+
 function missingRequestedFactsForDocument(
   question: string,
   document: ExtractedDocument,
@@ -285,7 +402,11 @@ function missingRequestedFactsForDocument(
   researchChatOptimization = false,
 ): string[] {
   if (!researchChatOptimization) return [];
-  const coverage = requestedFactCoverage(question, document.content, { requestedFacts });
+  const coverage = requestedFactCoverage(question, document.content, {
+    requestedFacts,
+    predicateEvidence: [document.predicateEvidenceContent ?? document.content],
+    structuredFacts: document.structuredFacts,
+  });
   const missing: string[] = requestedFacts?.length ? [...coverage.missing] : [];
   if (coverage.requestedPredicate && !coverage.requestedPredicate.present) {
     missing.push(`requested ${coverage.requestedPredicate.predicate} fact`);
@@ -1469,6 +1590,7 @@ async function retrieveSourceWithTrace(
     allowSnippetEvidence?: boolean;
     requestedFacts?: RequestedFactKind[];
     researchChatOptimization?: boolean;
+    allowedOrigin?: string;
   },
   dependencies: SourceRetrievalDependencies = defaultDependencies,
   attempts: string[] = ["serper_snippet"],
@@ -1511,7 +1633,8 @@ async function retrieveSourceWithTrace(
   let head: { url: string; contentType: string; link: string | null } | undefined;
   try {
     head = await readMetadataHead(input.result.url, dependencies);
-  } catch {
+  } catch (error) {
+    if (input.allowedOrigin) throw error;
     stopIfResearchDeadlineExpired();
     reasons.push("A safe metadata-only HEAD request did not yield source hints.");
   }
@@ -1671,7 +1794,8 @@ async function retrieveSourceWithTrace(
   // A capped range preview discovers feed and embedded metadata without downloading the article.
   try {
     preview = await readPreview(head?.url ?? input.result.url, dependencies);
-  } catch {
+  } catch (error) {
+    if (input.allowedOrigin) throw error;
     stopIfResearchDeadlineExpired();
     reasons.push(
       "The bounded metadata preview was unavailable; escalation will use the safe full fetcher.",
@@ -1841,7 +1965,7 @@ async function retrieveSourceWithTrace(
       dependencies.browser(full.url, getResearchExecutionContext()?.signal),
     );
     const renderedDocument = appendLifecycleTableEvidence(
-      extractHtml(rendered.html, new URL(rendered.url)),
+      extractRenderedDocument(rendered, reasons),
       rendered.html,
       input.question,
       input.requestedFacts,
@@ -1878,7 +2002,7 @@ async function retrieveSourceWithTrace(
       dependencies.browser(full.url, getResearchExecutionContext()?.signal),
     );
     const renderedDocument = appendLifecycleTableEvidence(
-      extractHtml(rendered.html, new URL(rendered.url)),
+      extractRenderedDocument(rendered, reasons),
       rendered.html,
       input.question,
       input.requestedFacts,
@@ -1935,6 +2059,7 @@ export async function retrieveSource(
     allowSnippetEvidence?: boolean;
     requestedFacts?: RequestedFactKind[];
     researchChatOptimization?: boolean;
+    allowedOrigin?: string;
   },
   dependencies: SourceRetrievalDependencies = defaultDependencies,
 ): Promise<RetrievedSource> {
@@ -1942,10 +2067,24 @@ export async function retrieveSource(
   const skipped: string[] = [];
   const reasons: string[] = [];
   try {
+    let scopedDependencies = dependencies;
+    if (input.allowedOrigin) {
+      const origin = new URL(input.allowedOrigin).origin;
+      if (new URL(input.result.url).origin !== origin) {
+        throw new Error("Discovered page is outside its validated site origin");
+      }
+      scopedDependencies = originBoundDependencies(dependencies, origin);
+    }
     const classification = classifyFirstPartyGitHubSource(input.result.url);
     let initial: RetrievedSource;
     try {
-      initial = await retrieveSourceWithTrace(input, dependencies, attempts, skipped, reasons);
+      initial = await retrieveSourceWithTrace(
+        input,
+        scopedDependencies,
+        attempts,
+        skipped,
+        reasons,
+      );
     } catch (error) {
       if (classification?.contentKind !== "release_history") throw error;
       stopIfResearchDeadlineExpired();
@@ -1980,7 +2119,7 @@ export async function retrieveSource(
         retrievalReasons: [...reasons],
       };
     }
-    const resolved = await retrieveGitHubReleaseHistory(input, initial, dependencies);
+    const resolved = await retrieveGitHubReleaseHistory(input, initial, scopedDependencies);
     if (resolved.document.content.trim()) return resolved;
     if (initial.retrievedContentLength > 0) return resolved;
     if (resolved !== initial) {

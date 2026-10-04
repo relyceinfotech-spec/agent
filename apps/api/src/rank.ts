@@ -9,9 +9,10 @@ import type {
 import { createHash } from "node:crypto";
 import { canonicalizeUrl } from "./security.js";
 import { containsExactEntity, subjectEntityMismatchReason } from "./entities.js";
-import { requestedFactCoverage } from "./requested-facts.js";
+import { requestedFactCoverage, requestedPredicatePresent } from "./requested-facts.js";
 import { querySubjectMismatchReason } from "./query-relevance.js";
 import { comparisonClaimHasTargetFinding } from "./comparison-evidence.js";
+import { publisherDomainKey } from "./source-provenance.js";
 
 export interface SourceAcquisitionContext {
   comparison: ComparisonObjective;
@@ -381,8 +382,9 @@ export function rankResults(question: string, results: SearchResult[]): Source[]
   const diverseRanked: Source[] = [];
 
   for (const source of initialSources) {
-    const currentCount = domainOccurrences.get(source.domain) ?? 0;
-    domainOccurrences.set(source.domain, currentCount + 1);
+    const publisherDomain = publisherDomainKey(source.domain);
+    const currentCount = domainOccurrences.get(publisherDomain) ?? 0;
+    domainOccurrences.set(publisherDomain, currentCount + 1);
 
     // Progressive penalty for duplicate domain representation
     let diversityMultiplier = 1.0;
@@ -414,12 +416,17 @@ export function selectResearchSourcesWithDecisions(
   limit: number,
   officialSourceRequirement: "none" | "preferred" | "required" = "none",
   taskQuestion?: string,
-  recoveryRequirements?: Pick<
-    ResearchRecoveryRequirements,
-    "unresolvedFacts" | "factInsufficientSources"
+  recoveryRequirements?: Partial<
+    Pick<
+      ResearchRecoveryRequirements,
+      "unresolvedFacts" | "factInsufficientSources" | "requestedPredicate"
+    >
   >,
   preferReadableText = false,
   acquisition?: SourceAcquisitionContext,
+  preferDistinctDomains = false,
+  preferExactEntityMatches = false,
+  previouslyUsedDomains: string[] = [],
 ): { selected: Source[]; decisions: Array<Omit<SourceSelectionDecision, "query">> } {
   const recoveryFacts = recoveryRequirements?.unresolvedFacts ?? [];
   const factInsufficientUrls = new Map<string, Set<string>>();
@@ -511,9 +518,34 @@ export function selectResearchSourcesWithDecisions(
     !/\b(?:videos?|transcripts?|youtube|vimeo)\b/i.test(taskQuestion ?? "")
       ? textEligible
       : policyEligible;
+  const requestedPredicate = preferExactEntityMatches
+    ? recoveryRequirements?.requestedPredicate?.requirement
+    : undefined;
+  const hasExactRequestedEntity = (source: Source) =>
+    requestedPredicate
+      ? containsExactEntity(
+          `${source.title} ${source.snippet} ${source.url}`,
+          requestedPredicate.entity,
+        )
+      : false;
+  const hasRequestedPredicateStatement = (source: Source) =>
+    requestedPredicate
+      ? requestedPredicatePresent([source.title, source.snippet], requestedPredicate)
+      : false;
+  if (requestedPredicate) {
+    eligible.sort(
+      (left, right) =>
+        Number(hasExactRequestedEntity(right)) - Number(hasExactRequestedEntity(left)) ||
+        Number(hasRequestedPredicateStatement(right)) -
+          Number(hasRequestedPredicateStatement(left)) ||
+        right.quality.overall - left.quality.overall,
+    );
+  }
   const selected: Source[] = [];
   const selectedUrls = new Set<string>();
-  const domains = new Set(acquisition?.usedDomains ?? []);
+  const domains = new Set(
+    [...(acquisition?.usedDomains ?? []), ...previouslyUsedDomains].map(publisherDomainKey),
+  );
   const needed = new Set(acquisition?.neededTargets ?? []);
   // Search metadata guides discovery only; it never establishes verified
   // comparison coverage or supplies publication evidence.
@@ -529,7 +561,8 @@ export function selectResearchSourcesWithDecisions(
     const targetMentions = acquisition
       ? [...needed].filter((target) => containsExactEntity(source.snippet, target))
       : [];
-    const independentDomain = !domains.has(source.domain);
+    const publisherDomain = publisherDomainKey(source.domain);
+    const independentDomain = !domains.has(publisherDomain);
     return {
       targetLeads,
       targetMentions,
@@ -550,12 +583,20 @@ export function selectResearchSourcesWithDecisions(
     selectionSignals.set(source.id, signal);
     selected.push(source);
     selectedUrls.add(source.url);
+    if (acquisition || preferDistinctDomains || preferExactEntityMatches) {
+      domains.add(publisherDomainKey(source.domain));
+    }
     if (acquisition) {
-      domains.add(source.domain);
       signal.targetLeads.forEach((target) => needed.delete(target));
     }
   };
   const authoritativeLimit = Math.min(2, Math.max(1, Math.floor(limit / 2)));
+  if (requestedPredicate && officialSourceRequirement !== "required" && limit > 0) {
+    const exactStatement = eligible.find(
+      (source) => hasRequestedPredicateStatement(source) && !selectedUrls.has(source.url),
+    );
+    if (exactStatement) select(exactStatement);
+  }
   for (const entity of entities.slice(0, authoritativeLimit)) {
     if (selected.length >= limit) break;
     const match = eligible.find(
@@ -579,9 +620,29 @@ export function selectResearchSourcesWithDecisions(
   }
   while (selected.length < limit) {
     const remaining = eligible.filter((source) => !selectedUrls.has(source.url));
-    if (acquisition) remaining.sort((a, b) => discovery(b).score - discovery(a).score);
-    if (!remaining[0]) break;
-    select(remaining[0]);
+    const distinctDomains = remaining.filter(
+      (source) => !domains.has(publisherDomainKey(source.domain)),
+    );
+    const sameSiteDiscovery = remaining.find((source) => {
+      if (source.provider !== "site-discovery" || !source.siteDiscoveryOrigin) return false;
+      try {
+        return new URL(source.url).origin === source.siteDiscoveryOrigin;
+      } catch {
+        return false;
+      }
+    });
+    if (
+      preferExactEntityMatches &&
+      domains.size > 0 &&
+      distinctDomains.length === 0 &&
+      !sameSiteDiscovery
+    )
+      break;
+    const preferred =
+      preferDistinctDomains && distinctDomains.length > 0 ? distinctDomains : remaining;
+    if (acquisition) preferred.sort((a, b) => discovery(b).score - discovery(a).score);
+    if (!preferred[0]) break;
+    select(preferred[0]);
   }
 
   const selectedIds = new Set(selected.map((source) => source.id));

@@ -267,6 +267,80 @@ describe("query understanding and planning", () => {
     );
   });
 
+  it("chooses an untried generic source class for precise-fact recovery", async () => {
+    const question = "Who is the CTO of Acme Systems?";
+    const plan = await buildPlan(question, "quick", llm);
+    const requirements: ResearchRecoveryRequirements = {
+      requestedPredicate: {
+        requirement: plan.interpretation.requestedPredicate!,
+        resolved: false,
+      },
+      requestedFacts: [],
+      resolvedFacts: [],
+      unresolvedFacts: [],
+      latestnessRequired: false,
+      latestnessResolved: false,
+      qualifiers: { latest: false, stable: false },
+      officialSourceRequirement: "none",
+      officialEvidenceResolved: false,
+    };
+    const complete = vi
+      .fn()
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          sourceClass: "company_profiles",
+          query: '"Acme Systems" CTO company profile',
+        }),
+      )
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          sourceClass: "independent_reporting",
+          query: '"Acme Systems" CTO interview',
+        }),
+      );
+    const model = { enabled: true, complete } as unknown as OpenRouterProvider;
+    const observation = {
+      domain: "acmesystems.example",
+      title: "Acme Systems services",
+      sourceType: "official",
+      retrievalStatus: "fetched" as const,
+      extractionStatus: "SUCCEEDED",
+      missingFacts: ["requested predicate"],
+    };
+
+    const [first] = await rewriteQueries(
+      question,
+      plan,
+      [],
+      "quick",
+      model,
+      undefined,
+      requirements,
+      { attemptedSourceClasses: ["company_profiles"], observedSources: [observation] },
+    );
+    expect(first).toMatch(/Acme Systems.*CTO.*professional biography staff directory/i);
+    expect(first).not.toMatch(/company profile business directory/i);
+    expect(validateRecoveryQuery(first!, question, plan, requirements).accepted).toBe(true);
+    expect(complete.mock.calls[0]?.[1]).toContain("acmesystems.example");
+
+    const [second] = await rewriteQueries(
+      question,
+      plan,
+      [],
+      "quick",
+      model,
+      undefined,
+      requirements,
+      {
+        attemptedQueries: [first!],
+        attemptedSourceClasses: ["company_profiles", "professional_profiles"],
+        observedSources: [observation],
+      },
+    );
+    expect(second).toMatch(/Acme Systems.*CTO.*news interview independent reporting/i);
+    expect(validateRecoveryQuery(second!, question, plan, requirements).accepted).toBe(true);
+  });
+
   it("turns price and technical specification requests into explicit requirements", async () => {
     const pricePlan = await buildPlan("What is the current price of React Pro?", "quick", llm);
     const technicalPlan = await buildPlan(
@@ -332,7 +406,7 @@ describe("query understanding and planning", () => {
     expect(plan.queries[0]).toContain("Rendering huge pull requests in the GitHub Copilot app");
   });
 
-  it("rewrites a known evidence gap without a slow model round-trip", async () => {
+  it("tries a model recovery query for a known gap, then preserves the deterministic fallback", async () => {
     const plan = await buildPlan(
       "Compare React Native and Flutter for a startup in 2026",
       "quick",
@@ -354,7 +428,7 @@ describe("query understanding and planning", () => {
       model,
       missing,
     );
-    expect(model.complete).not.toHaveBeenCalled();
+    expect(model.complete).toHaveBeenCalledTimes(1);
     expect(queries.some((query) => query.includes("ecosystem"))).toBe(true);
   });
 
@@ -389,7 +463,7 @@ describe("query understanding and planning", () => {
       },
     );
 
-    expect(model.complete).not.toHaveBeenCalled();
+    expect(model.complete).toHaveBeenCalledTimes(1);
     expect(queries).toHaveLength(1);
     expect(queries[0]).not.toBe(plan.queries[0]);
     expect(queries[0]).toContain("React");
@@ -429,7 +503,7 @@ describe("query understanding and planning", () => {
 
     const queries = await rewriteQueries(question, plan, [], "deep", model, [], requirements);
 
-    expect(model.complete).not.toHaveBeenCalled();
+    expect(model.complete).toHaveBeenCalledTimes(1);
     expect(queries).toHaveLength(1);
     expect(queries[0]).toContain("Node.js 22");
     expect(queries[0]).toContain("end-of-life date");
@@ -501,7 +575,7 @@ describe("query understanding and planning", () => {
     expect(queries[0]).not.toContain("version");
     expect(queries[0]).toContain("official");
     expect(queries[0]).not.toContain("features");
-    expect(model.complete).not.toHaveBeenCalled();
+    expect(model.complete).toHaveBeenCalledTimes(2);
   });
 
   it("targets a version newer than the highest known candidate instead of repeating a generic query", async () => {
@@ -555,7 +629,7 @@ describe("query understanding and planning", () => {
         requirements,
       ).reasons,
     ).toContain("latestness recovery query omitted the highest known version candidate");
-    expect(model.complete).not.toHaveBeenCalled();
+    expect(model.complete).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a broad recovery query that omits unresolved facts and official provenance", async () => {

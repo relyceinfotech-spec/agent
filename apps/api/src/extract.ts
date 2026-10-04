@@ -1,4 +1,9 @@
 import * as cheerio from "cheerio";
+import {
+  extractEmbeddedApplicationData,
+  extractEmbeddedStructuredData,
+  type StructuredPersonRoleFact,
+} from "./application-data.js";
 
 export interface ExtractedDocument {
   title: string;
@@ -9,6 +14,10 @@ export interface ExtractedDocument {
   domain: string;
   language?: string;
   content: string;
+  /** Page prose and non-JSON-LD data; JSON-LD relations are supplied separately. */
+  predicateEvidenceContent?: string;
+  structuredDataPresent?: boolean;
+  structuredFacts?: StructuredPersonRoleFact[];
   headings: string[];
   contentType?: "html" | "rss" | "pdf" | "structured";
   contentOrigin?: "metadata";
@@ -36,6 +45,9 @@ export function extractRetrievedDocument(
 
 export function extractHtml(html: string, url: URL): ExtractedDocument {
   const $ = cheerio.load(html);
+  const applicationData = extractEmbeddedApplicationData(html);
+  const fallbackApplicationData = extractEmbeddedApplicationData(html, false);
+  const structuredData = extractEmbeddedStructuredData(html, url.toString());
   $("script,style,noscript,nav,footer,header,aside,form,iframe,svg").remove();
   const title = $("meta[property='og:title']").attr("content") ?? $("title").text().trim();
   const description =
@@ -106,12 +118,27 @@ export function extractHtml(html: string, url: URL): ExtractedDocument {
   // Identical findings may belong to different sections; global deduplication
   // would discard the second section's source context.
   const distinctParagraphs = paragraphs;
-  const content =
+  const bodyContent =
     distinctParagraphs.join("\n\n").length >= 120
       ? distinctParagraphs.join("\n\n")
       : root
         ? $(root).text()
         : "";
+  const normalizedBody = bodyContent
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const structuredFactStatements = structuredData.facts.map((fact) => fact.statement);
+  const content = [
+    ...new Set([normalizedBody, ...applicationData, ...structuredFactStatements].filter(Boolean)),
+  ]
+    .join("\n\n")
+    .slice(0, 20_000);
+  const predicateEvidenceContent = [
+    ...new Set([normalizedBody, ...fallbackApplicationData].filter(Boolean)),
+  ]
+    .join("\n\n")
+    .slice(0, 20_000);
   return {
     title: title.replace(/\s+/g, " ").trim(),
     description: description.trim(),
@@ -120,12 +147,12 @@ export function extractHtml(html: string, url: URL): ExtractedDocument {
     canonicalUrl,
     domain: url.hostname,
     language: $("html").attr("lang"),
-    content: content
-      .replace(/[ \t]+/g, " ")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim(),
+    content,
+    predicateEvidenceContent,
+    structuredDataPresent: structuredData.present,
+    ...(structuredData.facts.length ? { structuredFacts: structuredData.facts } : {}),
     headings,
-    contentType: "html",
+    contentType: normalizedBody.length < 120 && applicationData.length ? "structured" : "html",
   };
 }
 

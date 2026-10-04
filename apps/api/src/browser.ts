@@ -22,11 +22,62 @@ function executablePath(): string | undefined {
   );
 }
 
+export interface BrowserApplicationResponse {
+  /** Same-origin path only; query strings are deliberately omitted. */
+  path: string;
+  contentType: string;
+  body: string;
+}
+
+interface ApplicationResponseCaptureCandidate {
+  pageUrl: string;
+  requestUrl: string;
+  responseUrl: string;
+  method: string;
+  status: number;
+  contentType: string;
+  responseBytes: number;
+  capturedCount: number;
+  capturedBytes: number;
+}
+
+const MAX_CAPTURED_APPLICATION_RESPONSES = 4;
+const MAX_CAPTURED_APPLICATION_RESPONSE_BYTES = 64_000;
+const MAX_CAPTURED_APPLICATION_BYTES = 128_000;
+
+/** Keep application-data capture passive, same-origin, public, and bounded. */
+export function shouldCaptureBrowserApplicationResponse(
+  candidate: ApplicationResponseCaptureCandidate,
+): boolean {
+  if (
+    candidate.method !== "GET" ||
+    candidate.status < 200 ||
+    candidate.status >= 300 ||
+    candidate.capturedCount >= MAX_CAPTURED_APPLICATION_RESPONSES ||
+    candidate.responseBytes <= 0 ||
+    candidate.responseBytes > MAX_CAPTURED_APPLICATION_RESPONSE_BYTES ||
+    candidate.capturedBytes + candidate.responseBytes > MAX_CAPTURED_APPLICATION_BYTES ||
+    !/^(?:application\/json|application\/[\w.+-]+\+json)\b/i.test(candidate.contentType)
+  ) {
+    return false;
+  }
+  try {
+    const pageOrigin = new URL(candidate.pageUrl).origin;
+    return (
+      new URL(candidate.requestUrl).origin === pageOrigin &&
+      new URL(candidate.responseUrl).origin === pageOrigin
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Bounded browser retrieval for client-rendered public pages only. */
 export async function browserFetch(
   url: string,
   requestSignal?: AbortSignal,
-): Promise<{ url: string; html: string }> {
+  allowedOrigin?: string,
+): Promise<{ url: string; html: string; applicationResponses?: BrowserApplicationResponse[] }> {
   const researchSignal = getResearchExecutionContext()?.signal;
   const signal =
     requestSignal && researchSignal && requestSignal !== researchSignal
@@ -36,6 +87,10 @@ export async function browserFetch(
     signal ? raceWithResearchAbort(operation, signal) : operation;
   throwIfResearchInactive();
   await boundOperation(assertSafeHttpUrl(url));
+  const pageOrigin = new URL(url).origin;
+  if (allowedOrigin && new URL(allowedOrigin).origin !== pageOrigin) {
+    throw new Error("Browser source is outside the validated site origin");
+  }
   const browserPath = executablePath();
   if (!browserPath)
     throw new Error("Browser fallback is unavailable: no browser executable configured");
@@ -76,14 +131,26 @@ export async function browserFetch(
     context.routeWebSocket("**/*", (socket) => socket.close());
     let requests = 0;
     let totalBytes = 0;
+    let capturedApplicationBytes = 0;
+    const applicationResponses: BrowserApplicationResponse[] = [];
     await boundOperation(
       context.route("**/*", async (route) => {
         const request = route.request();
+        if (
+          allowedOrigin &&
+          request.isNavigationRequest() &&
+          new URL(request.url()).origin !== allowedOrigin
+        ) {
+          await route.abort();
+          return;
+        }
         if (["image", "font", "media"].includes(request.resourceType())) {
           await route.abort();
           return;
         }
         try {
+          const requestOrigin =
+            allowedOrigin && request.isNavigationRequest() ? allowedOrigin : undefined;
           if (++requests > 30 || !["GET", "HEAD"].includes(request.method())) {
             await route.abort();
             return;
@@ -101,6 +168,7 @@ export async function browserFetch(
             },
             3,
             config.BROWSER_TIMEOUT_MS,
+            requestOrigin,
           );
           try {
             const bytes = await readBoundedBytes(
@@ -110,6 +178,28 @@ export async function browserFetch(
             );
             totalBytes += bytes.byteLength;
             if (totalBytes > 6_000_000) throw new Error("Browser total resource budget exceeded");
+            const contentType = fetched.response.headers.get("content-type") ?? "";
+            if (
+              shouldCaptureBrowserApplicationResponse({
+                pageUrl: url,
+                requestUrl: request.url(),
+                responseUrl: fetched.url,
+                method: request.method(),
+                status: fetched.response.status,
+                contentType,
+                responseBytes: bytes.byteLength,
+                capturedCount: applicationResponses.length,
+                capturedBytes: capturedApplicationBytes,
+              })
+            ) {
+              const pathname = new URL(fetched.url).pathname;
+              applicationResponses.push({
+                path: pathname.slice(0, 512),
+                contentType: contentType.split(";")[0].trim(),
+                body: Buffer.from(bytes).toString("utf8"),
+              });
+              capturedApplicationBytes += bytes.byteLength;
+            }
             const headers: Record<string, string> = {};
             for (const name of [
               "content-type",
@@ -149,12 +239,19 @@ export async function browserFetch(
     await boundOperation(page.waitForTimeout(Math.min(500, remainingResearchTimeMs(500) ?? 500)));
     const finalUrl = page.url();
     await boundOperation(assertSafeHttpUrl(finalUrl));
+    if (allowedOrigin && new URL(finalUrl).origin !== allowedOrigin) {
+      throw new Error("Browser navigation left the allowed site origin");
+    }
     const html = await boundOperation(page.content());
     throwIfResearchInactive();
     if (Buffer.byteLength(html, "utf8") > config.MAX_CONTENT_BYTES) {
       throw new Error("Browser-rendered page exceeds content-size limit");
     }
-    return { url: finalUrl, html };
+    return {
+      url: finalUrl,
+      html,
+      ...(applicationResponses.length ? { applicationResponses } : {}),
+    };
   } finally {
     signal?.removeEventListener("abort", onAbort);
     await closeBrowser();
